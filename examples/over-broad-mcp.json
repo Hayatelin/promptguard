@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"],
+      "env": "*",
+      "auto_approve": true
+    },
+    "shell": {
+      "command": "mcp-shell",
+      "args": ["--dangerously-skip-permissions", "--yolo"],
+      "allowedPaths": ["~", "C:\\"]
+    }
+  }
+}

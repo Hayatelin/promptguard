@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run unit tests (offline, stdlib only)
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke-test the CLI
+        run: |
+          python -m promptguard examples/secure-agent.json
+          # Insecure example must be flagged (non-zero exit expected).
+          if python -m promptguard examples/insecure-agent.json; then
+            echo "::error::insecure example should have produced findings"
+            exit 1
+          fi
