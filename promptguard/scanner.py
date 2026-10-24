@@ -106,16 +106,21 @@ def scan_text(text, path="<text>"):
     """Scan a block of text, returning a list of Finding objects."""
     findings = []
     full_lower = text.lower()
+    lines = text.splitlines()
+    # File-level rules read "text"/"lines" once, cache per-line results in
+    # ctx, and look them up via "lineno" so findings still land on a line.
     ctx = {
         "full_lower": full_lower,
         "file_auto_approve": bool(_FILE_AUTO_APPROVE_RE.search(text)),
         "path": path,
+        "text": text,
+        "lines": lines,
     }
 
-    lines = text.splitlines()
     for idx, line in enumerate(lines, start=1):
         if _IGNORE_RE.search(line):
             continue
+        ctx["lineno"] = idx
         for rule in RULES:
             try:
                 results = rule.detector(line, ctx)

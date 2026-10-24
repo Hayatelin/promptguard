@@ -76,6 +76,10 @@ promptguard: OK - no issues found
 | **PG005** | 🔴 high   | Destructive actions (`delete`, `drop`, `send_email`, `transfer`, `deploy`, `rm`) marked auto / no human-in-the-loop. |
 | **PG006** | 🔴 high   | Over-broad MCP/server permissions — filesystem root (`/`, `~`, `C:\`), full env passthrough, `--yolo` / `--dangerously-skip-permissions` flags. |
 | **PG007** | 🟠 medium | Secrets committed in prompts/configs — AWS `AKIA…`, OpenAI `sk-…`, GitHub `ghp_…`, generic `api_key: "…"`. |
+| **PG008** | 🟠 medium | Unpinned launch commands in MCP/agent configs — `npx`, `uvx`, `pipx run`, `docker run` without an exact version, commit SHA, or `@sha256` digest, and downloaded install scripts piped straight into `sh`. |
+| **PG009** | 🔴 high   | Tool-description and resource-metadata poisoning — pseudo-tags like `<IMPORTANT>`, "don't tell the user" concealment, requests to read or send `.ssh` keys, `.env`, or `mcp.json`, long base64 blobs, and invisible zero-width or bidi characters. |
+| **PG010** | 🔴 high   | GitHub workflows on untrusted triggers (`pull_request_target`, `issue_comment`, `workflow_run`, `issues`, `discussion`) that check out PR head code, or give an AI agent action write permissions or secrets. |
+| **PG011** | 🔴 high   | Workflow expression injection — attacker-controlled fields such as `github.event.issue.title`, `comment.body`, or `head_ref` expanded inside `run`, `script`, or an AI action's prompt input. |
 
 ## Why now
 
