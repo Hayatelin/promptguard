@@ -1511,6 +1511,980 @@ _detect_expression_injection = _file_level("_pg011", _analyze_expression_injecti
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers (PG012-PG020)
+# ---------------------------------------------------------------------------
+#
+# Same conventions as PG008-PG011: one whole-file analyzer per rule, cached in
+# ctx via _file_level, findings recorded with _add_hit.
+
+_CONFIG_EXTS = _PG008_EXTS
+_CONFIG_TXT_EXTS = _PG008_EXTS + (".txt",)
+_NO_JSON = object()
+
+
+def _cached_hits(ctx, key, analyzer):
+    """Read another rule's _file_level cache, computing it if needed."""
+    cache = ctx.get(key)
+    if cache is None:
+        try:
+            cache = analyzer(ctx)
+        except Exception:
+            cache = {}
+        ctx[key] = cache
+    return cache
+
+
+def _json_data(ctx):
+    """Parsed JSON for .json/.mcp/<text> input (PG008's condition), else None."""
+    data = ctx.get("_json", _NO_JSON)
+    if data is _NO_JSON:
+        data = None
+        text = ctx.get("text", "").lstrip("﻿")
+        if _file_ext(ctx) in (".json", ".mcp", "") and text.lstrip()[:1] in ("{", "["):
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = None
+        ctx["_json"] = data
+    return data
+
+
+def _is_comment_line(line):
+    return line.lstrip().startswith(("#", "//"))
+
+
+def _code_text(line, ctx):
+    """The line without a trailing ' # comment' (JSON lines are kept as is)."""
+    if _file_ext(ctx) in (".json", ".mcp"):
+        return line
+    return _strip_yaml_comment(line)
+
+
+def _skip_config_line(line):
+    return _is_comment_line(line) or bool(_DESCRIPTIVE_LINE_RE.match(line))
+
+
+def _host_of(value):
+    """Host part of a URL or host[:port] value, lower-cased."""
+    v = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", value.strip().strip("\"'"))
+    v = re.split(r"[/?#]", v, maxsplit=1)[0].rsplit("@", 1)[-1]
+    if v.startswith("["):
+        return v[1:v.find("]")].lower() if "]" in v else v[1:].lower()
+    return v.split(":", 1)[0].lower()
+
+
+def _is_local_host(host):
+    host = host.strip("[]").lower()
+    return (
+        host in ("localhost", "::1", "0.0.0.0")
+        or host.endswith(".localhost")
+        or bool(re.match(r"^127(?:\.\d{1,3}){3}$", host))
+    )
+
+
+def _first_value(lines, i, pos):
+    """(value, lineno) of the option value after lines[i][pos:].
+
+    Falls back to the first token of the next non-blank line (JSON arrays,
+    YAML block lists, backslash continuations). Returns ("", None) if the
+    next thing is another option or nothing.
+    """
+    m = _OPTION_VALUE_RE.match(lines[i], pos)
+    if m and m.group(1):
+        value, lineno = m.group(1), i + 1
+    else:
+        value, lineno = "", None
+        for j in range(i + 1, min(i + 4, len(lines))):
+            toks = _heuristic_tokens(lines[j][:2000])
+            if toks and toks[0] == "-":
+                toks = toks[1:]
+            if toks:
+                value, lineno = toks[0], j + 1
+                break
+    if not value or value.startswith("-") or value == "\\":
+        return "", None
+    return value, lineno
+
+
+_OPTION_VALUE_RE = re.compile(r"""["']?\s*[=:,]?\s*[\[(]?\s*["']?([^\s"',\[\]{}()]*)""")
+
+
+def _command_argvs(ctx):
+    """[(argv, argv_lines)] for every command/args pair, merged like PG008.
+
+    JSON files reuse _json_commands/_command_argv and locate each token with
+    _find_line; other files reuse PG008's inline-launch and command-key +
+    args heuristics (any command name, not only launchers).
+    """
+    cached = ctx.get("_argvs")
+    if cached is None:
+        try:
+            cached = _analyze_command_argvs(ctx)
+        except Exception:
+            cached = []
+        ctx["_argvs"] = cached
+    return cached
+
+
+def _analyze_command_argvs(ctx):
+    lines = _ctx_lines(ctx)
+    out = []
+    data = _json_data(ctx)
+    if data is not None:
+        argvs = []
+        _json_commands(data, argvs)
+        cmd_lines = [i for i, l in enumerate(lines, 1) if _JSON_CMD_KEY_RE.search(l)]
+        for k, argv in enumerate(argvs):
+            base = cmd_lines[k] if k < len(cmd_lines) else 1
+            cur = base - 1
+            where = []
+            for tok in argv:
+                ln = _find_line(lines, tok, cur)
+                if ln is None:
+                    ln = base
+                else:
+                    cur = ln - 1
+                where.append(ln)
+            out.append((argv, where))
+        return out
+    for i, line in enumerate(lines):
+        lineno = i + 1
+        if not _DESCRIPTIVE_LINE_RE.match(line):
+            m = _INLINE_LAUNCH_RE.search(line)
+            if m:
+                tokens = _heuristic_tokens(line[m.start(1):])
+                out.append((tokens, [lineno] * len(tokens)))
+        m = _CMD_ONLY_RE.search(line)
+        if not m:
+            continue
+        value = next(g for g in m.groups() if g is not None)
+        found = _find_args(lines, i, m.end())
+        if not found:
+            continue
+        argv = [(tok, lineno) for tok in _split_arg(value)]
+        for item, item_line in _collect_args(lines, found[0], found[1]):
+            argv.extend((tok, item_line) for tok in _split_arg(item))
+        out.append(([t for t, _ in argv], [l for _, l in argv]))
+    return out
+
+
+def _cli_options(argv, start, value_flags):
+    """_parse_cli's walk, yielding (flag, value, flag_index, value_index)."""
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _SHELL_SEPARATORS or tok == "--":
+            return
+        if tok.startswith("-") and len(tok) > 1:
+            name, eq, value = tok.partition("=")
+            if eq:
+                yield name, value, i, i
+            elif name in value_flags and i + 1 < len(argv):
+                yield name, argv[i + 1], i, i + 1
+                i += 1
+            else:
+                yield name, None, i, None
+            i += 1
+            continue
+        return
+
+
+def _logical_lines(lines, skip, want):
+    """Yield [(token, lineno)] per command line, joining trailing-backslash lines.
+
+    Only command lines with a physical line matching `want` are tokenized.
+    """
+    group = []
+    for i, raw in enumerate(lines):
+        if skip(raw):
+            if group:
+                yield _group_tokens(group, want)
+                group = []
+            continue
+        s = raw.rstrip()
+        cont = s.endswith("\\")
+        group.append((s[:-1] if cont else s, i + 1))
+        if not cont:
+            yield _group_tokens(group, want)
+            group = []
+    if group:
+        yield _group_tokens(group, want)
+
+
+def _group_tokens(group, want):
+    if not any(want.search(s) for s, _ in group):
+        return []
+    return [(tok, ln) for s, ln in group for tok in _heuristic_tokens(s)]
+
+
+def _is_separator_token(tok):
+    return tok in _SHELL_SEPARATORS or tok[:1] in ("|", ";", "&")
+
+
+def _cmd_name(tok):
+    """_launcher_name for a command token; "" for URLs."""
+    return "" if "://" in tok else _launcher_name(tok)
+
+
+# ---------------------------------------------------------------------------
+# PG012: blanket / standing tool approval
+# ---------------------------------------------------------------------------
+
+_APPROVAL_LIST_KEY_RE = re.compile(
+    r"""(?:^|[\s{,])["']?(allow|allowedTools|allowed_tools|alwaysAllow|always_allow|"""
+    r"""autoApprove|auto_approve)["']?\s*[:=]\s*""",
+    re.IGNORECASE,
+)
+_ALLOWED_TOOLS_FLAG_RE = re.compile(r"(?<![\w-])(--allowed[-_]?tools)(?![\w-])", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"""[^\s"'`,\[\]{}]+""")  # same split as _heuristic_tokens
+_TOOL_STAR_RE = re.compile(r"^([A-Za-z_][\w.-]*)\(\s*\*{1,2}\s*\)$")
+_READ_ONLY_TOOLS = ("read", "glob", "grep", "ls", "websearch")
+_BYPASS_RES = (
+    (
+        re.compile(
+            r"""(?:mode["']?\s*[:=]\s*["']?|--permission-mode["']?[\s,=]+["']?)"""
+            r"""bypass[_-]?permissions(?![\w-])""",
+            re.IGNORECASE,
+        ),
+        "permission mode 'bypassPermissions' skips every confirmation prompt",
+    ),
+    (
+        re.compile(
+            r"""(?:approval[_-]?mode["']?\s*[:=]\s*["']?|--approval-mode["']?[\s,=]+["']?)"""
+            r"""yolo(?![\w-])""",
+            re.IGNORECASE,
+        ),
+        "approval mode 'yolo' skips every confirmation prompt",
+    ),
+    (
+        re.compile(r"(?<![\w-])--dangerously-bypass-approvals-and-sandbox(?![\w-])", re.IGNORECASE),
+        "'--dangerously-bypass-approvals-and-sandbox' skips every confirmation "
+        "prompt and the sandbox",
+    ),
+    (
+        re.compile(
+            r"""(?:^|[\s{,])["']?enableAllProjectMcpServers["']?\s*[:=]\s*["']?true\b""",
+            re.IGNORECASE,
+        ),
+        "'enableAllProjectMcpServers: true' auto-approves every MCP server a "
+        "project .mcp.json declares",
+    ),
+)
+_TRUST_TRUE_RE = re.compile(r"""(?:^|[\s{,])["']?trust["']?\s*[:=]\s*["']?true\b""", re.IGNORECASE)
+
+
+def _wildcard_scope(item):
+    """(clean_item, scope) when an allow-list entry approves a whole tool, else None."""
+    s = item.strip().strip("\"'`").strip()
+    if s in ("*", "**"):
+        return s, "every tool"
+    m = _TOOL_STAR_RE.match(s)
+    if m:
+        if m.group(1).lower() in _READ_ONLY_TOOLS:
+            return None
+        return s, "every %s call" % m.group(1)
+    if s in ("Bash", "PowerShell"):
+        return s, "every %s call" % s
+    if s.lower().startswith("mcp__") and s.endswith("*"):
+        return s, "every matching MCP tool"
+    return None
+
+
+def _approval_message(item, where, scope):
+    return "Blanket approval: '%s' in '%s' allows %s without confirmation" % (
+        item, where, scope,
+    )
+
+
+def _analyze_blanket_approval(ctx):
+    if _file_ext(ctx) not in _CONFIG_EXTS:
+        return {}
+    lines = _ctx_lines(ctx)
+    low = ctx.get("full_lower", "")
+    allow_key_ok = "permissions" in low
+    mcp_ok = "mcp" in low
+    hits = {}
+    for i, raw in enumerate(lines):
+        if _skip_config_line(raw):
+            continue
+        line = _code_text(raw, ctx)
+        lineno = i + 1
+        for rx, what in _BYPASS_RES:
+            if rx.search(line):
+                _add_hit(hits, lines, lineno, "Blanket approval: " + what)
+        if mcp_ok and _TRUST_TRUE_RE.search(line):
+            _add_hit(
+                hits,
+                lines,
+                lineno,
+                "Blanket approval: MCP server 'trust: true' skips confirmation "
+                "for all of its tools",
+            )
+        for m in _APPROVAL_LIST_KEY_RE.finditer(line):
+            key = m.group(1)
+            if key.lower() == "allow" and not allow_key_ok:
+                continue
+            after = line[m.end():].strip()
+            if not after or after.startswith(("[", "#")):
+                items = _collect_args(lines, i, m.end())
+            else:
+                # Scalar value: only the value itself, never the rest of the line.
+                items = [(t, lineno) for t in _heuristic_tokens(after[:200])[:1]]
+            for item, item_line in items:
+                found = _wildcard_scope(item)
+                if found:
+                    _add_hit(hits, lines, item_line, _approval_message(found[0], key, found[1]))
+        for m in _ALLOWED_TOOLS_FLAG_RE.finditer(line):
+            flag = m.group(1)
+            rest = line[m.end():]
+            rest = rest[1:] if rest.startswith("=") else rest
+            values = []
+            for t in _TOKEN_RE.finditer(rest):
+                if t.group(0).startswith("-"):
+                    break
+                values.append((t.group(0), lineno))
+            if not values and not _TOKEN_RE.search(rest):
+                value, vline = _first_value(lines, i, len(lines[i]))
+                values = [(value, vline)] if value else []
+            for value, vline in values:
+                found = _wildcard_scope(value)
+                if found:
+                    _add_hit(hits, lines, vline, _approval_message(found[0], flag, found[1]))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG015: over-broad workflow token permissions
+# ---------------------------------------------------------------------------
+
+_PERMISSIONS_KEY_RE = re.compile(r"""^(\s*)(-\s+)?["']?permissions["']?\s*:(.*)$""")
+_SCOPE_KV_RE = re.compile(r"""["']?([\w-]+)["']?\s*:\s*["']?([\w-]+)["']?""")
+
+
+def _analyze_ci_permissions(ctx):
+    if not _is_github_workflow(ctx):
+        return {}
+    lines = _ctx_lines(ctx)
+    triggers = []
+    for event in _workflow_triggers(lines):
+        if event in _UNTRUSTED_TRIGGERS and event not in triggers:
+            triggers.append(event)
+    hits = {}
+    for i, line in enumerate(lines):
+        m = _PERMISSIONS_KEY_RE.match(line)
+        if not m:
+            continue
+        lineno = i + 1
+        rest = _strip_yaml_comment(m.group(3)).strip()
+        if _unquote(rest).lower() == "write-all":
+            _add_hit(
+                hits,
+                lines,
+                lineno,
+                "Workflow token granted 'permissions: write-all' (every scope "
+                "writable; grant only the scopes each job needs)",
+            )
+            continue
+        if not triggers:
+            continue
+        scopes = {}
+        if rest.startswith("{"):
+            body, j = rest, i
+            while "}" not in body and j + 1 < len(lines) and j - i < 20:
+                j += 1
+                body += " " + _strip_yaml_comment(lines[j]).strip()
+            for k, v in _SCOPE_KV_RE.findall(body.split("}", 1)[0].lstrip("{")):
+                scopes[k.lower()] = v.lower()
+        elif not rest:
+            key_col = len(m.group(1)) + len(m.group(2) or "")
+            for j in range(i + 1, _block_end(lines, i, key_col)):
+                mm = _SCOPE_KV_RE.match(_strip_yaml_comment(lines[j]).strip())
+                if mm:
+                    scopes[mm.group(1).lower()] = mm.group(2).lower()
+        if scopes.get("contents") == "write" and scopes.get("id-token") == "write":
+            _add_hit(
+                hits,
+                lines,
+                lineno,
+                "Untrusted trigger (%s) gets 'contents: write' and 'id-token: write' "
+                "in one permissions block (repo push plus OIDC cloud credentials)"
+                % ", ".join(triggers),
+            )
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG016: output exfiltration channel (markdown image / link URL)
+# ---------------------------------------------------------------------------
+
+_TEMPLATE_VAR_RE = re.compile(
+    r"\{\{[^{}\n]{0,200}\}\}|\$\{[^{}\n]{0,200}\}|\{[A-Za-z_][\w.]{0,100}\}"
+)
+_URL_BODY = (
+    r"""https?://(?:\{\{[^{}\n]{0,200}\}\}|\$\{[^{}\n]{0,200}\}|[^\s()"'<>\\])+"""
+)
+_MD_TARGET_RE = re.compile(r"\]\(\s*<?(" + _URL_BODY + ")", re.IGNORECASE)
+_MD_REFDEF_RE = re.compile(
+    r"^\s{0,3}\[[^\]\n]{1,300}\]:\s*<?(" + _URL_BODY + ")", re.IGNORECASE
+)
+_HTML_IMG_RE = re.compile(
+    r"""<img\b[^>]{0,300}?\bsrc\s*=\s*\\?["']?(""" + _URL_BODY + ")", re.IGNORECASE
+)
+
+
+def _exfil_values(url, kind):
+    """(host, [placeholders in the query string]) for an exfiltrating URL, else None.
+
+    Single-brace {name} placeholders count for images only: in links they are
+    usually API documentation (?filter={filter}), not prompt templates.
+    """
+    found = list(_TEMPLATE_VAR_RE.finditer(url))
+    if not found:
+        return None
+    masked = list(url)
+    for m in found:
+        masked[m.start():m.end()] = "X" * (m.end() - m.start())
+    masked = "".join(masked)
+    start = masked.index("://") + 3
+    end = len(masked)
+    for ch in "/?#":
+        k = masked.find(ch, start)
+        if k >= 0:
+            end = min(end, k)
+    if any(m.start() < end for m in found):
+        return None  # host itself is templated (relative/site URL)
+    host = _host_of(url)
+    if not host or _is_local_host(host):
+        return None
+    q = masked.find("?", end)
+    if q < 0:
+        return None
+    frag = masked.find("#", q)
+    stop = frag if frag >= 0 else len(masked)
+    values = [
+        m.group(0)
+        for m in found
+        if q < m.start() < stop and (kind == "image" or m.group(0)[:2] in ("{{", "${"))
+    ]
+    if not values:
+        return None
+    return host, values
+
+
+def _analyze_exfil_channel(ctx):
+    if _is_github_workflow(ctx) or _is_github_action(ctx):
+        return {}
+    lines = _ctx_lines(ctx)
+    hits = {}
+    for i, line in enumerate(lines):
+        if "http" not in line.lower():
+            continue
+        targets = []
+        for m in _MD_TARGET_RE.finditer(line):
+            j = line.rfind("[", max(0, m.start() - 300), m.start())
+            if j < 0:
+                continue
+            kind = "image" if j > 0 and line[j - 1] == "!" else "link"
+            targets.append((kind, m.group(1)))
+        m = _MD_REFDEF_RE.match(line)
+        if m:
+            targets.append(("link", m.group(1)))
+        for m in _HTML_IMG_RE.finditer(line):
+            targets.append(("image", m.group(1)))
+        for kind, url in targets:
+            found = _exfil_values(url, kind)
+            if not found:
+                continue
+            host, values = found
+            when = (
+                "fetched automatically when rendered" if kind == "image" else "sent when clicked"
+            )
+            _add_hit(
+                hits,
+                lines,
+                i + 1,
+                "Output exfiltration channel: %s URL to '%s' carries template value %s "
+                "in its query (%s)"
+                % (kind, host, ", ".join("'%s'" % _short(v, 40) for v in values), when),
+            )
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG017: unbounded agent loop / budget
+# ---------------------------------------------------------------------------
+
+_LOOP_LIMIT_KEYS = (
+    "maxiterations",
+    "maxturns",
+    "maxround",
+    "maxrounds",
+    "recursionlimit",
+    "maxconsecutiveautoreply",
+    "maxtoolcalls",
+    "maxbudget",
+    "maxbudgetusd",
+    "maxcost",
+    "maxcostusd",
+)
+_LOOP_HINT_RE = re.compile(
+    r"iteration|turn|round|recursion|auto_?reply|tool_?calls|budget|cost", re.IGNORECASE
+)
+_LOOP_KV_RE = re.compile(
+    r"""(?:^|[\s{,\[(])["']?([A-Za-z_][\w.-]{0,80})["']?\s*[:=]\s*"""
+    r"""("[^"\n]{0,40}"|'[^'\n]{0,40}'|[^\s,;}\])#"']{1,40})"""
+)
+_UNBOUNDED_WORDS = ("unlimited", "infinite", "infinity", "inf", "+inf", ".inf", "+.inf")
+_NUMBER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def _is_loop_key(key):
+    norm = re.sub(r"[^a-z0-9]", "", key.rsplit(".", 1)[-1].lower())
+    return any(norm.endswith(k) for k in _LOOP_LIMIT_KEYS)
+
+
+def _unbounded_value(value):
+    v = value.strip().strip("\"'").strip().lower()
+    if v in _UNBOUNDED_WORDS:
+        return True
+    if _NUMBER_RE.match(v):
+        return float(v) <= 0
+    return False
+
+
+def _loop_message(key, value):
+    return (
+        "Agent loop/budget limit '%s' set to %s (unbounded or non-positive; "
+        "set a finite positive cap)" % (key, value.strip())
+    )
+
+
+def _analyze_unbounded_loop(ctx):
+    if _file_ext(ctx) not in _CONFIG_EXTS:
+        return {}
+    lines = _ctx_lines(ctx)
+    hits = {}
+    for i, raw in enumerate(lines):
+        if not _LOOP_HINT_RE.search(raw) or _skip_config_line(raw):
+            continue
+        line = _code_text(raw, ctx)
+        for m in _LOOP_KV_RE.finditer(line):
+            key, value = m.group(1), m.group(2)
+            if _is_loop_key(key) and _unbounded_value(value):
+                _add_hit(hits, lines, i + 1, _loop_message(key, value))
+        toks = _heuristic_tokens(line)
+        for k, tok in enumerate(toks):
+            if not tok.startswith("--"):
+                continue
+            name, eq, value = tok[2:].partition("=")
+            if not eq:
+                value = toks[k + 1] if k + 1 < len(toks) else ""
+            if value and _is_loop_key(name) and _unbounded_value(value):
+                _add_hit(hits, lines, i + 1, _loop_message("--" + name, value))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG018: privileged MCP container / admin-scoped credential in args
+# ---------------------------------------------------------------------------
+
+_ADMIN_SCOPE_RE = re.compile(r"(?:^|_)(?:admin|root|superuser|service_?role|master|global)(?:_|$)")
+_CRED_WORD_RE = re.compile(
+    r"(?:^|_)(?:token|key|secret|password|passwd|pat|credentials?|apikey)(?:_|$)"
+)
+_SOCKET_SUFFIXES = ("docker.sock", "podman.sock")
+
+
+def _admin_cred_name(name):
+    norm = name.lstrip("-").lower().replace("-", "_")
+    if re.search(r"(?:^|_)(?:file|path|dir|env|var)$", norm):
+        return False  # names a file / env var holding the credential, not the value
+    return bool(_ADMIN_SCOPE_RE.search(norm) and _CRED_WORD_RE.search(norm))
+
+
+def _mount_source(flag, value):
+    if flag == "--mount":
+        for part in value.split(","):
+            k, _, v = part.partition("=")
+            if k.strip().lower() in ("source", "src"):
+                return v.strip()
+        return ""
+    return value.split(":", 1)[0].strip()
+
+
+def _pg006_root_on(ctx, lines, lineno):
+    """True when PG006 already reports a filesystem root on this line."""
+    if not 0 < lineno <= len(lines):
+        return False
+    return any(
+        msg.startswith("Over-broad filesystem root")
+        for msg, _ in (_detect_broad_mcp(lines[lineno - 1], ctx) or ())
+    )
+
+
+def _docker_privilege_hits(argv, where, start, ctx, lines, hits):
+    for name, value, fidx, vidx in _cli_options(argv, start, _DOCKER_VALUE_FLAGS):
+        fline = where[fidx]
+        vline = where[vidx] if vidx is not None else fline
+        low = (value or "").strip().lower()
+        if name == "--privileged" and low in ("", "true", "1"):
+            _add_hit(
+                hits, lines, fline,
+                "Privileged MCP container: '--privileged' (full access to host "
+                "devices and kernel)",
+            )
+        elif name in ("-v", "--volume", "--mount") and value:
+            src = _mount_source(name, value)
+            if src in ("/", "//", "/."):
+                if not _pg006_root_on(ctx, lines, vline):
+                    _add_hit(
+                        hits, lines, vline,
+                        "Privileged MCP container: host root mounted ('%s %s')"
+                        % (name, value),
+                    )
+            elif src.lower().endswith(_SOCKET_SUFFIXES):
+                _add_hit(
+                    hits, lines, vline,
+                    "Privileged MCP container: container engine socket mounted "
+                    "('%s %s' gives root on the host)" % (name, value),
+                )
+        elif name in ("--network", "--net") and low == "host":
+            _add_hit(
+                hits, lines, fline,
+                "Privileged MCP container: host network namespace ('%s host')" % name,
+            )
+        elif name == "--pid" and low == "host":
+            _add_hit(
+                hits, lines, fline,
+                "Privileged MCP container: host PID namespace ('--pid host')",
+            )
+        elif name == "--cap-add" and value:
+            for cap in value.split(","):
+                c = cap.strip().upper()
+                c = c[4:] if c.startswith("CAP_") else c
+                if c in ("ALL", "SYS_ADMIN"):
+                    _add_hit(
+                        hits, lines, vline,
+                        "Privileged MCP container: capability '%s' added (--cap-add)" % c,
+                    )
+
+
+def _analyze_container_privilege(ctx):
+    if _file_ext(ctx) not in _CONFIG_EXTS:
+        return {}
+    if _is_github_workflow(ctx) or _is_github_action(ctx):
+        return {}
+    lines = _ctx_lines(ctx)
+    hits = {}
+    for argv, where in _command_argvs(ctx):
+        for i, tok in enumerate(argv):
+            nxt = argv[i + 1].lower() if i + 1 < len(argv) else ""
+            if _launcher_name(tok) == "docker" and nxt == "run":
+                _docker_privilege_hits(argv, where, i + 2, ctx, lines, hits)
+            if tok.startswith("-"):
+                name, eq, value = tok.partition("=")
+                if not eq and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    value = argv[i + 1]
+                if value and _admin_cred_name(name):
+                    _add_hit(
+                        hits, lines, where[i],
+                        "Admin-scoped credential in MCP server args: '%s' (use a "
+                        "least-privilege token)" % name,
+                    )
+            elif "=" in tok and not tok.startswith(("http:", "https:")):
+                name, _, value = tok.partition("=")
+                if value and re.match(r"^[A-Za-z_][\w-]*$", name) and _admin_cred_name(name):
+                    _add_hit(
+                        hits, lines, where[i],
+                        "Admin-scoped credential in MCP server args: '%s' (use a "
+                        "least-privilege token)" % name,
+                    )
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG019: verification disabled
+# ---------------------------------------------------------------------------
+
+_VERIFY_OFF_RES = (
+    (
+        re.compile(r"(?<![\w-])--insecure(?![\w-])(?!=\s*(?:false|0)\b)"),
+        "'--insecure' skips TLS certificate checks",
+    ),
+    (
+        re.compile(
+            r"""(?<![\w-])--insecure-skip-tls-verify(?:=(?:true|1))?(?![\w=-])|"""
+            r"""(?:^|[\s{,])["']?insecure-skip-tls-verify["']?\s*:\s*["']?true\b""",
+            re.IGNORECASE,
+        ),
+        "'insecure-skip-tls-verify' skips TLS certificate checks",
+    ),
+    (
+        re.compile(r"(?<![\w-])--no-check-certificate(?![\w-])"),
+        "'--no-check-certificate' skips TLS certificate checks",
+    ),
+    (
+        re.compile(r"""strict[-_]?ssl["']?(?:\s*[:=]\s*|\s+)["']?false\b""", re.IGNORECASE),
+        "npm 'strict-ssl' false skips registry TLS certificate checks",
+    ),
+    (
+        re.compile(r"""NODE_TLS_REJECT_UNAUTHORIZED["']?\s*[:=]\s*["']?0(?![\w.])"""),
+        "'NODE_TLS_REJECT_UNAUTHORIZED=0' turns off TLS certificate checks for all "
+        "Node.js connections",
+    ),
+    (
+        re.compile(
+            r"""GIT_SSL_NO_VERIFY["']?\s*[:=]\s*["']?(?:1|true)\b|"""
+            r"""http\.sslverify["']?(?:\s*[:=]\s*|\s+)["']?false\b""",
+            re.IGNORECASE,
+        ),
+        "git 'sslVerify' off skips TLS certificate checks",
+    ),
+    (
+        re.compile(r"(?<![\w-])--insecure-ignore-(?:tlog|sct)(?:=(?:true|1))?(?![\w=-])"),
+        "cosign '--insecure-ignore-...' skips transparency-log/SCT checks",
+    ),
+)
+_TRUSTED_HOST_RE = re.compile(
+    r"""(?<![\w-])(--trusted-host|--allow-insecure-host|PIP_TRUSTED_HOST|UV_INSECURE_HOST|"""
+    r"""trusted[-_]host|allow[-_]insecure[-_]host)(?![\w-])""",
+    re.IGNORECASE,
+)
+_CURL_VALUE_SHORT = frozenset("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+_SHORT_BUNDLE_RE = re.compile(r"^-[A-Za-z0-9]+$")
+_ANY_REGEX_RE = re.compile(r"^\^?\.[*+]\$?$")
+_CURL_OR_COSIGN_RE = re.compile(r"curl|cosign", re.IGNORECASE)
+_COSIGN_VERBS = ("verify", "verify-blob", "verify-attestation", "verify-blob-attestation")
+
+
+def _curl_k_tokens(tokens):
+    """Yield (token, lineno) for curl short-option bundles that include -k."""
+    skip = False
+    for tok, ln in tokens:
+        if skip:
+            skip = False
+            continue
+        if not _SHORT_BUNDLE_RE.match(tok):
+            continue
+        body = tok[1:]
+        for k, ch in enumerate(body):
+            if ch == "k":
+                yield tok, ln
+                break
+            if ch in _CURL_VALUE_SHORT:
+                skip = k == len(body) - 1
+                break
+
+
+def _curl_message(tok):
+    return "Verification disabled: curl '%s' accepts any TLS certificate" % tok
+
+
+def _cosign_problem(verb, tokens):
+    if any(t in ("--key", "--sk") or t.startswith("--key=") for t, _ in tokens):
+        return None
+    for k, (tok, _) in enumerate(tokens):
+        name, eq, value = tok.partition("=")
+        if name not in ("--certificate-identity", "--certificate-identity-regexp"):
+            continue
+        if not eq:
+            value = tokens[k + 1][0] if k + 1 < len(tokens) else ""
+        if name.endswith("-regexp") and _ANY_REGEX_RE.match(value):
+            return (
+                "Verification disabled: 'cosign %s' with --certificate-identity-regexp "
+                "'%s' accepts any signer" % (verb, value)
+            )
+        return None
+    return (
+        "Verification disabled: 'cosign %s' without --certificate-identity accepts "
+        "a signature from any signer" % verb
+    )
+
+
+def _check_command_tokens(tokens, hits, lines):
+    """One pass over a logical command line: curl -k and cosign verify."""
+    mode = None
+    curl = []
+    cosign = None
+    flushed = []
+    for tok, ln in tokens:
+        if tok.endswith(";") and len(tok) > 1:
+            flushed.extend([(tok[:-1], ln), (";", ln)])
+        else:
+            flushed.append((tok, ln))
+    for tok, ln in flushed + [("|", 0)]:
+        low = tok.lower()
+        name = _cmd_name(tok) if ("curl" in low or "cosign" in low) else ""
+        if _is_separator_token(tok) or name in ("curl", "cosign"):
+            if mode == "curl":
+                for t, l in _curl_k_tokens(curl):
+                    _add_hit(hits, lines, l, _curl_message(t))
+            elif mode == "cosign":
+                problem = _cosign_problem(cosign[0], cosign[2])
+                if problem:
+                    _add_hit(hits, lines, cosign[1], problem)
+            mode, curl, cosign = None, [], None
+            if name == "curl":
+                mode = "curl"
+            elif name == "cosign":
+                mode = "cosign_verb"
+                cosign = [None, ln, []]
+            continue
+        if mode == "curl":
+            curl.append((tok, ln))
+        elif mode == "cosign_verb":
+            if tok.lower() in _COSIGN_VERBS:
+                mode = "cosign"
+                cosign[0] = tok.lower()
+            else:
+                mode = None
+        elif mode == "cosign":
+            cosign[2].append((tok, ln))
+
+
+def _analyze_verification_disabled(ctx):
+    if _file_ext(ctx) not in _CONFIG_TXT_EXTS:
+        return {}
+    lines = _ctx_lines(ctx)
+    hits = {}
+    code = [_code_text(l, ctx) for l in lines]
+    for i, raw in enumerate(lines):
+        if _skip_config_line(raw):
+            continue
+        line = code[i]
+        lineno = i + 1
+        for rx, what in _VERIFY_OFF_RES:
+            if rx.search(line):
+                _add_hit(hits, lines, lineno, "Verification disabled: " + what)
+        for m in _TRUSTED_HOST_RE.finditer(line):
+            value, _ = _first_value(code, i, m.end())
+            if value and _is_local_host(_host_of(value)):
+                continue
+            shown = "%s %s" % (m.group(1), value) if value else m.group(1)
+            _add_hit(
+                hits, lines, lineno,
+                "Verification disabled: '%s' trusts a package host without TLS "
+                "certificate checks" % shown,
+            )
+    for tokens in _logical_lines(code, _skip_config_line, _CURL_OR_COSIGN_RE):
+        if tokens:
+            _check_command_tokens(tokens, hits, lines)
+    if not (_is_github_workflow(ctx) or _is_github_action(ctx)):
+        for argv, where in _command_argvs(ctx):
+            pairs = list(zip(argv, where))
+            for k, (tok, _) in enumerate(pairs):
+                if _cmd_name(tok) == "curl":
+                    _check_command_tokens(pairs[k:], hits, lines)
+                    break
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG020: risky dependency source
+# ---------------------------------------------------------------------------
+
+_INDEX_OPT_RE = re.compile(
+    r"""(?<![\w./-])(--extra-index-url|--index-url|--default-index|--index|--find-links|"""
+    r"""--registry|PIP_EXTRA_INDEX_URL|PIP_INDEX_URL|PIP_FIND_LINKS|UV_EXTRA_INDEX_URL|"""
+    r"""UV_INDEX_URL|UV_DEFAULT_INDEX|UV_INDEX|NPM_CONFIG_REGISTRY|"""
+    r"""extra[-_]index[-_]url|index[-_]url|find[-_]links|default[-_]index|"""
+    r"""npmRegistryServer|registry[-_]url|registry)(?![\w-])""",
+    re.IGNORECASE,
+)
+_PIP_SHORT_INDEX_RE = re.compile(
+    r"""\b(?:pip3?|uv\s+pip)\s+(?:install|download|wheel)\b[^|;&\n]{0,500}?\s-i(?:\s+|=)"""
+    r"""["']?(http://[^\s"']+)""",
+    re.IGNORECASE,
+)
+# requirements*.txt: "-i URL" at the start of a line is pip's --index-url.
+_REQ_SHORT_INDEX_RE = re.compile(r"""^\s*-i(?:\s+|=)["']?([^\s"']+)""")
+_GIT_DEP_RE = re.compile(r"""(?<![\w])git\+(?!file:)[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>`,\]}]+""")
+# package.json "repository"/"url" metadata is not a dependency.
+_REPO_METADATA_KEY_RE = re.compile(
+    r"""["']?(?:url|repository|repo|homepage|bugs)["']?\s*[:=]\s*["']?$""", re.IGNORECASE
+)
+
+
+def _is_plain_http(url):
+    return url.lower().startswith("http://") and not _is_local_host(_host_of(url))
+
+
+def _index_message(opt, value):
+    extra = re.sub(r"[^a-z]", "", opt.lower()) in (
+        "extraindexurl", "pipextraindexurl", "uvextraindexurl",
+    )
+    url = value.split("=", 1)[1] if "=" in value and "://" in value.split("=", 1)[1] else value
+    http = bool(url) and _is_plain_http(url)
+    if extra and http:
+        return (
+            "Dependency source: '%s %s' adds a second package index over plain http "
+            "(dependency confusion and tampering in transit)" % (opt, _short(url))
+        )
+    if extra:
+        return (
+            "Dependency source: '%s' adds a second package index next to the default "
+            "(dependency confusion)" % opt
+        )
+    if http:
+        return (
+            "Dependency source: '%s %s' fetches packages over plain http (tampering "
+            "in transit)" % (opt, _short(url))
+        )
+    return None
+
+
+def _analyze_dependency_source(ctx):
+    if _file_ext(ctx) not in _CONFIG_TXT_EXTS:
+        return {}
+    lines = _ctx_lines(ctx)
+    pg008 = None
+    hits = {}
+    code = [_code_text(l, ctx) for l in lines]
+    for i, raw in enumerate(lines):
+        if _skip_config_line(raw):
+            continue
+        line = code[i]
+        lineno = i + 1
+        for m in _INDEX_OPT_RE.finditer(line):
+            value, _ = _first_value(code, i, m.end())
+            message = _index_message(m.group(1), value)
+            if message:
+                _add_hit(hits, lines, lineno, message)
+        shorts = [m.group(1) for m in _PIP_SHORT_INDEX_RE.finditer(line)]
+        if _file_ext(ctx) == ".txt":
+            m = _REQ_SHORT_INDEX_RE.match(line)
+            if m:
+                shorts.append(m.group(1))
+        for url in shorts:
+            message = _index_message("-i", url)
+            if message:
+                _add_hit(hits, lines, lineno, message)
+        for m in _GIT_DEP_RE.finditer(line):
+            spec = m.group(0).rstrip(").;")
+            if _COMMIT_SHA_RE.search(spec) or _REPO_METADATA_KEY_RE.search(line[:m.start()]):
+                continue
+            if pg008 is None:
+                pg008 = _cached_hits(ctx, "_pg008", _analyze_unpinned_launch)
+            if any("git source without a commit SHA" in msg for msg, _ in pg008.get(lineno, ())):
+                continue  # PG008 already reports this launch spec on this line
+            _add_hit(
+                hits, lines, lineno,
+                "Dependency source: git dependency '%s' is not pinned to a 40-char "
+                "commit SHA" % _short(spec, 80),
+            )
+    return hits
+
+
+_detect_blanket_approval = _file_level("_pg012", _analyze_blanket_approval)
+_detect_ci_permissions = _file_level("_pg015", _analyze_ci_permissions)
+_detect_exfil_channel = _file_level("_pg016", _analyze_exfil_channel)
+_detect_unbounded_loop = _file_level("_pg017", _analyze_unbounded_loop)
+_detect_container_privilege = _file_level("_pg018", _analyze_container_privilege)
+_detect_verification_disabled = _file_level("_pg019", _analyze_verification_disabled)
+_detect_dependency_source = _file_level("_pg020", _analyze_dependency_source)
+
+
+# ---------------------------------------------------------------------------
 # Rule registry
 # ---------------------------------------------------------------------------
 
@@ -1580,6 +2554,48 @@ RULES = [
         "high",
         "Attacker-controlled GitHub expression expanded in run/script/AI prompt",
         _detect_expression_injection,
+    ),
+    Rule(
+        "PG012",
+        "high",
+        "Blanket tool approval (wildcard allow entries, bypassPermissions/yolo mode, trusted MCP servers)",
+        _detect_blanket_approval,
+    ),
+    Rule(
+        "PG015",
+        "medium",
+        "Over-broad GitHub workflow token (write-all, or contents + id-token write on an untrusted trigger)",
+        _detect_ci_permissions,
+    ),
+    Rule(
+        "PG016",
+        "medium",
+        "Output exfiltration channel (image/link URL whose query carries a template placeholder)",
+        _detect_exfil_channel,
+    ),
+    Rule(
+        "PG017",
+        "medium",
+        "Unbounded agent loop or budget (max_iterations/max_turns/... set to 0, negative, unlimited or inf)",
+        _detect_unbounded_loop,
+    ),
+    Rule(
+        "PG018",
+        "high",
+        "Privileged MCP container (--privileged, host root/socket mount, host network/PID, SYS_ADMIN) or admin-scoped token in server args",
+        _detect_container_privilege,
+    ),
+    Rule(
+        "PG019",
+        "medium",
+        "Verification disabled (TLS checks off, trusted-host, strict-ssl=false, cosign verify without signer identity)",
+        _detect_verification_disabled,
+    ),
+    Rule(
+        "PG020",
+        "medium",
+        "Risky dependency source (--extra-index-url, plain-http index/registry, git+ dependency without commit SHA)",
+        _detect_dependency_source,
     ),
 ]
 
