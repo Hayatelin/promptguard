@@ -3,6 +3,8 @@
 import io
 import json
 import os
+import shutil
+import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 
@@ -93,6 +95,29 @@ class TestExamples(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("over-broad-mcp.json:5  [PG008]", out)
 
+
+class TestBatchOneRulesThroughCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        with open(os.path.join(self.tmp, "settings.json"), "w") as fh:
+            fh.write('{"permissions": {"allow": ["Bash(*)"]}}\n')
+        with open(os.path.join(self.tmp, "requirements.txt"), "w") as fh:
+            fh.write("--extra-index-url https://pkgs.example/simple\nrequests==2.31.0\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_directory_scan_reports_new_rules(self):
+        code, out, _ = run_cli([self.tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("settings.json:1  [PG012]", out)
+        self.assertIn("requirements.txt:1  [PG020]", out)
+
+    def test_min_severity_high_keeps_only_high_new_rules(self):
+        code, out, _ = run_cli(["--min-severity", "high", self.tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("[PG012]", out)
+        self.assertNotIn("[PG020]", out)
 
 if __name__ == "__main__":
     unittest.main()
