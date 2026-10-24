@@ -10,6 +10,7 @@ phrases below are assembled from fragments where they would otherwise be
 literal, and rules are scoped to realistic config/prompt shapes.
 """
 
+import bisect
 import json
 import os
 import re
@@ -444,6 +445,109 @@ _PIPE_TO_IEX_RE = re.compile(
     r"(iex|invoke-expression)\b",
     re.IGNORECASE,
 )
+# _pipe_search() splits the two patterns above at their "[^|\n]*\|" so a line
+# with many 'curl' words and no pipe is not rescanned from every word, and
+# _ShellTail replaces the shell tail's "(?:/\S*/)?" (which rescans the rest of
+# a long run like 'curl|/curl|/...' from every pipe).
+_PIPE_HEADS = {}
+_PIPE_STOP_RE = re.compile(r"[|\n]")
+_SHELL_WORD_RE = re.compile(r"(sh|bash|zsh)\b", re.IGNORECASE)
+_SLASH_SHELL_RE = re.compile(r"/(?=(?:sh|bash|zsh)\b)", re.IGNORECASE)
+_SUDO_RE = re.compile(r"sudo\s+", re.IGNORECASE)
+_SUDO_FLAG_RE = re.compile(r"-\S+\s+")
+_WHITESPACE_RE = re.compile(r"\s")
+
+
+class _ShellTail(object):
+    r"""Matches _PIPE_TO_SHELL_RE's tail at a '|', returning group(2) or None.
+
+    Same result as re.match of
+    r"\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:/\S*/)?(sh|bash|zsh)\b" (IGNORECASE),
+    with each line position examined a bounded number of times.
+    """
+
+    def __init__(self, line):
+        self.line = line
+        self.spaces = None
+        self.slashes = None
+        self.chain = {}
+
+    def _path_shell(self, y):
+        r"""group of (?:/\S*/)?(sh|bash|zsh)\b matched at y, or None."""
+        line = self.line
+        if y < len(line) and line[y] == "/":
+            if self.spaces is None:
+                self.spaces = [m.start() for m in _WHITESPACE_RE.finditer(line)]
+                self.slashes = [m.start() for m in _SLASH_SHELL_RE.finditer(line)]
+            k = bisect.bisect_left(self.spaces, y)
+            end = self.spaces[k] if k < len(self.spaces) else len(line)
+            # greedy \S* backtracks from the end of the run: the last such '/' wins
+            j = bisect.bisect_left(self.slashes, end) - 1
+            if j >= 0 and self.slashes[j] > y:
+                return _SHELL_WORD_RE.match(line, self.slashes[j] + 1).group(1)
+        m = _SHELL_WORD_RE.match(line, y)
+        return m.group(1) if m else None
+
+    def _after_flags(self, p):
+        r"""Try (?:-\S+\s+)* greedily from p, then the path/shell part."""
+        todo = []
+        while p not in self.chain:
+            todo.append(p)
+            m = _SUDO_FLAG_RE.match(self.line, p)
+            if not m:
+                self.chain[p] = self._path_shell(p)
+                todo.pop()
+                break
+            p = m.end()
+        result = self.chain[p]
+        for q in reversed(todo):
+            if result is None:
+                result = self._path_shell(q)
+            self.chain[q] = result
+        return result
+
+    def match(self, q):
+        y = _SPACES_RE.match(self.line, q + 1).end()
+        m = _SUDO_RE.match(self.line, y)
+        if m:
+            found = self._after_flags(m.end())
+            if found is not None:
+                return found
+        return self._path_shell(y)
+
+
+def _pipe_search(rx, line):
+    """(group(1), group(2)) of rx.search(line), or None (linear time).
+
+    rx is _PIPE_TO_SHELL_RE or _PIPE_TO_IEX_RE: r"\\b(word)\\b[^|\\n]*" + tail,
+    where tail starts with r"\\|". [^|\\n]* can only stop at the first '|' or
+    newline after the word, so the tail is tried once per such '|'.
+    """
+    parts = _PIPE_HEADS.get(rx.pattern)
+    if parts is None:
+        head, tail = rx.pattern.split(r"[^|\n]*", 1)
+        parts = (re.compile(head, rx.flags), re.compile(tail, rx.flags))
+        _PIPE_HEADS[rx.pattern] = parts
+    head_re, tail_re = parts
+    shell_tail = _ShellTail(line) if rx is _PIPE_TO_SHELL_RE else None
+    stop = -1
+    tried = set()
+    for m in head_re.finditer(line):
+        if m.end() > stop:
+            s = _PIPE_STOP_RE.search(line, m.end())
+            stop = s.start() if s else len(line)
+        if stop >= len(line) or line[stop] != "|" or stop in tried:
+            continue
+        tried.add(stop)
+        if shell_tail is not None:
+            found = shell_tail.match(stop)
+        else:
+            t = tail_re.match(line, stop)
+            found = t.group(1) if t else None
+        if found is not None:
+            return m.group(1), found
+    return None
+
 
 _SHELL_SEPARATORS = ("&&", "||", ";", "|", "&")
 
@@ -785,6 +889,96 @@ _INLINE_LAUNCH_RE = re.compile(
     r"""|uv\s+tool\s+run|pipx\s+run|docker\s+run)\s+\S""",
     re.IGNORECASE,
 )
+# _INLINE_LAUNCH_RE is the reference definition. Calling .search() on it is
+# quadratic on long runs such as ':::' or 'http://http://' (the optional
+# "[^\s\"'`]*[\\/]" path prefix rescans the rest of the run at every start
+# position), so _inline_launch_start() finds the same m.start(1) in linear
+# time: locate the launcher names first, then test only the start positions
+# that can precede them.
+_INLINE_PREFIX_CHARS = "\"'`=:;&|("
+_LAUNCH_AT_RE = re.compile(
+    r"""(?=((?:npx|uvx)(?:\.cmd|\.exe)?\s+\S)|(?:uv\s+tool\s+run|pipx\s+run|docker\s+run)\s+\S)""",
+    re.IGNORECASE,
+)
+_PATH_BREAK_RE = re.compile(r"""[\s"'`]""")
+_PREFIX_CHAR_RE = re.compile(r"""[=:;&|(]""")
+_SPACE_RE = re.compile(r"\s")
+_SPACES_RE = re.compile(r"\s*")
+_DASH_LEAD_RE = re.compile(r"\s*-\s+")
+_SHELL_FLAG_RE = re.compile(r"\s(?:-c|/c|/k)\s", re.IGNORECASE)
+
+
+def _inline_launch_start(line):
+    """m.start(1) of _INLINE_LAUNCH_RE.search(line), or None (linear time)."""
+    plain = set()  # launcher matched right at the position (no path prefix)
+    pathed = []    # npx/uvx positions right after '/' or '\'
+    for m in _LAUNCH_AT_RE.finditer(line):
+        p = m.start()
+        plain.add(p)
+        if m.group(1) is not None and p > 0 and line[p - 1] in "\\/":
+            pathed.append(p)
+    if not plain:
+        return None
+    breaks = [b.start() for b in _PATH_BREAK_RE.finditer(line)] if pathed else []
+
+    def run_start(k):
+        """Start of the run of non-[\\s"'`] characters containing line[k]."""
+        j = bisect.bisect_left(breaks, k) - 1
+        return breaks[j] + 1 if j >= 0 else 0
+
+    def group_ok(g):
+        """Does group 1 of _INLINE_LAUNCH_RE match at g?"""
+        if g in plain:
+            return True
+        k = bisect.bisect_right(pathed, g)
+        if k == len(pathed):
+            return False
+        p = pathed[k]
+        j = bisect.bisect_left(breaks, g)
+        return j == len(breaks) or breaks[j] >= p
+
+    def group_at(s):
+        """Group-1 start when the whole pattern matches at s, else None."""
+        if s == 0:
+            m = _DASH_LEAD_RE.match(line)
+            if m and group_ok(m.end()):
+                return m.end()
+            g = _SPACES_RE.match(line).end()
+            if group_ok(g):
+                return g
+        if s < len(line) and line[s] in _INLINE_PREFIX_CHARS:
+            g = _SPACES_RE.match(line, s + 1).end()
+            if group_ok(g):
+                return g
+        elif _SHELL_FLAG_RE.match(line, s):
+            g = _SPACES_RE.match(line, s + 3).end()
+            if group_ok(g):
+                return g
+        return None
+
+    def starts_before(g, out):
+        """Every s whose prefix alternative could end exactly at g."""
+        w = g
+        while w > 0 and _SPACE_RE.match(line, w - 1):
+            w -= 1
+        out.update(s for s in (w - 1, w - 3) if s >= 0)
+
+    cands = {0}
+    for g in plain:
+        starts_before(g, cands)
+    for p in pathed:
+        r = run_start(p - 1)
+        starts_before(r, cands)
+        m = _PREFIX_CHAR_RE.search(line, r, p - 1)
+        if m:
+            cands.add(m.start())
+    for s in sorted(cands):
+        g = group_at(s)
+        if g is not None:
+            return g
+    return None
+
+
 _DESCRIPTIVE_LINE_RE = re.compile(
     r"""^\s*(?:-\s+)?["']?(?:description|desc|summary|title|docstring|help|comment|note)["']?\s*[:=]""",
     re.IGNORECASE,
@@ -895,9 +1089,9 @@ def _pg008_heuristic(lines, hits):
         lineno = i + 1
         # (a) launcher and its arguments on the same line.
         if not _DESCRIPTIVE_LINE_RE.match(line):
-            m = _INLINE_LAUNCH_RE.search(line)
-            if m:
-                tokens = _heuristic_tokens(line[m.start(1):])
+            start = _inline_launch_start(line)
+            if start is not None:
+                tokens = _heuristic_tokens(line[start:])
                 for launcher, spec, problem, hint, _ in _launch_problems(tokens):
                     _add_hit(hits, lines, lineno, _unpinned_message(launcher, spec, problem, hint))
         # (b) command key holding only the launcher; args elsewhere.
@@ -927,14 +1121,14 @@ def _analyze_unpinned_launch(ctx):
     hits = {}
     for i, line in enumerate(lines, 1):
         for rx in (_PIPE_TO_SHELL_RE, _PIPE_TO_IEX_RE):
-            m = rx.search(line)
+            m = _pipe_search(rx, line)
             if m:
                 _add_hit(
                     hits,
                     lines,
                     i,
                     "Remote script piped straight into a shell (%s ... | %s)"
-                    % (m.group(1).lower(), m.group(2).lower()),
+                    % (m[0].lower(), m[1].lower()),
                 )
     data = None
     text = ctx.get("text", "").lstrip("\ufeff")
@@ -1650,9 +1844,9 @@ def _analyze_command_argvs(ctx):
     for i, line in enumerate(lines):
         lineno = i + 1
         if not _DESCRIPTIVE_LINE_RE.match(line):
-            m = _INLINE_LAUNCH_RE.search(line)
-            if m:
-                tokens = _heuristic_tokens(line[m.start(1):])
+            start = _inline_launch_start(line)
+            if start is not None:
+                tokens = _heuristic_tokens(line[start:])
                 out.append((tokens, [lineno] * len(tokens)))
         m = _CMD_ONLY_RE.search(line)
         if not m:
@@ -1796,12 +1990,167 @@ def _approval_message(item, where, scope):
     )
 
 
+_JSON_TOKEN_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|[{}\[\]:]')
+_TOML_HEADER_RE = re.compile(r"""^\s*\[\[?\s*([^\[\]#]+?)\s*\]\]?\s*(?:#.*)?$""")
+_BRACE_TOKEN_RE = re.compile(r"""[\\"{}]""")
+
+
+def _json_permission_allows(lines):
+    """{(line_index, column)} of each "allow" key nested inside a "permissions" value.
+
+    For JSON that parsed; walks the same nesting as the parse tree.
+    """
+    out = set()
+    stack = []  # (opening char, inside a "permissions" value?)
+    last_key = None
+    pending = None
+    for i, line in enumerate(lines):
+        for t in _JSON_TOKEN_RE.finditer(line):
+            tok = t.group(0)
+            if tok[0] == '"':
+                pending = (tok[1:-1], t.start() + 1)
+                continue
+            if tok == ":":
+                if pending is not None and stack and stack[-1][0] == "{":
+                    last_key = pending[0]
+                    if last_key.lower() == "allow" and stack[-1][1]:
+                        out.add((i, pending[1]))
+            elif tok in "{[":
+                under = bool(stack) and (
+                    stack[-1][1]
+                    or (stack[-1][0] == "{" and (last_key or "").lower() == "permissions")
+                )
+                stack.append((tok, under))
+                last_key = None
+            elif stack:
+                stack.pop()
+                last_key = None
+            pending = None
+    return out
+
+
+def _yaml_under_permissions(lines):
+    """Per line: is a less-indented line above it (an ancestor) a `permissions:` key?"""
+    under = [False] * len(lines)
+    stack = []  # (indent, is a permissions key)
+    count = 0
+    for j, line in enumerate(lines):
+        t = line.strip()
+        if not t or t.startswith(("#", "//")):
+            continue
+        d = _indent(line)
+        while stack and stack[-1][0] >= d:
+            count -= stack.pop()[1]
+        under[j] = count > 0
+        m = _YAML_KEY_RE.match(line)
+        is_perm = bool(m) and m.group(3).lower() == "permissions"
+        stack.append((d, is_perm))
+        count += is_perm
+    return under
+
+
+def _toml_under_permissions(lines):
+    """Per line: is it inside a TOML table whose dotted name has a `permissions` part?"""
+    under = []
+    cur = False
+    for line in lines:
+        m = _TOML_HEADER_RE.match(line)
+        if m:
+            cur = any(
+                part.strip().strip("\"'").lower() == "permissions"
+                for part in m.group(1).split(".")
+            )
+        under.append(cur)
+    return under
+
+
+def _brace_key(line, b):
+    """Lower-cased key written just before the '{' at line[b] ('a' in 'a: {', '"a" = {')."""
+    k = b
+    while k > 0 and line[k - 1] in " \t":
+        k -= 1
+    if k == 0 or line[k - 1] not in ":=":
+        return ""
+    k -= 1
+    while k > 0 and line[k - 1] in " \t":
+        k -= 1
+    if k > 0 and line[k - 1] in "\"'":
+        k -= 1
+    end = k
+    while k > 0 and (line[k - 1].isalnum() or line[k - 1] in "_-"):
+        k -= 1
+    return line[k:end].lower()
+
+
+class _AllowScope(object):
+    """Decides whether an `allow` list key sits under a `permissions` key.
+
+    JSON that parses: by the object nesting. Otherwise: an enclosing
+    `permissions: {` / `permissions = {` earlier on the same line, or a
+    `permissions:` ancestor by indentation (YAML), or a `[...permissions...]`
+    table header (TOML); .json/.mcp/<text> that did not parse accept either.
+    """
+
+    def __init__(self, ctx, lines):
+        self.lines = lines
+        self.ext = _file_ext(ctx)
+        self.json = (
+            _json_permission_allows(lines) if _json_data(ctx) is not None else None
+        )
+        self.yaml = None
+        self.toml = None
+        self.row = None
+
+    def ok(self, i, line, m):
+        col = m.start(1)
+        if self.json is not None:
+            return (i, col) in self.json
+        if self.row is None or self.row[0] != i:
+            self.row = [i, 0, [], False]  # line, scan position, '{' stack, inside "..."
+        row = self.row
+        k, stack, quoted = row[1], row[2], row[3]
+        while True:
+            t = _BRACE_TOKEN_RE.search(line, k, col)
+            if not t:
+                break
+            c = t.group(0)
+            k = t.end()
+            if quoted:
+                if c == "\\":
+                    k += 1  # escaped character inside a "..." string
+                elif c == '"':
+                    quoted = False
+            elif c == '"':
+                quoted = True
+            elif c == "{":
+                # each entry: is this brace, or one around it, a permissions value?
+                stack.append(
+                    (bool(stack) and stack[-1]) or _brace_key(line, t.start()) == "permissions"
+                )
+            elif c == "}" and stack:
+                stack.pop()
+        row[1], row[3] = max(k, col), quoted
+        if stack and stack[-1]:
+            return True
+        if self.ext != ".toml":
+            if self.yaml is None:
+                self.yaml = _yaml_under_permissions(self.lines)
+            if self.yaml[i]:
+                return True
+        if self.ext not in (".yaml", ".yml"):
+            if self.toml is None:
+                self.toml = _toml_under_permissions(self.lines)
+            if self.toml[i]:
+                return True
+        return False
+
+
 def _analyze_blanket_approval(ctx):
     if _file_ext(ctx) not in _CONFIG_EXTS:
         return {}
     lines = _ctx_lines(ctx)
     low = ctx.get("full_lower", "")
-    allow_key_ok = "permissions" in low
+    allow_scope = _AllowScope(ctx, lines) if "permissions" in low else None
     mcp_ok = "mcp" in low
     hits = {}
     for i, raw in enumerate(lines):
@@ -1822,7 +2171,7 @@ def _analyze_blanket_approval(ctx):
             )
         for m in _APPROVAL_LIST_KEY_RE.finditer(line):
             key = m.group(1)
-            if key.lower() == "allow" and not allow_key_ok:
+            if key.lower() == "allow" and not (allow_scope and allow_scope.ok(i, line, m)):
                 continue
             after = line[m.end():].strip()
             if not after or after.startswith(("[", "#")):
@@ -2020,7 +2369,6 @@ _LOOP_LIMIT_KEYS = (
     "maxround",
     "maxrounds",
     "recursionlimit",
-    "maxconsecutiveautoreply",
     "maxtoolcalls",
     "maxbudget",
     "maxbudgetusd",
@@ -2028,7 +2376,7 @@ _LOOP_LIMIT_KEYS = (
     "maxcostusd",
 )
 _LOOP_HINT_RE = re.compile(
-    r"iteration|turn|round|recursion|auto_?reply|tool_?calls|budget|cost", re.IGNORECASE
+    r"iteration|turn|round|recursion|tool_?calls|budget|cost", re.IGNORECASE
 )
 _LOOP_KV_RE = re.compile(
     r"""(?:^|[\s{,\[(])["']?([A-Za-z_][\w.-]{0,80})["']?\s*[:=]\s*"""
@@ -2099,6 +2447,8 @@ def _admin_cred_name(name):
     norm = name.lstrip("-").lower().replace("-", "_")
     if re.search(r"(?:^|_)(?:file|path|dir|env|var)$", norm):
         return False  # names a file / env var holding the credential, not the value
+    if norm.endswith("id"):
+        return False  # an identifier (--aws-kms-master-key-id, ROOT_KEY_ID), not a secret
     return bool(_ADMIN_SCOPE_RE.search(norm) and _CRED_WORD_RE.search(norm))
 
 
@@ -2169,10 +2519,29 @@ def _docker_privilege_hits(argv, where, start, ctx, lines, hits):
                     )
 
 
+# CI pipeline definitions: their docker commands are build steps, not MCP servers.
+_CI_CONFIG_NAMES = (
+    ".gitlab-ci.yml", ".gitlab-ci.yaml", "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
+    "azure-pipelines.yml", "azure-pipelines.yaml", ".drone.yml", ".drone.yaml",
+    ".travis.yml", ".travis.yaml",
+)
+
+
+def _is_ci_config(ctx):
+    path = (ctx.get("path") or "").replace("\\", "/").lower()
+    parts = path.split("/")
+    name = parts[-1]
+    if name in _CI_CONFIG_NAMES:
+        return True
+    if name in ("config.yml", "config.yaml") and len(parts) > 1 and parts[-2] == ".circleci":
+        return True
+    return name == "jenkinsfile" or name.startswith("jenkinsfile.") or name.endswith(".jenkinsfile")
+
+
 def _analyze_container_privilege(ctx):
     if _file_ext(ctx) not in _CONFIG_EXTS:
         return {}
-    if _is_github_workflow(ctx) or _is_github_action(ctx):
+    if _is_github_workflow(ctx) or _is_github_action(ctx) or _is_ci_config(ctx):
         return {}
     lines = _ctx_lines(ctx)
     hits = {}
@@ -2276,6 +2645,24 @@ def _curl_k_tokens(tokens):
                 break
 
 
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _curl_local_only(tokens):
+    """True when every URL in a curl command's tokens points at this machine.
+
+    Only scheme://host tokens (or --opt=scheme://host) count as URLs; a
+    command with none keeps its -k finding.
+    """
+    urls = []
+    for tok, _ in tokens:
+        if tok.startswith("-") and "=" in tok:
+            tok = tok.split("=", 1)[1]
+        if _URL_SCHEME_RE.match(tok):
+            urls.append(tok)
+    return bool(urls) and all(_is_local_host(_host_of(u)) for u in urls)
+
+
 def _curl_message(tok):
     return "Verification disabled: curl '%s' accepts any TLS certificate" % tok
 
@@ -2316,7 +2703,7 @@ def _check_command_tokens(tokens, hits, lines):
         low = tok.lower()
         name = _cmd_name(tok) if ("curl" in low or "cosign" in low) else ""
         if _is_separator_token(tok) or name in ("curl", "cosign"):
-            if mode == "curl":
+            if mode == "curl" and not _curl_local_only(curl):
                 for t, l in _curl_k_tokens(curl):
                     _add_hit(hits, lines, l, _curl_message(t))
             elif mode == "cosign":
@@ -2400,8 +2787,11 @@ _PIP_SHORT_INDEX_RE = re.compile(
 _REQ_SHORT_INDEX_RE = re.compile(r"""^\s*-i(?:\s+|=)["']?([^\s"']+)""")
 _GIT_DEP_RE = re.compile(r"""(?<![\w])git\+(?!file:)[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>`,\]}]+""")
 # package.json "repository"/"url" metadata is not a dependency.
+# pyproject [project.urls] keys (Source, "Bug Tracker", Changelog, ...) as well.
 _REPO_METADATA_KEY_RE = re.compile(
-    r"""["']?(?:url|repository|repo|homepage|bugs)["']?\s*[:=]\s*["']?$""", re.IGNORECASE
+    r"""["']?(?:url|repository|repo|homepage|bugs|source|source[ _-]?code|download|"""
+    r"""documentation|docs|changelog|issues|tracker|funding)["']?\s*[:=]\s*["']?$""",
+    re.IGNORECASE,
 )
 
 

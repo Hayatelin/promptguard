@@ -1114,5 +1114,148 @@ class TestDependencySourceRule(unittest.TestCase):
         unit = "--index-url https://pypi.org/simple git+https://g.example/o/r.git@%s " % ("a" * 40)
         self.assertLess(perf_seconds(unit, "requirements.txt"), 2.0)
 
+
+class TestLongLinePerformance(unittest.TestCase):
+    """400 KB single lines that used to backtrack quadratically (PG008's inline-launch
+    regex, reused by PG018/PG019; PG019 also scans .txt)."""
+
+    def assert_fast(self, unit):
+        for path in ("a.json", "notes.txt"):
+            self.assertLess(perf_seconds(unit, path), 2.0, (unit, path))
+
+    def test_colons(self):
+        self.assert_fast(":")
+
+    def test_open_parens(self):
+        self.assert_fast("(")
+
+    def test_http_scheme(self):
+        self.assert_fast("http://")
+
+    def test_git_urls_and_curl_without_pipe(self):
+        self.assert_fast("git+https://a/")
+        self.assert_fast("curl -k ")
+        self.assert_fast("curl|/")
+
+    def test_inline_launch_start_matches_reference_regex(self):
+        from promptguard.rules import _INLINE_LAUNCH_RE, _inline_launch_start
+        lines = [
+            "npx -y pkg", "  - npx pkg", '"command": "uvx tool"', "cmd /c npx pkg",
+            'x: "./node_modules/.bin/npx pkg"', "a:b/npx pkg", "C:\\bin\\npx.cmd -y p",
+            "run: uv tool run x", "PIPX RUN x", "docker  run img", "anpx pkg", "npx",
+            ":::npx x", "((/npx x", "- - npx x", " -c uvx x", "q /K docker run i",
+            "description: npx pkg", "http://a/npx x", "`npx` x", "=npx.exe y",
+        ]
+        for line in lines:
+            m = _INLINE_LAUNCH_RE.search(line)
+            self.assertEqual(_inline_launch_start(line), m.start(1) if m else None, line)
+
+
+class TestFalsePositiveFixes(unittest.TestCase):
+    """Findings that were false positives before (PG012, PG017-PG020)."""
+
+    # PG019: curl -k against this machine
+    def test_pg019_quiet_on_curl_k_to_localhost(self):
+        text = """\
+            services:
+              web:
+                healthcheck:
+                  test: ["CMD", "curl", "-fsk", "https://localhost/health"]
+                  interval: 30s
+            """
+        self.assertEqual(scan_rule(text, "PG019", path="docker-compose.yml"), [])
+        self.assertEqual(scan_rule("curl -k https://127.0.0.1:8443/x\n", "PG019", path="notes.txt"), [])
+
+    def test_pg019_still_fires_on_remote_or_unknown_target(self):
+        for text in (
+            "curl -k https://example.com\n",
+            "curl -k https://localhost/a https://example.com/b\n",
+            "curl -k $HEALTH_URL\n",
+        ):
+            found = scan_rule(text, "PG019", path="notes.txt")
+            self.assertEqual([f.line for f in found], [1], text)
+            self.assertIn("curl '-k'", found[0].message)
+
+    # PG018: CI pipeline files, *_id names
+    def test_pg018_skips_ci_pipeline_files(self):
+        text = """\
+            build:
+              script:
+                - docker run --privileged --network host img:1.0
+            """
+        for path in (".gitlab-ci.yml", "bitbucket-pipelines.yml", "azure-pipelines.yml",
+                     ".circleci/config.yml", ".drone.yml", ".travis.yml"):
+            self.assertEqual(scan_rule(text, "PG018", path=path), [], path)
+        self.assertEqual(scan_rule("docker run --privileged img:1.0\n", "PG018", path="Jenkinsfile"), [])
+        found = scan_rule(text, "PG018", path="deploy/mcp.yml")
+        self.assertEqual([f.line for f in found], [3, 3])
+
+    def test_pg018_quiet_on_admin_key_ids(self):
+        text = '{"command": "sops", "args": ["--aws-kms-master-key-id", "arn:aws:kms:x", "ROOT_KEY_ID=abc"]}'
+        self.assertEqual(scan_rule(text, "PG018", path="mcp.json"), [])
+        text = '{"command": "x", "args": ["--admin-token", "t", "ROOT_API_KEY=abc"]}'
+        found = scan_rule(text, "PG018", path="mcp.json")
+        self.assertEqual(len(found), 2)
+        self.assertIn("'--admin-token'", found[0].message)
+        self.assertIn("'ROOT_API_KEY'", found[1].message)
+
+    # PG017: autogen's max_consecutive_auto_reply=0 means "never auto-reply"
+    def test_pg017_quiet_on_max_consecutive_auto_reply_zero(self):
+        text = """\
+            agent:
+              max_consecutive_auto_reply: 0
+              max_turns: 0
+            """
+        found = scan_rule(text, "PG017", path="agents.yaml")
+        self.assertEqual([f.line for f in found], [3])
+        self.assertIn("'max_turns' set to 0", found[0].message)
+
+    # PG012: allow counts only under a permissions key
+    def test_pg012_quiet_on_allow_outside_permissions(self):
+        text = """\
+            permissions:
+              read: true
+            cors:
+              allow: ["*"]
+            """
+        self.assertEqual(scan_rule(text, "PG012", path="app.yaml"), [])
+        text = '{"cors": {"allow": ["*"]}, "permissions": {"deny": ["Bash(*)"]}}'
+        self.assertEqual(scan_rule(text, "PG012", path="app.json"), [])
+        text = '[permissions]\ndeny = ["Bash(*)"]\n\n[cors]\nallow = ["*"]\n'
+        self.assertEqual(scan_rule(text, "PG012", path="app.toml"), [])
+
+    def test_pg012_still_fires_on_permissions_allow(self):
+        text = '{"permissions": {"allow": ["Bash(*)"]}, "cors": {"allow": ["*"]}}'
+        found = scan_rule(text, "PG012", path=".claude/settings.json")
+        self.assertEqual(len(found), 1)
+        self.assertIn("'Bash(*)' in 'allow'", found[0].message)
+        yaml_text = "permissions:\n  allow:\n    - Bash(*)\n"
+        self.assertEqual([f.line for f in scan_rule(yaml_text, "PG012", path="a.yaml")], [3])
+        toml_text = '[permissions]\nallow = ["Bash(*)"]\n'
+        self.assertEqual([f.line for f in scan_rule(toml_text, "PG012", path="a.toml")], [2])
+        flow = 'permissions: {allow: ["Bash(*)"]}\n'
+        self.assertEqual([f.line for f in scan_rule(flow, "PG012", path="a.yml")], [1])
+
+    # PG020: pyproject [project.urls]
+    def test_pg020_quiet_on_project_urls(self):
+        text = """\
+            [project.urls]
+            Source = "git+https://github.com/org/repo"
+            "Bug Tracker" = "git+https://github.com/org/repo/issues"
+            Changelog = "git+https://github.com/org/repo/blob/main/CHANGES.md"
+            Documentation = "git+https://github.com/org/repo/wiki"
+            """
+        self.assertEqual(scan_rule(text, "PG020", path="pyproject.toml"), [])
+
+    def test_pg020_still_fires_on_git_dependency(self):
+        text = """\
+            [project]
+            dependencies = ["tool @ git+https://github.com/org/tool"]
+            [project.urls]
+            Source = "git+https://github.com/org/repo"
+            """
+        found = scan_rule(text, "PG020", path="pyproject.toml")
+        self.assertEqual([f.line for f in found], [2])
+
 if __name__ == "__main__":
     unittest.main()
