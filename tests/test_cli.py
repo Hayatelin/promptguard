@@ -87,5 +87,12 @@ class TestQuiet(unittest.TestCase):
         self.assertIn("issue(s)", out)
 
 
+class TestExamples(unittest.TestCase):
+    def test_over_broad_mcp_flags_unpinned_launch(self):
+        code, out, _ = run_cli([os.path.join(EXAMPLES, "over-broad-mcp.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("over-broad-mcp.json:5  [PG008]", out)
+
+
 if __name__ == "__main__":
     unittest.main()
