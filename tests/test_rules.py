@@ -1114,5 +1114,408 @@ class TestDependencySourceRule(unittest.TestCase):
         unit = "--index-url https://pypi.org/simple git+https://g.example/o/r.git@%s " % ("a" * 40)
         self.assertLess(perf_seconds(unit, "requirements.txt"), 2.0)
 
+
+class TestLongLinePerformance(unittest.TestCase):
+    """400 KB single lines that used to backtrack quadratically (PG008's inline-launch
+    regex, reused by PG018/PG019; PG019 also scans .txt)."""
+
+    def assert_fast(self, unit):
+        for path in ("a.json", "notes.txt"):
+            self.assertLess(perf_seconds(unit, path), 2.0, (unit, path))
+
+    def test_colons(self):
+        self.assert_fast(":")
+
+    def test_open_parens(self):
+        self.assert_fast("(")
+
+    def test_http_scheme(self):
+        self.assert_fast("http://")
+
+    def test_git_urls_and_curl_without_pipe(self):
+        self.assert_fast("git+https://a/")
+        self.assert_fast("curl -k ")
+        self.assert_fast("curl|/")
+
+    def test_inline_launch_start_matches_reference_regex(self):
+        from promptguard.rules import _INLINE_LAUNCH_RE, _inline_launch_start
+        lines = [
+            "npx -y pkg", "  - npx pkg", '"command": "uvx tool"', "cmd /c npx pkg",
+            'x: "./node_modules/.bin/npx pkg"', "a:b/npx pkg", "C:\\bin\\npx.cmd -y p",
+            "run: uv tool run x", "PIPX RUN x", "docker  run img", "anpx pkg", "npx",
+            ":::npx x", "((/npx x", "- - npx x", " -c uvx x", "q /K docker run i",
+            "description: npx pkg", "http://a/npx x", "`npx` x", "=npx.exe y",
+        ]
+        for line in lines:
+            m = _INLINE_LAUNCH_RE.search(line)
+            self.assertEqual(_inline_launch_start(line), m.start(1) if m else None, line)
+
+
+class TestFalsePositiveFixes(unittest.TestCase):
+    """Findings that were false positives before (PG012, PG017-PG020)."""
+
+    # PG019: curl -k against this machine
+    def test_pg019_quiet_on_curl_k_to_localhost(self):
+        text = """\
+            services:
+              web:
+                healthcheck:
+                  test: ["CMD", "curl", "-fsk", "https://localhost/health"]
+                  interval: 30s
+            """
+        self.assertEqual(scan_rule(text, "PG019", path="docker-compose.yml"), [])
+        self.assertEqual(scan_rule("curl -k https://127.0.0.1:8443/x\n", "PG019", path="notes.txt"), [])
+
+    def test_pg019_still_fires_on_remote_or_unknown_target(self):
+        for text in (
+            "curl -k https://example.com\n",
+            "curl -k https://localhost/a https://example.com/b\n",
+            "curl -k $HEALTH_URL\n",
+        ):
+            found = scan_rule(text, "PG019", path="notes.txt")
+            self.assertEqual([f.line for f in found], [1], text)
+            self.assertIn("curl '-k'", found[0].message)
+
+    # PG018: CI pipeline files, *_id names
+    def test_pg018_skips_ci_pipeline_files(self):
+        text = """\
+            build:
+              script:
+                - docker run --privileged --network host img:1.0
+            """
+        for path in (".gitlab-ci.yml", "bitbucket-pipelines.yml", "azure-pipelines.yml",
+                     ".circleci/config.yml", ".drone.yml", ".travis.yml"):
+            self.assertEqual(scan_rule(text, "PG018", path=path), [], path)
+        self.assertEqual(scan_rule("docker run --privileged img:1.0\n", "PG018", path="Jenkinsfile"), [])
+        found = scan_rule(text, "PG018", path="deploy/mcp.yml")
+        self.assertEqual([f.line for f in found], [3, 3])
+
+    def test_pg018_quiet_on_admin_key_ids(self):
+        text = '{"command": "sops", "args": ["--aws-kms-master-key-id", "arn:aws:kms:x", "ROOT_KEY_ID=abc"]}'
+        self.assertEqual(scan_rule(text, "PG018", path="mcp.json"), [])
+        text = '{"command": "x", "args": ["--admin-token", "t", "ROOT_API_KEY=abc"]}'
+        found = scan_rule(text, "PG018", path="mcp.json")
+        self.assertEqual(len(found), 2)
+        self.assertIn("'--admin-token'", found[0].message)
+        self.assertIn("'ROOT_API_KEY'", found[1].message)
+
+    # PG017: autogen's max_consecutive_auto_reply=0 means "never auto-reply"
+    def test_pg017_quiet_on_max_consecutive_auto_reply_zero(self):
+        text = """\
+            agent:
+              max_consecutive_auto_reply: 0
+              max_turns: 0
+            """
+        found = scan_rule(text, "PG017", path="agents.yaml")
+        self.assertEqual([f.line for f in found], [3])
+        self.assertIn("'max_turns' set to 0", found[0].message)
+
+    # PG012: allow counts only under a permissions key
+    def test_pg012_quiet_on_allow_outside_permissions(self):
+        text = """\
+            permissions:
+              read: true
+            cors:
+              allow: ["*"]
+            """
+        self.assertEqual(scan_rule(text, "PG012", path="app.yaml"), [])
+        text = '{"cors": {"allow": ["*"]}, "permissions": {"deny": ["Bash(*)"]}}'
+        self.assertEqual(scan_rule(text, "PG012", path="app.json"), [])
+        text = '[permissions]\ndeny = ["Bash(*)"]\n\n[cors]\nallow = ["*"]\n'
+        self.assertEqual(scan_rule(text, "PG012", path="app.toml"), [])
+
+    def test_pg012_still_fires_on_permissions_allow(self):
+        text = '{"permissions": {"allow": ["Bash(*)"]}, "cors": {"allow": ["*"]}}'
+        found = scan_rule(text, "PG012", path=".claude/settings.json")
+        self.assertEqual(len(found), 1)
+        self.assertIn("'Bash(*)' in 'allow'", found[0].message)
+        yaml_text = "permissions:\n  allow:\n    - Bash(*)\n"
+        self.assertEqual([f.line for f in scan_rule(yaml_text, "PG012", path="a.yaml")], [3])
+        toml_text = '[permissions]\nallow = ["Bash(*)"]\n'
+        self.assertEqual([f.line for f in scan_rule(toml_text, "PG012", path="a.toml")], [2])
+        flow = 'permissions: {allow: ["Bash(*)"]}\n'
+        self.assertEqual([f.line for f in scan_rule(flow, "PG012", path="a.yml")], [1])
+
+    # PG020: pyproject [project.urls]
+    def test_pg020_quiet_on_project_urls(self):
+        text = """\
+            [project.urls]
+            Source = "git+https://github.com/org/repo"
+            "Bug Tracker" = "git+https://github.com/org/repo/issues"
+            Changelog = "git+https://github.com/org/repo/blob/main/CHANGES.md"
+            Documentation = "git+https://github.com/org/repo/wiki"
+            """
+        self.assertEqual(scan_rule(text, "PG020", path="pyproject.toml"), [])
+
+    def test_pg020_still_fires_on_git_dependency(self):
+        text = """\
+            [project]
+            dependencies = ["tool @ git+https://github.com/org/tool"]
+            [project.urls]
+            Source = "git+https://github.com/org/repo"
+            """
+        found = scan_rule(text, "PG020", path="pyproject.toml")
+        self.assertEqual([f.line for f in found], [2])
+
+
+class TestFalsePositiveFixesRound2(unittest.TestCase):
+    """Findings the first round of fixes dropped although fc2d05a reported them correctly."""
+
+    def lines(self, text, rule_id, path):
+        return [f.line for f in only(scan_text(text, path=path), rule_id)]
+
+    # PG012: JSON-like text that json.loads rejects is read by its nesting, not by indentation
+    def test_pg012_fires_on_jsonc_and_json5_permissions(self):
+        cases = [
+            ('{\n  /* c */ "permissions": {\n    "allow": ["Bash(*)"],\n  }\n}', [3]),
+            ('{"permissions":{\n"allow":["Bash(*)"],}}', [2]),
+            ('{ "env": {}, "permissions": {\n    "allow": ["Bash(*)"],\n  },\n}', [2]),
+            ('{\n  // c\n  "permissions":\n  {\n    "allow": ["Bash(*)"]\n  }\n}', [5]),
+            ('{\n// c\n"permissions": {\n"allow": [\n"Bash(*)",\n]\n}\n}', [5]),
+            ("{\n  permissions: {\n    allow: ['Bash(*)'],\n  },\n}", [3]),
+            ('// c\n{"permissions": {"allow": ["Bash(*)"]}}', [2]),
+        ]
+        for text, want in cases:
+            self.assertEqual(self.lines(text, "PG012", ".claude/settings.json"), want, text)
+        self.assertEqual(self.lines('{"permissions": {"allow": ["*"],}}', "PG012", "<text>"), [1])
+
+    def test_pg012_jsonc_still_skips_allow_outside_permissions(self):
+        text = '{\n  // c\n  "cors": {\n    "allow": ["*"],\n  },\n  "permissions": {\n    "allow": ["Bash(*)"],\n  }\n}'
+        self.assertEqual(self.lines(text, "PG012", "settings.json"), [7])
+        text = '{\n  // c\n  "permissions": {\n    "deny": []\n  },\n  "allow": ["Bash(*)"]\n}'
+        self.assertEqual(self.lines(text, "PG012", "settings.json"), [])
+        # '//' and '/*' inside strings are text, not comments
+        text = '{"note": "http://x /* y", "cors": {"allow": ["*"]}, "permissions": {"deny": [],}}'
+        self.assertEqual(self.lines(text, "PG012", "settings.json"), [])
+
+    def test_pg012_fires_with_line_breaks_inside_json_strings(self):
+        # str.splitlines() breaks at U+2028, U+0085 and form feed; JSON strings may hold them
+        for sep in ("\u2028", "\x85", "\x0c"):
+            text = '{"permissions": {"note": "a%sb", "allow": ["Bash(*)"]}}' % sep
+            self.assertEqual(self.lines(text, "PG012", "settings.json"), [2], repr(sep))
+            text = '{"env": {"x": "a%sb"}, "permissions": {"allow": ["Bash(*)"]}}' % sep
+            self.assertEqual(self.lines(text, "PG012", "settings.json"), [2], repr(sep))
+        text = '{"a": "x\u2028y\u2028z", "cors": {"allow": ["*"]}, "permissions": {"deny": []}}'
+        self.assertEqual(self.lines(text, "PG012", "settings.json"), [])
+
+    def test_pg012_fires_on_mixed_formats(self):
+        self.assertEqual(self.lines('[permissions]\nallow = ["Bash(*)"]\n', "PG012", "a.yml"), [2])
+        self.assertEqual(self.lines("permissions:\n  allow:\n    - Bash(*)\n", "PG012", "a.toml"), [3])
+        self.assertEqual(self.lines("permissions:\n  allow:\n    - Bash(*)\n", "PG012", "a.json"), [3])
+        self.assertEqual(self.lines('[permissions]\nallow = ["Bash(*)"]\n', "PG012", "a.json"), [2])
+        self.assertEqual(self.lines('[cors]\nallow = ["*"]\n[permissions]\nx = 1\n', "PG012", "a.yml"), [])
+
+    # PG020: the extra metadata keys only count inside URL tables
+    def test_pg020_fires_on_dependencies_named_like_metadata(self):
+        cases = [
+            ('{"dependencies":{"docs":"git+https://github.com/o/r.git"}}', "package.json", [1]),
+            ('[tool.poetry.dependencies]\nsource = "git+https://github.com/o/r"\n', "pyproject.toml", [2]),
+            ('[tool.poetry.dependencies]\ndocs = "git+https://github.com/o/r"\n', "pyproject.toml", [2]),
+            ("source = git+https://github.com/o/r\n", "requirements.txt", [1]),
+            ("dependencies:\n  - source: git+https://github.com/o/r\n", "a.yaml", [2]),
+            ('[urls]\nSource = "git+https://github.com/o/r"\n', "pyproject.toml", [2]),
+        ]
+        for text, path, want in cases:
+            self.assertEqual(self.lines(text, "PG020", path), want, text)
+
+    def test_pg020_quiet_in_url_tables_and_on_base_metadata(self):
+        text = '[tool.poetry.urls]\n"Bug Tracker" = "git+https://github.com/o/r"\ndocs = "git+https://x/y"\n'
+        self.assertEqual(self.lines(text, "PG020", "pyproject.toml"), [])
+        text = '[project]\nname = "x"\nurls = { Source = "git+https://github.com/o/r" }\n'
+        self.assertEqual(self.lines(text, "PG020", "pyproject.toml"), [])
+        text = '{"repository": {"url": "git+https://github.com/o/r.git"}, "homepage": "git+https://x/y"}'
+        self.assertEqual(self.lines(text, "PG020", "package.json"), [])
+        text = '[project.urls]\nSource = "git+https://x/y"\n[project]\ndependencies = ["a @ git+https://x/y"]\n'
+        self.assertEqual(self.lines(text, "PG020", "pyproject.toml"), [4])
+
+    # PG017: only max_consecutive_auto_reply 0 is a stop; inf / unlimited / -1 are not
+    def test_pg017_fires_on_unbounded_auto_reply(self):
+        text = ("max_consecutive_auto_reply: inf\nmax_consecutive_auto_reply: unlimited\n"
+                "max_consecutive_auto_reply: -1\nmax_consecutive_auto_reply: 0\n"
+                "max_consecutive_auto_reply: 0.0\nmax_consecutive_auto_reply: 5\n")
+        self.assertEqual(self.lines(text, "PG017", "a.yaml"), [1, 2, 3])
+        self.assertEqual(self.lines('{"maxConsecutiveAutoReply": "inf"}', "PG017", "a.json"), [1])
+        self.assertEqual(self.lines("run --max_consecutive_auto_reply=-1\n", "PG017", "a.yaml"), [1])
+        self.assertEqual(self.lines("run --max_consecutive_auto_reply=0\n", "PG017", "a.yaml"), [])
+
+    # PG019: --insecure / --no-check-certificate follow the same local-only rule as -k
+    def test_pg019_local_only_insecure_and_wget(self):
+        quiet = [
+            "curl --insecure https://localhost/x\n",
+            "wget --no-check-certificate https://localhost/x\n",
+            "wget -qO- --no-check-certificate https://127.0.0.1:8443/x\n",
+            "curl -k --insecure -o out.txt https://127.0.0.1/x > log.txt 2>&1\n",
+        ]
+        for text in quiet:
+            self.assertEqual(self.lines(text, "PG019", "notes.txt"), [], text)
+        loud = [
+            "curl --insecure https://example.com/x\n",
+            "curl --insecure https://localhost/x; curl --insecure https://example.com/y\n",
+            "wget --no-check-certificate https://localhost/x https://example.com/y\n",
+            "kubectl --insecure get pods; curl --insecure https://localhost/x\n",
+            "wget --no-check-certificate $URL\n",
+        ]
+        for text in loud:
+            self.assertEqual(self.lines(text, "PG019", "notes.txt"), [1], text)
+        text = '{"command": "wget", "args": ["--no-check-certificate", "https://localhost/x"]}'
+        self.assertEqual(self.lines(text, "PG019", "mcp.json"), [])
+
+    def test_pg019_variable_or_bare_remote_target_keeps_finding(self):
+        for text in (
+            "curl -k https://localhost/h $REMOTE\n",
+            'curl -k https://localhost/h "$REMOTE"\n',
+            "curl -k https://localhost/h example.org/x\n",
+            "curl -k https://localhost/h %TARGET%\n",
+            "curl -k -H 'Host: evil.com' https://localhost/h\n",
+        ):
+            found = self.lines(text, "PG019", "notes.txt")
+            self.assertEqual(found, [1], text)
+        self.assertEqual(self.lines("curl -k https://localhost/h localhost:8080/x\n", "PG019", "notes.txt"), [])
+
+    # PG018: "id" only as its own word or glued to the credential word
+    def test_pg018_id_suffix_needs_a_word_boundary(self):
+        def msgs(name):
+            text = '{"mcpServers": {"x": {"command": "docker", "args": ["run", "%s", "v", "img:1"]}}}' % name
+            return only(scan_text(text, path="mcp.json"), "PG018")
+        for name in ("--admin-token-android", "--admin-key-grid", "--root-token-hid", "--admin-token-uuid"):
+            self.assertEqual(len(msgs(name)), 1, name)
+        for name in ("--admin-token-id", "--aws-kms-master-key-id", "--root-tokenid", "--admin-api-key-id",
+                     "--master-keyid", "--root-secretid"):
+            self.assertEqual(msgs(name), [], name)
+        self.assertEqual(self.lines("cmd: npx p@1.0.0 ROOT_SECRET_VALID=a\n", "PG018", "a.yaml"), [1])
+        self.assertEqual(self.lines("cmd: npx p@1.0.0 ROOT_TOKEN_ID=a\n", "PG018", "a.yaml"), [])
+
+
+class TestLinearHelpers(unittest.TestCase):
+    """The linear-time helpers give the answers of the code / regexes they replace."""
+
+    def test_each_launch_problem_matches_launch_problems(self):
+        import random
+        from promptguard.rules import _each_launch_problem, _launch_problems
+        vocab = ["npx", "uvx", "uv", "tool", "run", "pipx", "docker", "-p", "--package", "-c", "--call",
+                 "--from", "--spec", "--", "&&", "|", "-y", "pkg", "pkg@1.2.3", "pkg@latest", "x/y", "-p=pkg",
+                 "--from=b", "img", "img:latest", "-e", "/bin/npx", "npx.cmd", "a==1", "-v"]
+        rng = random.Random(3)
+        for _ in range(3000):
+            argv = [rng.choice(vocab) for _ in range(rng.randint(0, 12))]
+            ref = _launch_problems(argv)
+            seen = []
+            _each_launch_problem(argv, lambda item: seen.append(item) or False)
+            self.assertEqual(seen, ref, argv)
+            uniq = []
+            for item in ref:
+                if item not in uniq:
+                    uniq.append(item)
+            seen = []
+            _each_launch_problem(argv, lambda item: seen.append(item) or True)
+            self.assertEqual(seen, uniq, argv)
+
+    def test_git_dep_spans_and_metadata_key(self):
+        import random
+        from promptguard import rules
+        rng = random.Random(4)
+        alpha = ["git+", "git", "+", "file:", "https", "://", "a", ".", "-", " ", '"', "'", ",", "]", "/", "_", ":"]
+        for _ in range(3000):
+            s = "".join(rng.choice(alpha) for _ in range(rng.randint(0, 30)))
+            self.assertEqual(list(rules._git_dep_spans(s)),
+                             [(m.start(), m.end()) for m in rules._GIT_DEP_RE.finditer(s)], s)
+        keys = ["url", "Repository", "homepage", "bugs", "x", " ", "\t", '"', "'", ":", "=", "my", " "]
+        for _ in range(3000):
+            s = "".join(rng.choice(keys) for _ in range(rng.randint(0, 8)))
+            for end in range(len(s) + 1):
+                self.assertEqual(rules._metadata_key_before(s, end, rules._REPO_METADATA_WORD_RE),
+                                 bool(rules._REPO_METADATA_KEY_RE.search(s[:end])), (s, end))
+
+    def test_item_scanner_matches_list_item_regex(self):
+        import random
+        from promptguard import rules
+        rng = random.Random(5)
+        alpha = ['"', "'", "\\", ",", " ", "a", "]", "''", '\\"', "x y"]
+        for _ in range(4000):
+            s = "".join(rng.choice(alpha) for _ in range(rng.randint(0, 25)))
+            end = rng.randint(0, len(s))
+            scanner = rules._ItemScanner(s, end)
+            for pos in range(len(s) + 1):
+                m = rules._LIST_ITEM_RE.search(s, pos, end)
+                want = (m.end(), next(g for g in m.groups() if g is not None)) if m else None
+                self.assertEqual(scanner.search(pos), want, (s, pos, end))
+
+    def test_wildcard_scope_span(self):
+        from promptguard import rules
+        for tok in ("Bash(*)", "x" * 11, "Edit(**)" * 2, "mcp__server__*", "MCP__A_long_name*", "Read(*)" * 2,
+                    "Glob(*)--x(*)", "abcdefghijk)", "Bash", "*", "a.b-c(*)", "mcp__x", "İmcp__abcdefg*"):
+            line = "--allowedTools=" + tok
+            self.assertEqual(rules._wildcard_scope_span(line, 15, len(line)), rules._wildcard_scope(tok), tok)
+
+
+class TestLongLinePerformanceRound2(unittest.TestCase):
+    """400 KB single lines (and long runs of short lines) that were quadratic in fc2d05a and 399d36b."""
+
+    def assert_fast(self, unit, paths=("a.json", "a.yaml", "<text>")):
+        for path in paths:
+            self.assertLess(perf_seconds(unit, path), 2.0, (unit, path))
+
+    def test_pg008_launch_option_chains(self):
+        self.assert_fast("npx -p ")
+        self.assert_fast("uvx --from ")
+
+    def test_pg018_root_mounts(self):
+        self.assert_fast("docker run -v /:/ ")
+
+    def test_pg012_allowed_tools_flags(self):
+        self.assert_fast("--allowedTools=Bash(")
+        self.assert_fast("--allowedTools x.")
+
+    def test_pg012_unclosed_allow_lists(self):
+        self.assert_fast('"permissions": {"allow": [')
+        self.assert_fast('permissions: {allow: [\\"')
+        self.assert_fast("autoApprove: ['")
+
+    def test_pg012_jsonc_walker(self):
+        self.assert_fast('{"permissions": {"allow": ["Bash(*)"],', (".claude/settings.json", "<text>"))
+        self.assert_fast("/*", (".claude/settings.json",))
+
+    def test_pg020_git_runs(self):
+        self.assert_fast("git+", ("requirements.txt", "pyproject.toml", "a.json"))
+        self.assert_fast("url = git+https://x/y ", ("requirements.txt", "pyproject.toml"))
+
+    def test_many_short_lines(self):
+        self.assert_fast("[project.urls]\n", ("pyproject.toml", "a.json"))
+        self.assert_fast('[permissions]\nallow = ["*"]\n', ("a.toml", "a.json"))
+
+    def test_pg019_local_insecure(self):
+        self.assert_fast("curl --insecure https://localhost/x ", ("notes.txt", "a.yaml"))
+        self.assert_fast("wget --no-check-certificate https://localhost/x ", ("notes.txt", "a.yaml"))
+
+
+class TestManyDistinctFindingsPerLine(unittest.TestCase):
+    """One 400 KB line yielding tens of thousands of distinct findings (_add_hit dedup)."""
+
+    def seconds(self, parts, path, prefix=""):
+        line = prefix
+        i = 0
+        while len(line) < PERF_BYTES:
+            line += parts % {"i": i}
+            i += 1
+        start = time.time()
+        found = scan_text(line, path=path)
+        return time.time() - start, len(found)
+
+    def test_distinct_unpinned_launches(self):
+        took, count = self.seconds("uvx tool%(i)d ; ", "a.yaml")
+        self.assertGreater(count, 1000)
+        self.assertLess(took, 2.0)
+
+    def test_distinct_wildcard_allow_entries(self):
+        took, count = self.seconds(
+            '"mcp__srv%(i)d__*", ', ".claude/settings.json", prefix='{"permissions": {"allow": ['
+        )
+        self.assertGreater(count, 1000)
+        self.assertLess(took, 2.0)
+        took, count = self.seconds("git+https://h%(i)d.io/r ", "requirements.txt")
+        self.assertGreater(count, 1000)
+        self.assertLess(took, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
