@@ -2054,25 +2054,103 @@ def _key_needles(key):
 
 def _key_offset(text, node, key):
     """Offset of `"key":` directly inside JSON object `node` (else node.start)."""
-    children = [
-        v for v in node.values() if isinstance(v, (_JDict, _JList))
-    ]
+    # Sibling values occupy disjoint spans, so after sorting by start a match
+    # can only lie inside the child with the greatest start <= the match.
+    spans = sorted(
+        (v.start, v.end) for v in node.values() if isinstance(v, (_JDict, _JList))
+    )
+    starts = [s for s, _ in spans]
     for needle in _key_needles(key):
         rx = re.compile(re.escape(needle) + r"\s*:")
         for m in rx.finditer(text, node.start, node.end):
             p = m.start()
-            if not any(c.start <= p < c.end for c in children):
+            k = bisect.bisect_right(starts, p) - 1
+            if k < 0 or p >= spans[k][1]:
                 return p
     return node.start
 
 
+_JSON_STRING_RE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
+_JSON_ESCAPE_RE = re.compile(r"\\(.)", re.DOTALL)
+_HASH_MOD = (1 << 61) - 1
+_HASH_BASE = 1000003
+
+
+def _poly_hash(s):
+    h = 0
+    for ch in s:
+        h = (h * _HASH_BASE + ord(ch)) % _HASH_MOD
+    return h
+
+
+class _ItemOffsets(object):
+    """_item_offset() for many items of one JSON array, after a single scan.
+
+    text.find(json.dumps(item), node.start, node.end) per item rescans the
+    array from its start (quadratic for long allowedTools lists).  In valid
+    JSON every '"' opens a string literal, closes one, or is an escaped quote
+    inside one, and a needle (itself a JSON string literal without raw
+    newlines or unescaped quotes) starting at such a '"' can only end at one
+    place: an opening quote -> that whole literal; an escaped quote -> the
+    rest of its literal; a closing quote -> '"' + the gap up to the next
+    opening quote + '"'.  So the first occurrence of any needle is the
+    smallest start recorded for it in those three tables.
+    """
+
+    def __init__(self, text, node):
+        self.text = text
+        self.node = node
+        self.first = {}
+        self.suffix = None
+        lits = list(_JSON_STRING_RE.finditer(text, node.start, node.end))
+        first = self.first
+        for k, m in enumerate(lits):
+            a, b = m.span()
+            first.setdefault(m.group(), a)
+            if k + 1 < len(lits):
+                first.setdefault('"' + text[b:lits[k + 1].start()] + '"', b - 1)
+        for m in lits:
+            if '\\"' not in m.group():
+                continue
+            if self.suffix is None:
+                self.suffix = {}
+            a, b = m.span()
+            quotes = [
+                e.start(1) for e in _JSON_ESCAPE_RE.finditer(text, a + 1, b - 1)
+                if e.group(1) == '"'
+            ]
+            h = 0
+            power = 1
+            pos = b - 1
+            for q in reversed(quotes):
+                while pos >= q:
+                    h = (h + ord(text[pos]) * power) % _HASH_MOD
+                    power = power * _HASH_BASE % _HASH_MOD
+                    pos -= 1
+                self.suffix.setdefault((b - q, h), q)
+
+    def find(self, needle):
+        best = self.first.get(needle, -1)
+        if self.suffix is not None:
+            q = self.suffix.get((len(needle), _poly_hash(needle)), -1)
+            if q >= 0 and (best < 0 or q < best):
+                if self.text.startswith(needle, q):
+                    best = q
+                else:  # hash collision: fall back to a plain search
+                    return self.text.find(needle, self.node.start, self.node.end)
+        return best
+
+    def offset(self, item):
+        for needle in _key_needles(item):
+            p = self.find(needle)
+            if p >= 0:
+                return p
+        return self.node.start
+
+
 def _item_offset(text, node, item):
     """Offset of string `item` inside JSON array `node` (else node.start)."""
-    for needle in _key_needles(item):
-        p = text.find(needle, node.start, node.end)
-        if p >= 0:
-            return p
-    return node.start
+    return _ItemOffsets(text, node).offset(item)
 
 
 def _basename(ctx):
@@ -2091,8 +2169,11 @@ _AGENT_DENY_KEYS = ("disallowedTools", "disallowed-tools", "disallowed_tools")
 _ALLOWED_TOOLS_KEYS = ("allowed-tools", "allowed_tools", "allowedTools")
 # "*", "mcp__*", or Tool(...) whose specifier is only "*"/":" (plus an
 # optional "domain:" prefix), e.g. Bash(*), Bash(:*), Read(**), WebFetch(domain:*).
+# Same language as "\(\s*(?:domain\s*:\s*)?[*:\s]*\*[*:\s]*\)", but the
+# lookahead finds the required "*" once instead of re-scanning the run for
+# every split point (that form was quadratic on "Bash(* * * ..." with no ")").
 _WILDCARD_TOOL_RE = re.compile(
-    r"^(?:\*|mcp__\*.*|[A-Za-z][\w-]*\(\s*(?:domain\s*:\s*)?[*:\s]*\*[*:\s]*\))$",
+    r"^(?:\*|mcp__\*.*|[A-Za-z][\w-]*\((?:\s*domain\s*:)?(?=[*:\s]*\*)[*:\s]*\))$",
     re.IGNORECASE,
 )
 _NPM_INSTALL_SCRIPTS = ("preinstall", "install", "postinstall")
@@ -2186,17 +2267,42 @@ def _fm_entries(field):
     return out
 
 
+# Front-matter fields only sub-agent definitions use (skills and docs pages
+# share name/description, so those two alone prove nothing).
+_AGENT_ONLY_KEYS = (
+    "tools", "model", "color", "permissionMode", "mcpServers",
+) + _AGENT_DENY_KEYS
+_DOC_DIRS = (
+    "docs", "doc", "documentation", "website", "site", "wiki", "blog", "pages",
+)
+
+
 def _is_agent_definition(ctx, fields):
+    """True for a Claude Code sub-agent file, not a skill or a docs page.
+
+    Location decides first: anything under .claude/agents/, or a direct child
+    of a plugin's agents/ folder that is not inside a docs tree.  Deeper or
+    docs-tree files under some agents/ folder count only when their front
+    matter carries an agent-only field such as tools or model.
+    """
     path = ctx.get("path") or "<text>"
     if path == "<text>":
         return False
-    parts = [p for p in re.split(r"[\\/]+", path) if p]
-    name = parts[-1].lower() if parts else ""
-    if not name.endswith(".md") or name == "readme.md":
+    parts = [p.lower() for p in re.split(r"[\\/]+", path) if p]
+    name = parts[-1] if parts else ""
+    if not name.endswith(".md") or name in ("readme.md", "skill.md"):
         return False
-    if not any(p.lower() == "agents" for p in parts[:-1]):
+    dirs = parts[:-1]
+    if "agents" not in dirs:
         return False
-    return "name" in fields and "description" in fields
+    if "name" not in fields or "description" not in fields:
+        return False
+    for k in range(1, len(dirs)):
+        if dirs[k] == "agents" and dirs[k - 1] == ".claude":
+            return True
+    if dirs[-1] == "agents" and not any(d in _DOC_DIRS for d in dirs):
+        return True
+    return any(k in fields for k in _AGENT_ONLY_KEYS)
 
 
 def _pg013_markdown(ctx, lines, hits):
@@ -2314,9 +2420,12 @@ def _pg013_plugin(text, starts, data, lines, hits, base):
             allowed = spec.get("allowedTools") if isinstance(spec, dict) else None
             if not isinstance(allowed, _JList):
                 continue
+            offsets = None
             for entry in allowed:
                 if isinstance(entry, str) and _WILDCARD_TOOL_RE.match(entry.strip()):
-                    lineno = _offset_line(starts, _item_offset(text, allowed, entry))
+                    if offsets is None:
+                        offsets = _ItemOffsets(text, allowed)
+                    lineno = _offset_line(starts, offsets.offset(entry))
                     _add_hit(
                         hits, lines, lineno,
                         "Plugin command '%s' pre-approves wildcard tool entry '%s' "
@@ -2382,10 +2491,19 @@ _TRIVIAL_PATTERNS = {
 }
 
 
+_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+# "HTMLParser" -> "HTML_Parser": "_" before the last capital of a run of 2+
+# capitals that is followed by a lowercase letter.  Same result as
+# re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s) without its quadratic
+# backtracking on long all-capital names.
+_ACRONYM_END_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_NAME_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
 def _name_tokens(name):
-    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
-    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
-    return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t]
+    s = _CAMEL_RE.sub(r"\1_\2", name)
+    s = _ACRONYM_END_RE.sub("_", s)
+    return [t for t in _NAME_SPLIT_RE.split(s.lower()) if t]
 
 
 def _sink_category(param, tool_tokens):
@@ -2452,6 +2570,49 @@ def _is_constrained(schema):
     return False
 
 
+def _loose_optional(schema):
+    """Label suffix ("" or "[]") for a loose Optional/Union string schema.
+
+    Pydantic and FastMCP emit Optional[str] as {"anyOf": [{"type": "string"},
+    {"type": "null"}]} with no top-level "type" (oneOf likewise).  The
+    schema counts when every branch is null, a string or an array of
+    strings, and some string branch is unconstrained; enum/const/maxLength/
+    pattern may sit on the outer schema or on that branch.  Returns None
+    when the schema is not of that shape or is constrained.
+    """
+    if _is_constrained(schema):
+        return None
+    for key in ("anyOf", "oneOf"):
+        alts = schema.get(key)
+        if not isinstance(alts, list) or not alts:
+            continue
+        suffix = None
+        shaped = True
+        branches = 0
+        for alt in alts:
+            if not isinstance(alt, dict) or "$ref" in alt:
+                shaped = False
+                break
+            types = _schema_types(alt)
+            if types == {"null"}:
+                continue
+            if "string" in types and types <= {"string", "null"}:
+                target, mark = alt, ""
+            elif "array" in types and types <= {"array", "null"} and isinstance(
+                alt.get("items"), dict
+            ) and "string" in _schema_types(alt["items"]):
+                target, mark = alt["items"], "[]"
+            else:
+                shaped = False
+                break
+            branches += 1
+            if suffix is None and not _is_constrained(target):
+                suffix = mark
+        if shaped and branches and suffix is not None:
+            return suffix
+    return None
+
+
 def _tool_schemas(node, out):
     """Collect (tool_name, schema) for every tool definition in a JSON tree."""
     if isinstance(node, dict):
@@ -2500,6 +2661,10 @@ def _broad_params(schema, tool_tokens, prefix, depth, out):
             and not _is_constrained(target)
         ):
             out.append((label, category, props, pname, pschema))
+        elif category and target is None and "type" not in pschema and "$ref" not in pschema:
+            suffix = _loose_optional(pschema)
+            if suffix is not None:
+                out.append((label + suffix, category, props, pname, pschema))
         if "object" in types:
             _broad_params(pschema, tool_tokens, prefix + pname + ".", depth + 1, out)
 
@@ -2597,9 +2762,14 @@ _CHECKSUM_FILE_RES = (
 _SIGNATURE_FILE_RE = re.compile(
     r"\.(?:sig|asc|minisig|pem|crt|cert|sigstore|bundle|intoto\.jsonl)$", re.IGNORECASE
 )
+# Signature checks that waive PG021 for the whole file.  "-V" may be merged
+# with other short flags (minisign -Vm file).  gpg --decrypt is not listed:
+# it prints a bad or missing signature as a warning and still exits 0 for
+# encrypted-only input, so it does not gate the download on a signature.
 _SIGNATURE_VERIFY_RE = re.compile(
     r"\bgpg2?\b[^\n|;&]{0,200}?\s--verify\b|\bgpgv2?\b|\bcosign\s+verify(?:-blob)?\b|"
-    r"\b(?:minisign|signify)\b[^\n|;&]{0,200}?\s-V\b|"
+    r"\b(?:minisign|signify)\b[^\n|;&]{0,200}?\s-[A-Za-z]*V[A-Za-z]*\b|"
+    r"\bopenssl\s+dgst\b[^\n|;&]{0,200}?\s-verify\b|\bsigstore\s+verify\b|"
     r"\bgh\s+attestation\s+verify\b|\bslsa-verifier\b"
 )
 
@@ -2616,9 +2786,13 @@ _MULTI_TENANT_HOSTS = (
 )
 
 
+_URL_PARTS_RE = re.compile(r"https?://([^/?#]+)([^?#]*)", re.IGNORECASE)
+_URL_QUERY_RE = re.compile(r"[?#]")
+
+
 def _url_origin(url):
     """'host' (or 'host/owner/repo' on shared code hosts) of an http(s) URL."""
-    m = re.match(r"https?://([^/?#]+)([^?#]*)", url, re.IGNORECASE)
+    m = _URL_PARTS_RE.match(url)
     if not m:
         return None
     host = m.group(1).rsplit("@", 1)[-1].lower()
@@ -2630,23 +2804,30 @@ def _url_origin(url):
 
 
 def _url_basename(url):
-    path = re.split(r"[?#]", url, maxsplit=1)[0].rstrip("/")
+    path = _URL_QUERY_RE.split(url, maxsplit=1)[0].rstrip("/")
     return path.rsplit("/", 1)[-1].strip("\"',")
 
 
 def _is_checksum_file(name):
     low = name.lower()
+    # Each pattern contains one of these literals.
+    if "sha" not in low and "md5" not in low and "b2" not in low and "checksum" not in low:
+        return False
     return any(rx.search(low) for rx in _CHECKSUM_FILE_RES)
 
 
-def _pg021_logical_lines(lines):
-    """Yield [(index, text)] pieces joined by trailing '\\' or '`' continuations."""
+def _pg021_logical_lines(clean):
+    """Yield [(index, text)] pieces joined by trailing '\\' or '`' continuations.
+
+    `clean` holds the lines already passed through _strip_yaml_comment
+    (which is idempotent, so this matches stripping each raw line here).
+    """
     pieces = []
-    for i, raw in enumerate(lines):
-        s = _strip_yaml_comment(raw)
+    for i, s in enumerate(clean):
         if _PROSE_KEY_RE.match(s):
             s = ""
-        s = _GH_EXPR_RE.sub(lambda m: "${{" + re.sub(r"\s+", "", m.group(1)) + "}}", s)
+        if "${{" in s:
+            s = _GH_EXPR_RE.sub(lambda m: "${{" + re.sub(r"\s+", "", m.group(1)) + "}}", s)
         stripped = s.rstrip()
         if stripped.endswith("\\") or stripped.endswith(" `"):
             pieces.append((i, stripped[:-1]))
@@ -2659,6 +2840,8 @@ def _pg021_logical_lines(lines):
 
 
 def _is_upload(command, segment):
+    if "-" not in segment:  # every upload pattern starts with a "-" option
+        return False
     name = command.lower()
     if name == "curl":
         return bool(_CURL_UPLOAD_RE.search(segment))
@@ -2671,15 +2854,25 @@ def _is_upload(command, segment):
 
 def _download_urls(pieces, dockerfile, assigned):
     """[(url, index)] for every URL fetched on one logical line."""
-    texts = [t for _, t in pieces]
-    offsets = []
-    pos = 0
-    for t in texts:
-        offsets.append(pos)
-        pos += len(t) + 1
-    logical = " ".join(texts)
-    segments = []
+    if len(pieces) == 1:
+        logical = pieces[0][1]
+        offsets = None
+    else:
+        texts = [t for _, t in pieces]
+        offsets = []
+        pos = 0
+        for t in texts:
+            offsets.append(pos)
+            pos += len(t) + 1
+        logical = " ".join(texts)
+    # Every _URL_TOKEN_RE alternative needs "://" or "$".
+    if "://" not in logical and "$" not in logical:
+        return []
     cmds = list(_DOWNLOAD_CMD_RE.finditer(logical))
+    add = dockerfile and _DOCKER_ADD_RE.match(logical)
+    if not cmds and not add:
+        return []
+    segments = []
     for k, m in enumerate(cmds):
         limit = cmds[k + 1].start() if k + 1 < len(cmds) else len(logical)
         end = _SEGMENT_END_RE.search(logical, m.end(), limit)
@@ -2687,7 +2880,7 @@ def _download_urls(pieces, dockerfile, assigned):
         segment = logical[m.end():seg_end]
         if not _is_upload(m.group(1), segment):
             segments.append((m.end(), seg_end))
-    if dockerfile and _DOCKER_ADD_RE.match(logical):
+    if add:
         segments.append((0, len(logical)))
     out = []
     for start, end in segments:
@@ -2700,9 +2893,53 @@ def _download_urls(pieces, dockerfile, assigned):
                 if var not in assigned:
                     continue
                 url = assigned[var] + (rest or "")
-            piece = bisect.bisect_right(offsets, t.start()) - 1
-            out.append((url, pieces[piece][0]))
+            if offsets is None:
+                out.append((url, pieces[0][0]))
+            else:
+                piece = bisect.bisect_right(offsets, t.start()) - 1
+                out.append((url, pieces[piece][0]))
     return out
+
+
+def _pg021_artifact_index(artifacts, hosts):
+    """{host: (names, trie)} for the artifact downloads on the given hosts.
+
+    names keeps download order.  trie maps lowercase names split on "." to
+    the position of the first artifact with that name: for a checksum name N,
+    N.lower().startswith(A.lower() + ".") holds exactly when A's dot segments
+    are a proper prefix of N's, so one walk over N finds every candidate.
+    """
+    index = {}
+    for host, name, _ in artifacts:
+        if host not in hosts:
+            continue
+        entry = index.get(host)
+        if entry is None:
+            entry = index[host] = ([], {})
+        names, trie = entry
+        node = trie
+        for seg in name.lower().split("."):
+            node = node.setdefault(seg, {})
+        node.setdefault(None, len(names))
+        names.append(name)
+    return index
+
+
+def _pg021_pick_artifact(entry, checksum_name):
+    """First same-host artifact whose name + "." prefixes the checksum name
+    (case-insensitively), else the first same-host artifact."""
+    names, trie = entry
+    segs = checksum_name.lower().split(".")
+    best = None
+    node = trie
+    for seg in segs[:-1]:
+        node = node.get(seg)
+        if node is None:
+            break
+        pos = node.get(None)
+        if pos is not None and (best is None or pos < best):
+            best = pos
+    return names[best if best is not None else 0]
 
 
 def _analyze_same_origin_checksum(ctx):
@@ -2714,38 +2951,43 @@ def _analyze_same_origin_checksum(ctx):
     if not ("http://" in low or "https://" in low):
         return {}
     lines = _ctx_lines(ctx)
-    clean = [_strip_yaml_comment(s) for s in lines]
-    if any(_SIGNATURE_VERIFY_RE.search(s) for s in clean):
+    # _strip_yaml_comment only changes lines that contain "#".
+    clean = [_strip_yaml_comment(s) if "#" in s else s for s in lines]
+    # One search over the lines joined by "|": no alternative can match
+    # across it (it is neither \s nor in [^\n|;&], and \b sees it as a line
+    # edge), so this equals searching line by line.
+    if _SIGNATURE_VERIFY_RE.search("|".join(clean)):
         return {}
     assigned = {}
     for s in clean:
+        if "://" not in s:  # both patterns need a literal http(s)://
+            continue
         for m in _URL_ASSIGN_RE.finditer(s):
             assigned.setdefault(m.group(1), m.group(2))
         if dockerfile:
             m = _DOCKER_ENV_SPACE_RE.match(s)
             if m:
                 assigned.setdefault(m.group(1), m.group(2))
-    downloads = []
-    for pieces in _pg021_logical_lines(lines):
+    checksums = []
+    artifacts = []
+    for pieces in _pg021_logical_lines(clean):
         for url, idx in _download_urls(pieces, dockerfile, assigned):
             host = _url_origin(url)
             name = _url_basename(url)
             if host and name:
-                downloads.append((host, name, idx))
-    checksums = [d for d in downloads if _is_checksum_file(d[1])]
+                if _is_checksum_file(name):
+                    checksums.append((host, name, idx))
+                elif not _SIGNATURE_FILE_RE.search(name):
+                    artifacts.append((host, name, idx))
     if not checksums:
         return {}
-    artifacts = [
-        d for d in downloads
-        if not _is_checksum_file(d[1]) and not _SIGNATURE_FILE_RE.search(d[1])
-    ]
     hits = {}
+    by_host = _pg021_artifact_index(artifacts, set(c[0] for c in checksums))
     for host, name, idx in checksums:
-        same = [a for a in artifacts if a[0] == host]
-        if not same:
+        entry = by_host.get(host)
+        if entry is None:
             continue
-        exact = [a for a in same if name.lower().startswith(a[1].lower() + ".")]
-        artifact = (exact or same)[0][1]
+        artifact = _pg021_pick_artifact(entry, name)
         _add_hit(
             hits, lines, idx + 1,
             "Same-origin checksum: '%s' is downloaded from %s, the same origin as "
@@ -4473,6 +4715,18 @@ RULES = [
         _detect_blanket_approval,
     ),
     Rule(
+        "PG013",
+        "medium",
+        "Sub-agent, skill or plugin inherits or pre-approves broad permissions (omitted or wildcard tools, auto-run install/session hooks)",
+        _detect_permission_inheritance,
+    ),
+    Rule(
+        "PG014",
+        "medium",
+        "Over-broad tool input schema (free-form path, command, URL, SQL or code string parameter)",
+        _detect_broad_schema,
+    ),
+    Rule(
         "PG015",
         "medium",
         "Over-broad GitHub workflow token (write-all, or contents + id-token write on an untrusted trigger)",
@@ -4507,18 +4761,6 @@ RULES = [
         "medium",
         "Risky dependency source (--extra-index-url, plain-http index/registry, git+ dependency without commit SHA)",
         _detect_dependency_source,
-    ),
-    Rule(
-        "PG013",
-        "medium",
-        "Sub-agent, skill or plugin inherits or pre-approves broad permissions (omitted or wildcard tools, auto-run install/session hooks)",
-        _detect_permission_inheritance,
-    ),
-    Rule(
-        "PG014",
-        "medium",
-        "Over-broad tool input schema (free-form path, command, URL, SQL or code string parameter)",
-        _detect_broad_schema,
     ),
     Rule(
         "PG021",

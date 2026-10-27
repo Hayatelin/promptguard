@@ -1980,5 +1980,302 @@ class TestSameOriginChecksumRule(unittest.TestCase):
         self.assertIn("artifact 'tool3.tgz'", found[0].message)
 
 
+def _ref_name_tokens(name):
+    """_name_tokens as first written (quadratic on long all-capital names)."""
+    import re
+
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t]
+
+
+def _ref_wildcard(entry):
+    import re
+
+    return bool(re.match(
+        r"^(?:\*|mcp__\*.*|[A-Za-z][\w-]*\(\s*(?:domain\s*:\s*)?[*:\s]*\*[*:\s]*\))$",
+        entry, re.IGNORECASE,
+    ))
+
+
+def _seeded_strings(alphabet, count, max_len, seed):
+    import random
+
+    rnd = random.Random(seed)
+    return [
+        "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, max_len)))
+        for _ in range(count)
+    ]
+
+
+class TestBatch2ReviewFixes(unittest.TestCase):
+    """PR #4 review: linear-time helpers, agent-file detection, signature
+    verifiers, Optional schemas, rule order."""
+
+    # -- 1. PG013 wildcard entry regex --------------------------------------
+    def test_wildcard_regex_matches_reference(self):
+        from promptguard import rules
+
+        samples = [
+            "*", "*\n", "mcp__*", "MCP__*x", "mcp__*\n\n", "Bash(*)", "Bash(:*)",
+            "Bash( * )", "Read(**)", "WebFetch(domain:*)", "WebFetch( Domain : * )",
+            "WebFetch(domain:)", "Bash()", "Bash(*)\n", "Bash(*\n)", "Bash(* x)",
+            "Bash(git *)", "1(*)", "B-x_1(*:*)", "Bash(*", "Bash(*))", "(*)",
+            "Bash(domain:domain:*)", "Bash(\u00a0*\u2028)", "\u212a(*)", "\u017f(*)",
+        ]
+        samples += _seeded_strings("*: \n\tdomainx()B_-\u00a0", 20000, 12, 13)
+        samples += ["Bash(" + s for s in _seeded_strings("*: \n\tdomain)x", 20000, 10, 14)]
+        for s in samples:
+            self.assertEqual(
+                bool(rules._WILDCARD_TOOL_RE.match(s)), _ref_wildcard(s), repr(s)
+            )
+
+    def test_wildcard_regex_linear_on_unclosed_paren(self):
+        for body in ("* " * 200000, "*" * 400000 + "x)", ": " * 200000 + "*"):
+            text = "---\nname: a\ndescription: d\nallowed-tools: Bash(" + body + "\n---\n"
+            self.assertGreaterEqual(len(text), 400000)
+            findings, elapsed = timed_scan(text, "skills/a/SKILL.md")
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(only(findings, "PG013"), [])
+        text = "---\nname: a\ndescription: d\nallowed-tools: Bash(" + "* " * 200000 + ")\n---\n"
+        findings, elapsed = timed_scan(text, "skills/a/SKILL.md")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual([f.line for f in only(findings, "PG013")], [4])
+
+    # -- 2. PG014 name tokens -----------------------------------------------
+    def test_name_tokens_match_reference(self):
+        import itertools
+
+        from promptguard import rules
+
+        names = ["".join(p) for k in range(7) for p in itertools.product("AaB0_", repeat=k)]
+        names += _seeded_strings("AaBbZz09_- .\u00c9\u00e9\u212a", 20000, 16, 15)
+        names += ["HTMLParser", "getHTTPResponseCode", "XMLHttpRequest", "A" * 60 + "b", "URLPath"]
+        for name in names:
+            self.assertEqual(rules._name_tokens(name), _ref_name_tokens(name), repr(name))
+
+    def test_name_tokens_linear_on_capitals(self):
+        big = "A" * 400000
+        for text in (
+            '{"tools":[{"name":"t","inputSchema":{"type":"object","properties":{"%s":{"type":"string"}}}}]}' % big,
+            '{"tools":[{"name":"%s","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}]}' % big,
+            '{"tools":[{"name":"t","inputSchema":{"type":"object","properties":{"%sPath":{"type":"string"}}}}]}' % big,
+        ):
+            findings, elapsed = timed_scan(text, TOOLS)
+            self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG014")), 1)
+
+    # -- 3. PG021 checksum x artifact pairing --------------------------------
+    def test_artifact_pick_matches_reference(self):
+        import random
+
+        from promptguard import rules
+
+        rnd = random.Random(16)
+        parts = ["tool", "Tool", "tgz", "tar", "gz", "", "x", "\u0130", "sha256", "TOOL"]
+        for _ in range(3000):
+            arts = []
+            for _ in range(rnd.randint(1, 8)):
+                name = ".".join(rnd.choice(parts) for _ in range(rnd.randint(1, 4)))
+                if name:
+                    arts.append((rnd.choice(["h1", "h2"]), name, 0))
+            for _ in range(4):
+                host = rnd.choice(["h1", "h2"])
+                base = rnd.choice([a[1] for a in arts] + parts)
+                name = base + rnd.choice([".sha256", ".", "..sha256", ".tgz.sha256"])
+                same = [a for a in arts if a[0] == host]
+                index = rules._pg021_artifact_index(arts, {host})
+                if not same:
+                    self.assertNotIn(host, index)
+                    continue
+                exact = [a for a in same if name.lower().startswith(a[1].lower() + ".")]
+                self.assertEqual(
+                    rules._pg021_pick_artifact(index[host], name), (exact or same)[0][1]
+                )
+
+    def test_checksum_pairs_linear(self):
+        pairs = ";".join(
+            "curl https://h.example.com/a%d;curl https://h.example.com/a%d.sha256" % (i, i)
+            for i in range(8000)
+        )
+        cases = [
+            ("Dockerfile", "RUN " + pairs),
+            (RELEASE, "- run: " + pairs),
+            ("Dockerfile", "ADD " + " ".join(
+                "https://h.example.com/a%d https://h.example.com/a%d.sha256" % (i, i)
+                for i in range(7000))),
+        ]
+        for path, text in cases:
+            self.assertGreaterEqual(len(text), 400000)
+            findings, elapsed = timed_scan(text, path)
+            self.assertLess(elapsed, 2.0)
+            found = only(findings, "PG021")
+            self.assertGreaterEqual(len(found), 7000)
+            self.assertIn("'a0.sha256'", found[0].message)
+            self.assertIn("artifact 'a0'", found[0].message)
+
+    # -- 4. JSON offset helpers ---------------------------------------------
+    def test_item_and_key_offsets_match_plain_search(self):
+        import random
+        import re
+
+        from promptguard import rules
+
+        rnd = random.Random(17)
+        items = ["*", "Bash(*)", 'a"b', '"', "\\", ",", ", ", ":", "\u00e9", "", '"*"', "a\\"]
+        for _ in range(2000):
+            arr = [rnd.choice(items + [rnd.choice(items) + rnd.choice(items)]) for _ in range(rnd.randint(0, 6))]
+            if rnd.random() < 0.3:
+                arr.append({rnd.choice(items): rnd.choice(items)})
+            text = json.dumps({"x": {"y": 1}, "allowedTools": arr, "x ": [arr]},
+                              ensure_ascii=rnd.random() < 0.5, indent=rnd.choice([None, 1]))
+            data = rules._json_positions(text)
+            node = data["allowedTools"]
+            index = rules._ItemOffsets(text, node)
+            for item in items + [a + b for a in items for b in items]:
+                want = node.start
+                for needle in rules._key_needles(item):
+                    p = text.find(needle, node.start, node.end)
+                    if p >= 0:
+                        want = p
+                        break
+                self.assertEqual(index.offset(item), want, (text, item))
+            for key in ("allowedTools", "x", "y", "x "):
+                want = data.start
+                children = [v for v in data.values() if isinstance(v, (dict, list))]
+                for needle in rules._key_needles(key):
+                    hit = [m.start() for m in re.finditer(re.escape(needle) + r"\s*:", text)
+                           if not any(c.start <= m.start() < c.end for c in children)]
+                    if hit:
+                        want = hit[0]
+                        break
+                self.assertEqual(rules._key_offset(text, data, key), want)
+
+    def test_offsets_linear_on_many_children(self):
+        pkg = json.dumps({"name": "mcp-x", "scripts": dict(
+            [("k%d" % i, {"postinstall": 1}) for i in range(17000)] + [("postinstall", "x")]
+        )}, separators=(",", ":"))
+        self.assertGreaterEqual(len(pkg), 400000)
+        findings, elapsed = timed_scan(pkg, "package.json")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG013")), 1)
+        plugin = json.dumps({"commands": {"c": {"allowedTools": [
+            "Tool%d(*)" % i for i in range(36000)
+        ]}}}, separators=(",", ":"))
+        self.assertGreaterEqual(len(plugin), 400000)
+        findings, elapsed = timed_scan(plugin, "plugin.json")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG013")), 36000)
+
+    # -- 5. PG013 agent-file detection --------------------------------------
+    PLAIN = "---\nname: overview\ndescription: How the agents fit together\n---\n# Agents\n"
+
+    def test_skill_and_docs_pages_are_not_agents(self):
+        for path in (
+            "plugins/acme/agents/release/SKILL.md",
+            ".claude/agents/helper/skill.md",
+            "agents/SKILL.MD",
+            "docs/agents/overview.md",
+            "website/docs/agents/setup.md",
+            "agents/guides/overview.md",
+        ):
+            self.assertEqual(scan_rule(self.PLAIN, "PG013", path=path), [], path)
+
+    def test_real_agent_definitions_still_report(self):
+        for path in (
+            ".claude/agents/reviewer.md",
+            ".claude/agents/team/reviewer.md",
+            "plugins/acme/agents/reviewer.md",
+            "agents/reviewer.md",
+        ):
+            found = scan_rule(self.PLAIN, "PG013", path=path)
+            self.assertEqual([f.line for f in found], [2], path)
+            self.assertIn("omits 'tools'", found[0].message)
+        nested = "---\nname: helper\ndescription: d\nmodel: sonnet\n---\n"
+        found = scan_rule(nested, "PG013", path="docs/agents/helper.md")
+        self.assertEqual([f.line for f in found], [2])
+        wild = "---\nname: helper\ndescription: d\ntools: '*'\n---\n"
+        found = scan_rule(wild, "PG013", path="agents/team/helper.md")
+        self.assertEqual([f.line for f in found], [4])
+
+    def test_skill_under_agents_keeps_allowed_tools_check(self):
+        text = "---\nname: rel\ndescription: d\nallowed-tools: Bash(*)\n---\n"
+        found = scan_rule(text, "PG013", path="plugins/acme/agents/rel/SKILL.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("Skill/command front matter", found[0].message)
+
+    # -- 6. PG021 signature verifiers ---------------------------------------
+    PAIR = (
+        "steps:\n  - run: |\n"
+        "      curl -fsSLO https://dl.example.com/v1/tool.tgz\n"
+        "      curl -fsSLO https://dl.example.com/v1/tool.tgz.sha256\n"
+    )
+
+    def test_more_signature_verifiers_waive(self):
+        for verify in (
+            "minisign -Vm tool.tgz.sha256 -P RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+            "minisign -V -m tool.tgz.sha256 -p minisign.pub",
+            "minisign -qVm tool.tgz.sha256 -p minisign.pub",
+            "signify -Vp key.pub -m tool.tgz.sha256",
+            "openssl dgst -sha256 -verify pub.pem -signature tool.sig tool.tgz.sha256",
+            "sigstore verify identity --cert-identity x tool.tgz.sha256",
+            "cosign verify-blob --certificate-identity x tool.tgz.sha256",
+        ):
+            text = self.PAIR + "      " + verify + "\n"
+            self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [], verify)
+
+    def test_decrypt_and_lookalikes_do_not_waive(self):
+        for other in (
+            "gpg --decrypt tool.tgz.sha256.gpg > tool.tgz.sha256",
+            "minisign -G -p minisign.pub",
+            "openssl dgst -sha256 tool.tgz",
+            "openssl dgst -sign key.pem -out tool.sig tool.tgz",
+        ):
+            text = self.PAIR + "      " + other + "\n"
+            found = scan_rule(text, "PG021", path=RELEASE)
+            self.assertEqual([f.line for f in found], [4], other)
+
+    # -- 7. PG014 Optional parameters ---------------------------------------
+    @staticmethod
+    def _tool(schema):
+        return json.dumps({"tools": [{"name": "read_file", "inputSchema": {
+            "type": "object", "properties": {"path": schema}}}]})
+
+    def test_optional_string_reports(self):
+        for schema in (
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "title": "Path"},
+            {"oneOf": [{"type": "null"}, {"type": "string", "format": "path"}]},
+            {"type": ["string", "null"]},
+            {"anyOf": [{"type": "string", "maxLength": 9}, {"type": "string"}, {"type": "null"}]},
+        ):
+            found = scan_rule(self._tool(schema), "PG014", path=TOOLS)
+            self.assertEqual(len(found), 1, schema)
+            self.assertIn("'read_file' parameter 'path' (path)", found[0].message)
+        arr = {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+        found = scan_rule(self._tool(arr), "PG014", path=TOOLS)
+        self.assertIn("parameter 'path[]' (path)", found[0].message)
+
+    def test_optional_string_constrained_stays_quiet(self):
+        for schema in (
+            {"anyOf": [{"type": "string", "maxLength": 255}, {"type": "null"}]},
+            {"anyOf": [{"type": "string", "pattern": "^/srv/[a-z]+$"}, {"type": "null"}]},
+            {"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 64},
+            {"oneOf": [{"type": "string"}, {"type": "null"}], "enum": ["a", None]},
+            {"type": ["string", "null"], "const": "/srv"},
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"anyOf": [{"$ref": "#/$defs/P"}, {"type": "null"}]},
+            {"anyOf": [{"type": "null"}]},
+        ):
+            self.assertEqual(scan_rule(self._tool(schema), "PG014", path=TOOLS), [], schema)
+
+    # -- 8. rule order ------------------------------------------------------
+    def test_rules_listed_by_id(self):
+        from promptguard.rules import RULES
+
+        ids = [r.id for r in RULES]
+        self.assertEqual(ids, sorted(ids))
+
+
 if __name__ == "__main__":
     unittest.main()
