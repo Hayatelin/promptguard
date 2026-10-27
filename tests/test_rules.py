@@ -1,10 +1,13 @@
 """Per-rule tests: each rule fires on bad input and stays quiet on clean input."""
 
+import json
+import os
+import tempfile
 import textwrap
 import time
 import unittest
 
-from promptguard.scanner import scan_text
+from promptguard.scanner import scan_path, scan_text, should_scan_file
 
 
 def rule_ids(findings):
@@ -1515,6 +1518,763 @@ class TestManyDistinctFindingsPerLine(unittest.TestCase):
         took, count = self.seconds("git+https://h%(i)d.io/r ", "requirements.txt")
         self.assertGreater(count, 1000)
         self.assertLess(took, 2.0)
+
+
+def timed_scan(text, path):
+    start = time.time()
+    findings = scan_text(text, path=path)
+    return findings, time.time() - start
+
+
+AGENT = ".claude/agents/reviewer.md"
+
+
+class TestPermissionInheritanceRule(unittest.TestCase):
+    def test_fires_on_agent_without_tools(self):
+        text = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            model: sonnet
+            ---
+            You review code.
+            """
+        found = scan_rule(text, "PG013", path=AGENT)
+        self.assertEqual([f.line for f in found], [2])
+        self.assertEqual(found[0].severity, "medium")
+        self.assertIn("Sub-agent 'reviewer' omits 'tools'", found[0].message)
+
+    def test_fires_on_wildcard_agent_tools(self):
+        inline = """\
+            ---
+            name: helper
+            description: General helper
+            tools: "*"
+            ---
+            """
+        found = scan_rule(inline, "PG013", path="plugins/acme/agents/helper.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("wildcard tool entry '*'", found[0].message)
+        block = """\
+            ---
+            name: helper
+            description: General helper
+            tools:
+              - Read
+              - mcp__*
+            ---
+            """
+        found = scan_rule(block, "PG013", path="agents/nested/helper.md")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("'mcp__*'", found[0].message)
+
+    def test_fires_on_wildcard_skill_allowed_tools(self):
+        text = """\
+            ---
+            name: release
+            description: Cut a release
+            allowed-tools: Read Grep Bash(git tag *) Bash(*)
+            ---
+            """
+        found = scan_rule(text, "PG013", path="skills/release/SKILL.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("'Bash(*)' in 'allowed-tools'", found[0].message)
+        self.assertNotIn("git tag", found[0].message)
+
+    def test_fires_on_mcp_package_install_script(self):
+        text = """\
+            {
+              "name": "@acme/mcp-server-weather",
+              "version": "1.0.0",
+              "scripts": {
+                "build": "tsc",
+                "postinstall": "node scripts/setup.js"
+              }
+            }
+            """
+        found = scan_rule(text, "PG013", path="package.json")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("Install-time npm script 'postinstall'", found[0].message)
+        self.assertIn("'@acme/mcp-server-weather'", found[0].message)
+
+    def test_fires_on_plugin_session_start_hook(self):
+        text = """\
+            {
+              "hooks": {
+                "SessionStart": [
+                  {
+                    "matcher": "startup",
+                    "hooks": [
+                      {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/boot.sh"}
+                    ]
+                  }
+                ],
+                "PostToolUse": [
+                  {"matcher": "Write", "hooks": [{"type": "command", "command": "fmt.sh"}]}
+                ]
+              }
+            }
+            """
+        found = scan_rule(text, "PG013", path="plugins/acme/hooks/hooks.json")
+        self.assertEqual([f.line for f in found], [7])
+        self.assertIn("'SessionStart'", found[0].message)
+
+    def test_quiet_on_readme_and_docs_front_matter(self):
+        text = """\
+            ---
+            name: Getting started
+            description: How to install the project
+            ---
+            # Getting started
+            """
+        self.assertEqual(scan_rule(text, "PG013", path="README.md"), [])
+        self.assertEqual(scan_rule(text, "PG013", path="docs/guide.md"), [])
+        self.assertEqual(scan_rule(text, "PG013", path="agents/README.md"), [])
+        self.assertEqual(scan_rule("# Agents\n\nNo front matter.\n", "PG013", path=AGENT), [])
+
+    def test_quiet_on_scoped_agents_and_skills(self):
+        scoped = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            tools: Read, Grep, Glob, mcp__github__*
+            ---
+            """
+        self.assertEqual(scan_rule(scoped, "PG013", path=AGENT), [])
+        deny = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            disallowedTools: Write, Edit
+            ---
+            """
+        self.assertEqual(scan_rule(deny, "PG013", path=AGENT), [])
+        skill = """\
+            ---
+            name: commit
+            description: Stage and commit
+            allowed-tools: Bash(git add *) Bash(git commit *) Read
+            ---
+            """
+        self.assertEqual(scan_rule(skill, "PG013", path="skills/commit/SKILL.md"), [])
+
+    def test_quiet_on_regular_packages_and_other_hooks(self):
+        web_app = json.dumps(
+            {"name": "my-web-app", "scripts": {"postinstall": "node setup.js"}}, indent=2
+        )
+        self.assertEqual(scan_rule(web_app, "PG013", path="package.json"), [])
+        mcp_build = json.dumps(
+            {"name": "mcp-server-x", "scripts": {"prepare": "tsc", "build": "tsc"}}, indent=2
+        )
+        self.assertEqual(scan_rule(mcp_build, "PG013", path="package.json"), [])
+        settings = json.dumps(
+            {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "x.sh"}]}]}}
+        )
+        self.assertEqual(scan_rule(settings, "PG013", path=".claude/settings.json"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            ---
+            name: reviewer  # promptguard:ignore
+            description: Reviews pull requests
+            ---
+            """
+        self.assertEqual(scan_rule(text, "PG013", path=AGENT), [])
+
+    def test_performance_400kb_line(self):
+        entries = " ".join("Read(src/file%d.py)" % i for i in range(25000))
+        line = "allowed-tools: " + entries + " Bash(*)"
+        self.assertGreaterEqual(len(line), 400000)
+        text = "---\nname: big\ndescription: big\n" + line + "\n---\n"
+        findings, elapsed = timed_scan(text, "skills/big/SKILL.md")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual([f.line for f in only(findings, "PG013")], [4])
+
+
+TOOLS = "tools.json"
+
+
+class TestBroadToolSchemaRule(unittest.TestCase):
+    def test_fires_on_mcp_path_parameter(self):
+        text = """\
+            {
+              "tools": [
+                {
+                  "name": "read_file",
+                  "description": "Read a file",
+                  "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                      "path": {"type": "string", "description": "File to read"},
+                      "encoding": {"type": "string"}
+                    },
+                    "required": ["path"]
+                  }
+                }
+              ]
+            }
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual([f.line for f in found], [9])
+        self.assertEqual(found[0].severity, "medium")
+        message = found[0].message
+        self.assertIn("'read_file' parameter 'path' (path)", message)
+        self.assertIn("additionalProperties: false", message)
+
+    def test_fires_on_function_url_with_format_only(self):
+        text = """\
+            {"type": "function", "function": {"name": "fetch_page", "parameters": {
+              "type": "object",
+              "properties": {"targetUrl": {"type": "string", "format": "uri"}},
+              "additionalProperties": false}}}
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual([f.line for f in found], [3])
+        self.assertIn("'targetUrl' (url)", found[0].message)
+        self.assertNotIn("additionalProperties", found[0].message)
+
+    def test_fires_on_sql_nested_and_array_parameters(self):
+        text = """\
+            [
+              {"name": "run_sql", "input_schema": {"type": "object",
+                "properties": {"query": {"type": "string"}}}},
+              {"name": "bulk_export", "input_schema": {"type": "object",
+                "properties": {
+                  "options": {"type": "object", "properties": {
+                    "outputDir": {"type": "string"}}},
+                  "files": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": false}}
+            ]
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual(sorted(f.line for f in found), [3, 7, 8])
+        messages = " ".join(f.message for f in found)
+        self.assertIn("'run_sql' parameter 'query' (sql)", messages)
+        self.assertIn("'options.outputDir' (path)", messages)
+        self.assertIn("'files[]' (path)", messages)
+
+    def test_quiet_when_constrained(self):
+        text = """\
+            {"name": "ops", "inputSchema": {"type": "object", "properties": {
+              "path": {"type": "string", "enum": ["a.txt", "b.txt"]},
+              "url": {"type": "string", "pattern": "^https://api\\\\.example\\\\.com/"},
+              "command": {"type": "string", "maxLength": 64},
+              "dir": {"type": "string", "const": "/srv/data"}
+            }}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_non_sink_names_and_search_query(self):
+        text = """\
+            [
+              {"name": "search_docs", "inputSchema": {"type": "object", "properties": {
+                "query": {"type": "string"}, "zip_code": {"type": "string"},
+                "file_id": {"type": "string"}, "path_depth": {"type": "integer"}}}}
+            ]
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_missing_additional_properties_alone(self):
+        text = """\
+            {"name": "get_weather", "inputSchema": {"type": "object",
+              "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_yaml_and_non_tool_parameters(self):
+        yaml_text = """\
+            tools:
+              - name: read_file
+                inputSchema:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+            """
+        self.assertEqual(scan_rule(yaml_text, "PG014", path="tools.yaml"), [])
+        arm = '{"name": "deploy", "parameters": {"storagePath": {"type": "string"}}}'
+        self.assertEqual(scan_rule(arm, "PG014", path="azuredeploy.json"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            {"name": "read_file", "inputSchema": {"type": "object", "properties": {
+              "path": {"type": "string", "description": "sandboxed # promptguard:ignore"}
+            }}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_performance_400kb_line(self):
+        tools = []
+        size = 0
+        while size < 400000:
+            tool = {
+                "name": "tool_%d" % len(tools),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "enum": ["a", "b"]},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            }
+            tools.append(tool)
+            size += len(json.dumps(tool)) + 2
+        tools.append(
+            {"name": "last", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}}
+        )
+        text = json.dumps({"tools": tools})
+        self.assertGreaterEqual(len(text), 400000)
+        findings, elapsed = timed_scan(text, TOOLS)
+        self.assertLess(elapsed, 2.0)
+        found = only(findings, "PG014")
+        self.assertEqual(len(found), 1)
+        self.assertIn("'last' parameter 'url'", found[0].message)
+
+
+RELEASE = ".github/workflows/release.yml"
+
+
+class TestSameOriginChecksumRule(unittest.TestCase):
+    def test_fires_on_release_checksum_from_same_host(self):
+        text = """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: |
+                      curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz
+                      curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz.sha256
+                      sha256sum -c tool.tar.gz.sha256
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [8])
+        self.assertEqual(found[0].severity, "medium")
+        message = found[0].message
+        self.assertIn("'tool.tar.gz.sha256' is downloaded from github.com/acme/tool", message)
+        self.assertIn("artifact 'tool.tar.gz'", message)
+
+    def test_fires_on_sha256sums_after_line_continuation(self):
+        text = """\
+            steps:
+              - run: |
+                  wget -q \\
+                    https://dl.example.com/v2/tool_linux_amd64.zip
+                  wget -q https://dl.example.com/v2/SHA256SUMS
+                  sha256sum --ignore-missing -c SHA256SUMS
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [5])
+        self.assertIn("'SHA256SUMS'", found[0].message)
+        self.assertIn("'tool_linux_amd64.zip'", found[0].message)
+
+    def test_fires_on_shared_base_url_variable(self):
+        text = """\
+            env:
+              BASE_URL: https://dl.example.com/tool/v1
+            jobs:
+              fetch:
+                steps:
+                  - run: curl -LO "$BASE_URL/tool.tgz"
+                  - run: curl -LO "${{ env.BASE_URL }}/tool.tgz.sha256"
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [7])
+        self.assertIn("dl.example.com", found[0].message)
+
+    def test_fires_in_dockerfile_text(self):
+        text = """\
+            FROM debian:12
+            ADD https://example.com/dl/tool.tgz /tmp/tool.tgz
+            RUN curl -fsSL https://example.com/dl/tool.tgz.sha256 -o /tmp/tool.tgz.sha256 \\
+             && cd /tmp && sha256sum -c tool.tgz.sha256
+            """
+        found = scan_rule(text, "PG021", path="Dockerfile")
+        self.assertEqual([f.line for f in found], [3])
+
+    @unittest.skipUnless(
+        should_scan_file("Dockerfile"),
+        "Dockerfile scanning arrives with batch 3 (scanner scope change)",
+    )
+    def test_dockerfile_integration_after_batch_3(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "Dockerfile"), "w") as fh:
+                fh.write(
+                    "FROM debian:12\n"
+                    "RUN curl -fsSLO https://example.com/dl/tool.tgz \\\n"
+                    " && curl -fsSLO https://example.com/dl/tool.tgz.sha256 \\\n"
+                    " && sha256sum -c tool.tgz.sha256\n"
+                )
+            found = only(scan_path(d), "PG021")
+            self.assertEqual([f.line for f in found], [3])
+
+    def test_quiet_on_pinned_hash(self):
+        text = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz
+                  echo "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  tool.tar.gz" | sha256sum -c -
+            """
+        self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [])
+
+    def test_quiet_on_other_host_or_signed_checksums(self):
+        other = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://cdn.example.net/tool.tar.gz
+                  curl -fsSLO https://checksums.example.org/tool.tar.gz.sha256
+                  sha256sum -c tool.tar.gz.sha256
+            """
+        self.assertEqual(scan_rule(other, "PG021", path=RELEASE), [])
+        signed = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_linux_amd64.zip
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_SHA256SUMS
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_SHA256SUMS.sig
+                  gpg --verify tool_1.0_SHA256SUMS.sig tool_1.0_SHA256SUMS
+                  sha256sum --ignore-missing -c tool_1.0_SHA256SUMS
+            """
+        self.assertEqual(scan_rule(signed, "PG021", path=RELEASE), [])
+
+    def test_quiet_on_uploads_comments_and_markdown(self):
+        upload = """\
+            steps:
+              - run: |
+                  curl -T dist/tool.tgz https://repo.example.com/upload/tool.tgz
+                  curl -T dist/tool.tgz.sha256 https://repo.example.com/upload/tool.tgz.sha256
+                  # curl -LO https://repo.example.com/upload/tool.tgz.sha256
+            """
+        self.assertEqual(scan_rule(upload, "PG021", path=RELEASE), [])
+        docs = """\
+            curl -LO https://x.example.com/tool.tgz
+            curl -LO https://x.example.com/tool.tgz.sha256
+            """
+        self.assertEqual(scan_rule(docs, "PG021", path="docs/install.md"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://x.example.com/tool.tgz
+                  curl -fsSLO https://x.example.com/tool.tgz.sha256  # promptguard:ignore
+            """
+        self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [])
+
+    def test_performance_400kb_line(self):
+        cmds = " && ".join(
+            "curl -fsSLO https://mirror%d.example.com/tool%d.tgz" % (i % 40, i)
+            for i in range(9000)
+        )
+        line = "      - run: " + cmds + " && curl -fsSLO https://mirror3.example.com/tool3.tgz.sha256"
+        self.assertGreaterEqual(len(line), 400000)
+        text = (
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + line + "\n"
+        )
+        findings, elapsed = timed_scan(text, RELEASE)
+        self.assertLess(elapsed, 2.0)
+        found = only(findings, "PG021")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("artifact 'tool3.tgz'", found[0].message)
+
+
+def _ref_name_tokens(name):
+    """_name_tokens as first written (quadratic on long all-capital names)."""
+    import re
+
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t]
+
+
+def _ref_wildcard(entry):
+    import re
+
+    return bool(re.match(
+        r"^(?:\*|mcp__\*.*|[A-Za-z][\w-]*\(\s*(?:domain\s*:\s*)?[*:\s]*\*[*:\s]*\))$",
+        entry, re.IGNORECASE,
+    ))
+
+
+def _seeded_strings(alphabet, count, max_len, seed):
+    import random
+
+    rnd = random.Random(seed)
+    return [
+        "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, max_len)))
+        for _ in range(count)
+    ]
+
+
+class TestBatch2ReviewFixes(unittest.TestCase):
+    """PR #4 review: linear-time helpers, agent-file detection, signature
+    verifiers, Optional schemas, rule order."""
+
+    # -- 1. PG013 wildcard entry regex --------------------------------------
+    def test_wildcard_regex_matches_reference(self):
+        from promptguard import rules
+
+        samples = [
+            "*", "*\n", "mcp__*", "MCP__*x", "mcp__*\n\n", "Bash(*)", "Bash(:*)",
+            "Bash( * )", "Read(**)", "WebFetch(domain:*)", "WebFetch( Domain : * )",
+            "WebFetch(domain:)", "Bash()", "Bash(*)\n", "Bash(*\n)", "Bash(* x)",
+            "Bash(git *)", "1(*)", "B-x_1(*:*)", "Bash(*", "Bash(*))", "(*)",
+            "Bash(domain:domain:*)", "Bash(\u00a0*\u2028)", "\u212a(*)", "\u017f(*)",
+        ]
+        samples += _seeded_strings("*: \n\tdomainx()B_-\u00a0", 20000, 12, 13)
+        samples += ["Bash(" + s for s in _seeded_strings("*: \n\tdomain)x", 20000, 10, 14)]
+        for s in samples:
+            self.assertEqual(
+                bool(rules._WILDCARD_TOOL_RE.match(s)), _ref_wildcard(s), repr(s)
+            )
+
+    def test_wildcard_regex_linear_on_unclosed_paren(self):
+        for body in ("* " * 200000, "*" * 400000 + "x)", ": " * 200000 + "*"):
+            text = "---\nname: a\ndescription: d\nallowed-tools: Bash(" + body + "\n---\n"
+            self.assertGreaterEqual(len(text), 400000)
+            findings, elapsed = timed_scan(text, "skills/a/SKILL.md")
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(only(findings, "PG013"), [])
+        text = "---\nname: a\ndescription: d\nallowed-tools: Bash(" + "* " * 200000 + ")\n---\n"
+        findings, elapsed = timed_scan(text, "skills/a/SKILL.md")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual([f.line for f in only(findings, "PG013")], [4])
+
+    # -- 2. PG014 name tokens -----------------------------------------------
+    def test_name_tokens_match_reference(self):
+        import itertools
+
+        from promptguard import rules
+
+        names = ["".join(p) for k in range(7) for p in itertools.product("AaB0_", repeat=k)]
+        names += _seeded_strings("AaBbZz09_- .\u00c9\u00e9\u212a", 20000, 16, 15)
+        names += ["HTMLParser", "getHTTPResponseCode", "XMLHttpRequest", "A" * 60 + "b", "URLPath"]
+        for name in names:
+            self.assertEqual(rules._name_tokens(name), _ref_name_tokens(name), repr(name))
+
+    def test_name_tokens_linear_on_capitals(self):
+        big = "A" * 400000
+        for text in (
+            '{"tools":[{"name":"t","inputSchema":{"type":"object","properties":{"%s":{"type":"string"}}}}]}' % big,
+            '{"tools":[{"name":"%s","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}]}' % big,
+            '{"tools":[{"name":"t","inputSchema":{"type":"object","properties":{"%sPath":{"type":"string"}}}}]}' % big,
+        ):
+            findings, elapsed = timed_scan(text, TOOLS)
+            self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG014")), 1)
+
+    # -- 3. PG021 checksum x artifact pairing --------------------------------
+    def test_artifact_pick_matches_reference(self):
+        import random
+
+        from promptguard import rules
+
+        rnd = random.Random(16)
+        parts = ["tool", "Tool", "tgz", "tar", "gz", "", "x", "\u0130", "sha256", "TOOL"]
+        for _ in range(3000):
+            arts = []
+            for _ in range(rnd.randint(1, 8)):
+                name = ".".join(rnd.choice(parts) for _ in range(rnd.randint(1, 4)))
+                if name:
+                    arts.append((rnd.choice(["h1", "h2"]), name, 0))
+            for _ in range(4):
+                host = rnd.choice(["h1", "h2"])
+                base = rnd.choice([a[1] for a in arts] + parts)
+                name = base + rnd.choice([".sha256", ".", "..sha256", ".tgz.sha256"])
+                same = [a for a in arts if a[0] == host]
+                index = rules._pg021_artifact_index(arts, {host})
+                if not same:
+                    self.assertNotIn(host, index)
+                    continue
+                exact = [a for a in same if name.lower().startswith(a[1].lower() + ".")]
+                self.assertEqual(
+                    rules._pg021_pick_artifact(index[host], name), (exact or same)[0][1]
+                )
+
+    def test_checksum_pairs_linear(self):
+        pairs = ";".join(
+            "curl https://h.example.com/a%d;curl https://h.example.com/a%d.sha256" % (i, i)
+            for i in range(8000)
+        )
+        cases = [
+            ("Dockerfile", "RUN " + pairs),
+            (RELEASE, "- run: " + pairs),
+            ("Dockerfile", "ADD " + " ".join(
+                "https://h.example.com/a%d https://h.example.com/a%d.sha256" % (i, i)
+                for i in range(7000))),
+        ]
+        for path, text in cases:
+            self.assertGreaterEqual(len(text), 400000)
+            findings, elapsed = timed_scan(text, path)
+            self.assertLess(elapsed, 2.0)
+            found = only(findings, "PG021")
+            self.assertGreaterEqual(len(found), 7000)
+            self.assertIn("'a0.sha256'", found[0].message)
+            self.assertIn("artifact 'a0'", found[0].message)
+
+    # -- 4. JSON offset helpers ---------------------------------------------
+    def test_item_and_key_offsets_match_plain_search(self):
+        import random
+        import re
+
+        from promptguard import rules
+
+        rnd = random.Random(17)
+        items = ["*", "Bash(*)", 'a"b', '"', "\\", ",", ", ", ":", "\u00e9", "", '"*"', "a\\"]
+        for _ in range(2000):
+            arr = [rnd.choice(items + [rnd.choice(items) + rnd.choice(items)]) for _ in range(rnd.randint(0, 6))]
+            if rnd.random() < 0.3:
+                arr.append({rnd.choice(items): rnd.choice(items)})
+            text = json.dumps({"x": {"y": 1}, "allowedTools": arr, "x ": [arr]},
+                              ensure_ascii=rnd.random() < 0.5, indent=rnd.choice([None, 1]))
+            data = rules._json_positions(text)
+            node = data["allowedTools"]
+            index = rules._ItemOffsets(text, node)
+            for item in items + [a + b for a in items for b in items]:
+                want = node.start
+                for needle in rules._key_needles(item):
+                    p = text.find(needle, node.start, node.end)
+                    if p >= 0:
+                        want = p
+                        break
+                self.assertEqual(index.offset(item), want, (text, item))
+            for key in ("allowedTools", "x", "y", "x "):
+                want = data.start
+                children = [v for v in data.values() if isinstance(v, (dict, list))]
+                for needle in rules._key_needles(key):
+                    hit = [m.start() for m in re.finditer(re.escape(needle) + r"\s*:", text)
+                           if not any(c.start <= m.start() < c.end for c in children)]
+                    if hit:
+                        want = hit[0]
+                        break
+                self.assertEqual(rules._key_offset(text, data, key), want)
+
+    def test_offsets_linear_on_many_children(self):
+        pkg = json.dumps({"name": "mcp-x", "scripts": dict(
+            [("k%d" % i, {"postinstall": 1}) for i in range(17000)] + [("postinstall", "x")]
+        )}, separators=(",", ":"))
+        self.assertGreaterEqual(len(pkg), 400000)
+        findings, elapsed = timed_scan(pkg, "package.json")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG013")), 1)
+        plugin = json.dumps({"commands": {"c": {"allowedTools": [
+            "Tool%d(*)" % i for i in range(36000)
+        ]}}}, separators=(",", ":"))
+        self.assertGreaterEqual(len(plugin), 400000)
+        findings, elapsed = timed_scan(plugin, "plugin.json")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(only(findings, "PG013")), 36000)
+
+    # -- 5. PG013 agent-file detection --------------------------------------
+    PLAIN = "---\nname: overview\ndescription: How the agents fit together\n---\n# Agents\n"
+
+    def test_skill_and_docs_pages_are_not_agents(self):
+        for path in (
+            "plugins/acme/agents/release/SKILL.md",
+            ".claude/agents/helper/skill.md",
+            "agents/SKILL.MD",
+            "docs/agents/overview.md",
+            "website/docs/agents/setup.md",
+            "agents/guides/overview.md",
+        ):
+            self.assertEqual(scan_rule(self.PLAIN, "PG013", path=path), [], path)
+
+    def test_real_agent_definitions_still_report(self):
+        for path in (
+            ".claude/agents/reviewer.md",
+            ".claude/agents/team/reviewer.md",
+            "plugins/acme/agents/reviewer.md",
+            "agents/reviewer.md",
+        ):
+            found = scan_rule(self.PLAIN, "PG013", path=path)
+            self.assertEqual([f.line for f in found], [2], path)
+            self.assertIn("omits 'tools'", found[0].message)
+        nested = "---\nname: helper\ndescription: d\nmodel: sonnet\n---\n"
+        found = scan_rule(nested, "PG013", path="docs/agents/helper.md")
+        self.assertEqual([f.line for f in found], [2])
+        wild = "---\nname: helper\ndescription: d\ntools: '*'\n---\n"
+        found = scan_rule(wild, "PG013", path="agents/team/helper.md")
+        self.assertEqual([f.line for f in found], [4])
+
+    def test_skill_under_agents_keeps_allowed_tools_check(self):
+        text = "---\nname: rel\ndescription: d\nallowed-tools: Bash(*)\n---\n"
+        found = scan_rule(text, "PG013", path="plugins/acme/agents/rel/SKILL.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("Skill/command front matter", found[0].message)
+
+    # -- 6. PG021 signature verifiers ---------------------------------------
+    PAIR = (
+        "steps:\n  - run: |\n"
+        "      curl -fsSLO https://dl.example.com/v1/tool.tgz\n"
+        "      curl -fsSLO https://dl.example.com/v1/tool.tgz.sha256\n"
+    )
+
+    def test_more_signature_verifiers_waive(self):
+        for verify in (
+            "minisign -Vm tool.tgz.sha256 -P RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+            "minisign -V -m tool.tgz.sha256 -p minisign.pub",
+            "minisign -qVm tool.tgz.sha256 -p minisign.pub",
+            "signify -Vp key.pub -m tool.tgz.sha256",
+            "openssl dgst -sha256 -verify pub.pem -signature tool.sig tool.tgz.sha256",
+            "sigstore verify identity --cert-identity x tool.tgz.sha256",
+            "cosign verify-blob --certificate-identity x tool.tgz.sha256",
+        ):
+            text = self.PAIR + "      " + verify + "\n"
+            self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [], verify)
+
+    def test_decrypt_and_lookalikes_do_not_waive(self):
+        for other in (
+            "gpg --decrypt tool.tgz.sha256.gpg > tool.tgz.sha256",
+            "minisign -G -p minisign.pub",
+            "openssl dgst -sha256 tool.tgz",
+            "openssl dgst -sign key.pem -out tool.sig tool.tgz",
+        ):
+            text = self.PAIR + "      " + other + "\n"
+            found = scan_rule(text, "PG021", path=RELEASE)
+            self.assertEqual([f.line for f in found], [4], other)
+
+    # -- 7. PG014 Optional parameters ---------------------------------------
+    @staticmethod
+    def _tool(schema):
+        return json.dumps({"tools": [{"name": "read_file", "inputSchema": {
+            "type": "object", "properties": {"path": schema}}}]})
+
+    def test_optional_string_reports(self):
+        for schema in (
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "title": "Path"},
+            {"oneOf": [{"type": "null"}, {"type": "string", "format": "path"}]},
+            {"type": ["string", "null"]},
+            {"anyOf": [{"type": "string", "maxLength": 9}, {"type": "string"}, {"type": "null"}]},
+        ):
+            found = scan_rule(self._tool(schema), "PG014", path=TOOLS)
+            self.assertEqual(len(found), 1, schema)
+            self.assertIn("'read_file' parameter 'path' (path)", found[0].message)
+        arr = {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+        found = scan_rule(self._tool(arr), "PG014", path=TOOLS)
+        self.assertIn("parameter 'path[]' (path)", found[0].message)
+
+    def test_optional_string_constrained_stays_quiet(self):
+        for schema in (
+            {"anyOf": [{"type": "string", "maxLength": 255}, {"type": "null"}]},
+            {"anyOf": [{"type": "string", "pattern": "^/srv/[a-z]+$"}, {"type": "null"}]},
+            {"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 64},
+            {"oneOf": [{"type": "string"}, {"type": "null"}], "enum": ["a", None]},
+            {"type": ["string", "null"], "const": "/srv"},
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"anyOf": [{"$ref": "#/$defs/P"}, {"type": "null"}]},
+            {"anyOf": [{"type": "null"}]},
+        ):
+            self.assertEqual(scan_rule(self._tool(schema), "PG014", path=TOOLS), [], schema)
+
+    # -- 8. rule order ------------------------------------------------------
+    def test_rules_listed_by_id(self):
+        from promptguard.rules import RULES
+
+        ids = [r.id for r in RULES]
+        self.assertEqual(ids, sorted(ids))
 
 
 if __name__ == "__main__":
