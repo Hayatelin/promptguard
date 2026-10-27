@@ -275,6 +275,19 @@ def _detect_destructive(line, ctx):
     )
 
 
+def _root_context(ctx):
+    """Does the file mention mcp/filesystem/allowed/root/args? (once per text, not per line)"""
+    low = ctx.get("full_lower", "")
+    cached = ctx.get("_root_context")
+    if cached is None or cached[0] is not low:
+        cached = (
+            low,
+            "mcp" in low or "filesystem" in low or "allowed" in low or "root" in low or "args" in low,
+        )
+        ctx["_root_context"] = cached
+    return cached[1]
+
+
 def _detect_broad_mcp(line, ctx):
     if _DANGEROUS_FLAGS_RE.search(line):
         yield (
@@ -289,8 +302,7 @@ def _detect_broad_mcp(line, ctx):
         )
         return
     # Filesystem root grants are only interesting in mcp / filesystem contexts.
-    low = ctx.get("full_lower", "")
-    if "mcp" in low or "filesystem" in low or "allowed" in low or "root" in low or "args" in low:
+    if _root_context(ctx):
         m = _BROAD_ROOT_RE.search(line)
         if m and any(
             k in line.lower()
@@ -395,13 +407,35 @@ def _file_level(key, analyzer):
     return detector
 
 
+class _HitBucket(list):
+    """List of (message, snippet) with a set of seen messages for O(1) dedup.
+
+    `seen_len` records how many items `seen` covers; if other code appended to
+    the list directly, the set is rebuilt so dedup stays exact.
+    """
+
+    __slots__ = ("seen", "seen_len")
+
+
 def _add_hit(hits, lines, lineno, message):
     """Record a finding for `lineno`, once per (line, message)."""
-    bucket = hits.setdefault(lineno, [])
-    if any(m == message for m, _ in bucket):
+    bucket = hits.get(lineno)
+    if not isinstance(bucket, _HitBucket):
+        bucket = _HitBucket(bucket or ())
+        bucket.seen_len = -1
+        hits[lineno] = bucket
+    if bucket.seen_len != len(bucket):
+        bucket.seen = {m for m, _ in bucket}
+        bucket.seen_len = len(bucket)
+    if message in bucket.seen:
         return
-    snippet = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
+    if bucket:
+        snippet = bucket[0][1]  # same line, same snippet: share one string
+    else:
+        snippet = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
     bucket.append((message, snippet))
+    bucket.seen.add(message)
+    bucket.seen_len = len(bucket)
 
 
 def _indent(s):
@@ -603,7 +637,10 @@ _GIT_HINT = "pin a full 40-char commit SHA"
 
 
 def _launcher_name(token):
-    base = re.split(r"[\\/]", token)[-1].lower()
+    # == re.split(r"[\\/]", token)[-1].lower(), without the regex call per token
+    base = token[max(token.rfind("/"), token.rfind("\\")) + 1:].lower()
+    if not base.endswith((".cmd", ".exe", ".bat", ".ps1")):
+        return base
     for suffix in (".cmd", ".exe", ".bat", ".ps1"):
         if base.endswith(suffix):
             return base[: -len(suffix)]
@@ -772,7 +809,10 @@ def _check_docker(argv, start):
 def _launch_problems(argv):
     """Find unpinned launches anywhere in argv.
 
-    Returns [(launcher, spec, problem, hint, token_index)].
+    Returns [(launcher, spec, problem, hint, token_index)]. Reference
+    definition: the scanner uses _each_launch_problem(), which visits the same
+    items in the same order without rewalking the options after every
+    launcher name (quadratic on 'npx -p npx -p ...' / 'uvx --from uvx ...').
     """
     out = []
     for i, tok in enumerate(argv):
@@ -799,6 +839,128 @@ def _launch_problems(argv):
         elif name == "docker" and nxt == "run":
             out.extend(_check_docker(argv, i + 2))
     return out
+
+
+class _LaunchTable(object):
+    """_parse_cli(argv, start, value_flags) for every start of one launcher kind.
+
+    The walk from a start is a chain through the option tokens (each option
+    moves on 1 or 2 tokens), so walks from different starts merge; the chain
+    facts are filled in once, right to left.
+    """
+
+    def __init__(self, argv, label, value_flags, pick, block, spec_problem):
+        n = len(argv)
+        self.argv = argv
+        self.label = label
+        self.spec_problem = spec_problem
+        self.nxt = [-1] * (n + 1)     # next node of an option node, else -1
+        self.pick = [None] * (n + 1)  # (value, value_index) of a picked option
+        self.term = [None] * (n + 1)  # positional index _parse_cli returns
+        self.has_pick = [False] * (n + 1)
+        self.has_block = [False] * (n + 1)
+        for s in range(n - 1, -1, -1):
+            tok = argv[s]
+            if tok in _SHELL_SEPARATORS:
+                continue
+            if tok == "--":
+                self.term[s] = s + 1 if s + 1 < n else None
+                continue
+            if not (tok.startswith("-") and len(tok) > 1):
+                self.term[s] = s
+                continue
+            name, eq, value = tok.partition("=")
+            if eq:
+                vidx, nx = s, s + 1
+            elif name in value_flags and s + 1 < n:
+                value, vidx, nx = argv[s + 1], s + 1, s + 2
+            else:
+                value, vidx, nx = None, None, s + 1
+            self.nxt[s] = nx
+            self.term[s] = self.term[nx]
+            self.has_pick[s] = self.has_pick[nx]
+            self.has_block[s] = self.has_block[nx] or name in block
+            if name in pick and value is not None:
+                self.pick[s] = (value, vidx)
+                self.has_pick[s] = True
+        # jump[s]: s itself for a picked option still to visit, else where to look next.
+        self.jump = [s if self.pick[s] is not None else self.nxt[s] for s in range(n + 1)]
+        self.items = {}
+        self.pos_done = set()  # positional candidates already settled
+
+    def _item(self, value, idx):
+        spec = _clean_spec(value)
+        problem = self.spec_problem(spec)
+        if problem:
+            return (self.label, spec, problem[0], problem[1], idx)
+        return None
+
+    def _find(self, s):
+        path = []
+        while s >= 0 and self.jump[s] != s:
+            path.append(s)
+            s = self.jump[s]
+        for p in path:
+            self.jump[p] = s
+        return s
+
+    def visit_from(self, start, visit):
+        if self.has_pick[start]:
+            s = self._find(start)
+            while s >= 0:
+                if s not in self.items:
+                    self.items[s] = self._item(*self.pick[s])
+                item = self.items[s]
+                if item is None or visit(item):
+                    self.jump[s] = self.nxt[s]  # settled: later walks skip it
+                s = self._find(self.nxt[s])
+        elif not self.has_block[start] and self.term[start] is not None:
+            pos = self.term[start]
+            if pos in self.pos_done:
+                return
+            item = self._item(self.argv[pos], pos)
+            if item is None or visit(item):
+                self.pos_done.add(pos)
+
+
+def _each_launch_problem(argv, visit):
+    """Call visit(item) for each item of _launch_problems(argv), in order.
+
+    visit() returns True when further occurrences of that same item can no
+    longer change anything; those repeats are skipped.
+    """
+    tables = {}
+
+    def table(kind):
+        t = tables.get(kind)
+        if t is None:
+            if kind == "npx":
+                t = _LaunchTable(argv, "npx", _NPX_VALUE_FLAGS, ("-p", "--package"),
+                                 ("-c", "--call"), _npm_spec_problem)
+            elif kind == "docker run":
+                t = _LaunchTable(argv, kind, _DOCKER_VALUE_FLAGS, (), (), _docker_image_problem)
+            else:
+                flags, spec_flag = (
+                    (_PIPX_VALUE_FLAGS, "--spec") if kind == "pipx run" else (_UV_VALUE_FLAGS, "--from")
+                )
+                t = _LaunchTable(argv, kind, flags, (spec_flag,), (), _py_spec_problem)
+            tables[kind] = t
+        return t
+
+    n = len(argv)
+    for i, tok in enumerate(argv):
+        name = _launcher_name(tok)
+        nxt = argv[i + 1].lower() if i + 1 < n else ""
+        if name == "npx":
+            table("npx").visit_from(i + 1, visit)
+        elif name == "uvx":
+            table("uvx").visit_from(i + 1, visit)
+        elif name == "uv" and nxt == "tool" and i + 2 < n and argv[i + 2].lower() == "run":
+            table("uv tool run").visit_from(i + 3, visit)
+        elif name == "pipx" and nxt == "run":
+            table("pipx run").visit_from(i + 2, visit)
+        elif name == "docker" and nxt == "run":
+            table("docker run").visit_from(i + 2, visit)
 
 
 def _unpinned_message(launcher, spec, problem, hint):
@@ -872,14 +1034,24 @@ def _pg008_json(lines, data, hits):
     _json_commands(data, argvs)
     cmd_lines = [i for i, l in enumerate(lines, 1) if _JSON_CMD_KEY_RE.search(l)]
     cursors = {}
+    exhausted = set()  # specs _find_line no longer finds (their cursor stays put)
     for k, argv in enumerate(argvs):
-        for launcher, spec, problem, hint, _ in _launch_problems(argv):
-            lineno = _find_line(lines, spec, cursors.get(spec, 0))
-            if lineno:
-                cursors[spec] = lineno
-            else:
-                lineno = cmd_lines[k] if k < len(cmd_lines) else 1
-            _add_hit(hits, lines, lineno, _unpinned_message(launcher, spec, problem, hint))
+        fallback = cmd_lines[k] if k < len(cmd_lines) else 1
+
+        def visit(item):
+            launcher, spec, problem, hint, _ = item
+            lineno = None
+            if spec not in exhausted:
+                lineno = _find_line(lines, spec, cursors.get(spec, 0))
+                if lineno:
+                    cursors[spec] = lineno
+                else:
+                    exhausted.add(spec)
+            _add_hit(hits, lines, lineno or fallback, _unpinned_message(launcher, spec, problem, hint))
+            # A repeat of an exhausted spec lands on `fallback` again: no change.
+            return spec in exhausted
+
+        _each_launch_problem(argv, visit)
 
 
 # Heuristic (a): a launcher at the start of a command string on one line.
@@ -1023,11 +1195,109 @@ def _find_unquoted(s, ch):
 
 
 def _list_items(part):
+    """[value of each _LIST_ITEM_RE.finditer(part) match] (via _ItemScanner: linear time)."""
+    scanner = _ItemScanner(part, len(part))
     items = []
-    for m in _LIST_ITEM_RE.finditer(part):
-        value = next(g for g in m.groups() if g is not None)
-        items.append(value)
-    return items
+    e = 0
+    while True:
+        found = scanner.search(e)
+        if found is None:
+            return items
+        items.append(found[1])
+        e = found[0]
+
+
+_ITEM_START_RE = re.compile(r"[^,\s]")
+_ITEM_WORD_RE = re.compile(r"""[^,\s"']+""")
+
+
+class _ItemScanner(object):
+    """_LIST_ITEM_RE.search(line, pos, end) without its quadratic cases.
+
+    The regex retries its "..." / '...' alternatives at every quote; on text
+    like '\\"\\"\\"...' or "''''..." with no closing quote each try reads to
+    `end`. Here each quoted scan is memoised by position, so the answers
+    (same matches, same groups) come in linear time over all searches.
+    """
+
+    def __init__(self, line, end):
+        self.line = line
+        self.end = end
+        self.dq = {}  # position inside "...": index of the closing '"', or -1
+        self.sq = {}  # position inside '...': (end of a match closed by a lone "'", or -1, last "''" start or -1)
+
+    def _dq_close(self, k):
+        line, end, memo = self.line, self.end, self.dq
+        trail = []
+        res = -1
+        while k < end:
+            if k in memo:
+                res = memo[k]
+                break
+            trail.append(k)
+            c = line[k]
+            if c == '"':
+                res = k
+                break
+            if c == "\\":
+                if k + 1 < end and line[k + 1] != "\n":  # \\. ('.' is not a newline)
+                    k += 2
+                    continue
+                break  # the content stops at this backslash: no closing quote
+            k += 1
+        for t in trail:
+            memo[t] = res
+        return res
+
+    def _sq_walk(self, k):
+        """(close, last_pair) for (?:[^']|'')* run greedily from k up to `end`."""
+        line, end, memo = self.line, self.end, self.sq
+        trail = []  # (position, is the start of a '' pair)
+        res = (-1, -1)
+        while k < end:
+            if k in memo:
+                res = memo[k]
+                break
+            if line[k] == "'":
+                if k + 1 < end and line[k + 1] == "'":
+                    trail.append((k, True))
+                    k += 2
+                    continue
+                trail.append((k, False))
+                res = (k + 1, -1)
+                break
+            trail.append((k, False))
+            k += 1
+        close, last = res
+        for t, pair in reversed(trail):
+            if pair and last < 0:
+                last = t
+            memo[t] = (close, last)
+        return memo[trail[0][0]] if trail else res
+
+    def search(self, pos):
+        """(match end, value) of _LIST_ITEM_RE.search(line, pos, end), or None."""
+        line, end = self.line, self.end
+        x = pos
+        while True:
+            m = _ITEM_START_RE.search(line, x, end)
+            if not m:
+                return None
+            x = m.start()
+            c = line[x]
+            if c == '"':
+                q = self._dq_close(x + 1)
+                if q >= 0:
+                    return q + 1, line[x + 1:q]
+            elif c == "'":
+                close, last = self._sq_walk(x + 1)
+                stop = close if close >= 0 else (last + 1 if last >= 0 else -1)
+                if stop >= 0:
+                    return stop, line[x + 1:stop - 1]
+            else:
+                w = _ITEM_WORD_RE.match(line, x, end)
+                return w.end(), w.group(0)
+            x += 1
 
 
 def _collect_args(lines, j, pos):
@@ -1092,8 +1362,7 @@ def _pg008_heuristic(lines, hits):
             start = _inline_launch_start(line)
             if start is not None:
                 tokens = _heuristic_tokens(line[start:])
-                for launcher, spec, problem, hint, _ in _launch_problems(tokens):
-                    _add_hit(hits, lines, lineno, _unpinned_message(launcher, spec, problem, hint))
+                _each_launch_problem(tokens, _launch_hit(hits, lines, lambda idx: lineno))
         # (b) command key holding only the launcher; args elsewhere.
         m = _CMD_ONLY_RE.search(line)
         if not m:
@@ -1108,8 +1377,18 @@ def _pg008_heuristic(lines, hits):
         for item, item_line in _collect_args(lines, found[0], found[1]):
             argv.extend((tok, item_line) for tok in _split_arg(item))
         tokens = [t for t, _ in argv]
-        for launcher, spec, problem, hint, idx in _launch_problems(tokens):
-            _add_hit(hits, lines, argv[idx][1], _unpinned_message(launcher, spec, problem, hint))
+        _each_launch_problem(tokens, _launch_hit(hits, lines, lambda idx: argv[idx][1]))
+
+
+def _launch_hit(hits, lines, line_of):
+    """visit() for _each_launch_problem: one hit per item (repeats add nothing)."""
+
+    def visit(item):
+        launcher, spec, problem, hint, idx = item
+        _add_hit(hits, lines, line_of(idx), _unpinned_message(launcher, spec, problem, hint))
+        return True
+
+    return visit
 
 
 def _analyze_unpinned_launch(ctx):
@@ -1990,43 +2269,100 @@ def _approval_message(item, where, scope):
     )
 
 
-_JSON_TOKEN_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|[{}\[\]:]')
 _TOML_HEADER_RE = re.compile(r"""^\s*\[\[?\s*([^\[\]#]+?)\s*\]\]?\s*(?:#.*)?$""")
 _BRACE_TOKEN_RE = re.compile(r"""[\\"{}]""")
+# JSON / JSONC / JSON5 lexing for _json_permission_allows(): strings, comments,
+# bare (JSON5) keys and the structural characters.
+_JSONC_STEP_RE = re.compile(r"""["']|//|/\*|[{}\[\]:]|[A-Za-z_$][\w$-]*""")
+_DQ_BODY_RE = re.compile(r'''(?:[^"\\\n\r]|\\.)*''')
+_SQ_BODY_RE = re.compile(r"""(?:[^'\\\n\r]|\\.)*""")
+_EOL_RE = re.compile(r"[\n\r]")
+# The line breaks str.splitlines() uses: _ctx_lines() numbering.
+_SPLITLINES_BREAK_RE = re.compile("\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+_LEAD_JSONC_NOISE_RE = re.compile(r"""(?:\s+|//[^\n\r]*|#[^\n\r]*|/\*.*?(?:\*/|\Z))*""", re.DOTALL)
 
 
-def _json_permission_allows(lines):
+def _json_permission_allows(text):
     """{(line_index, column)} of each "allow" key nested inside a "permissions" value.
 
-    For JSON that parsed; walks the same nesting as the parse tree.
+    Walks the object nesting of the whole text (so a string holding U+2028 or
+    a form feed, which str.splitlines() breaks, stays one string), skipping
+    // and /* */ comments; '...' strings and bare keys are read as JSON5 does.
+    For JSON that parsed this is the parse tree's nesting. Line/column follow
+    str.splitlines(), like _ctx_lines().
     """
-    out = set()
+    keys = []
     stack = []  # (opening char, inside a "permissions" value?)
     last_key = None
     pending = None
-    for i, line in enumerate(lines):
-        for t in _JSON_TOKEN_RE.finditer(line):
-            tok = t.group(0)
-            if tok[0] == '"':
-                pending = (tok[1:-1], t.start() + 1)
-                continue
-            if tok == ":":
-                if pending is not None and stack and stack[-1][0] == "{":
-                    last_key = pending[0]
-                    if last_key.lower() == "allow" and stack[-1][1]:
-                        out.add((i, pending[1]))
-            elif tok in "{[":
-                under = bool(stack) and (
-                    stack[-1][1]
-                    or (stack[-1][0] == "{" and (last_key or "").lower() == "permissions")
-                )
-                stack.append((tok, under))
-                last_key = None
-            elif stack:
-                stack.pop()
-                last_key = None
-            pending = None
+    n = len(text)
+    pos = 0
+    while True:
+        t = _JSONC_STEP_RE.search(text, pos)
+        if not t:
+            break
+        tok = t.group(0)
+        pos = t.end()
+        if tok in ("\"", "'"):
+            body = (_DQ_BODY_RE if tok == '"' else _SQ_BODY_RE).match(text, pos)
+            end = body.end()
+            if end < n and text[end] == tok:
+                pending = (text[pos:end], pos)
+                pos = end + 1
+            else:
+                pending = None  # unterminated: stop at the line break
+                pos = end
+            continue
+        if tok == "//":
+            e = _EOL_RE.search(text, pos)
+            pos = e.start() if e else n
+            continue
+        if tok == "/*":
+            e = text.find("*/", pos)
+            pos = e + 2 if e >= 0 else n
+            continue
+        if tok[0] not in "{}[]:":
+            pending = (tok, t.start())  # bare word: a JSON5 key, or a value
+            continue
+        # In JSON a key only comes right after '{' or ',' inside an object, so
+        # not checking the container type below changes nothing for JSON; it
+        # keeps broken text (a stray ']' or '}', an unclosed array) readable.
+        if tok == ":":
+            if pending is not None:
+                last_key = pending[0]
+                if last_key.lower() == "allow" and stack and stack[-1][1]:
+                    keys.append(pending[1])
+        elif tok in "{[":
+            under = (bool(stack) and stack[-1][1]) or (last_key or "").lower() == "permissions"
+            stack.append((tok, under))
+            last_key = None
+        elif stack:
+            stack.pop()
+            last_key = None
+        pending = None
+    if not keys:
+        return set()
+    starts = [0] + [b.end() for b in _SPLITLINES_BREAK_RE.finditer(text)]
+    out = set()
+    for off in keys:
+        i = bisect.bisect_right(starts, off) - 1
+        out.add((i, off - starts[i]))
     return out
+
+
+def _looks_like_json(text):
+    """Does the text (after a BOM, blanks and comments) open a JSON object/array?
+
+    A first line like '[permissions]' is a TOML table header, not an array.
+    """
+    s = text.lstrip("\ufeff")
+    p = _LEAD_JSONC_NOISE_RE.match(s).end()
+    if s[p:p + 1] == "{":
+        return True
+    if s[p:p + 1] != "[":
+        return False
+    e = _EOL_RE.search(s, p)
+    return not _TOML_HEADER_RE.match(s[p:e.start() if e else len(s)])
 
 
 def _yaml_under_permissions(lines):
@@ -2085,18 +2421,23 @@ def _brace_key(line, b):
 class _AllowScope(object):
     """Decides whether an `allow` list key sits under a `permissions` key.
 
-    JSON that parses: by the object nesting. Otherwise: an enclosing
-    `permissions: {` / `permissions = {` earlier on the same line, or a
-    `permissions:` ancestor by indentation (YAML), or a `[...permissions...]`
-    table header (TOML); .json/.mcp/<text> that did not parse accept either.
+    JSON, and .json/.mcp/<text> input that does not parse but still opens
+    with '{' or '[' (JSONC comments, trailing commas, JSON5): by the object
+    nesting. Anything else: an enclosing `permissions: {` / `permissions = {`
+    earlier on the same line, or a `permissions:` ancestor by indentation
+    (YAML), or a `[...permissions...]` table header (TOML), whatever the
+    extension says (TOML text in a .yml file still counts).
     """
 
     def __init__(self, ctx, lines):
         self.lines = lines
-        self.ext = _file_ext(ctx)
-        self.json = (
-            _json_permission_allows(lines) if _json_data(ctx) is not None else None
-        )
+        text = ctx.get("text", "")
+        if _json_data(ctx) is not None or (
+            _file_ext(ctx) in (".json", ".mcp", "") and _looks_like_json(text)
+        ):
+            self.json = _json_permission_allows(text)
+        else:
+            self.json = None
         self.yaml = None
         self.toml = None
         self.row = None
@@ -2132,17 +2473,105 @@ class _AllowScope(object):
         row[1], row[3] = max(k, col), quoted
         if stack and stack[-1]:
             return True
-        if self.ext != ".toml":
-            if self.yaml is None:
-                self.yaml = _yaml_under_permissions(self.lines)
-            if self.yaml[i]:
-                return True
-        if self.ext not in (".yaml", ".yml"):
-            if self.toml is None:
-                self.toml = _toml_under_permissions(self.lines)
-            if self.toml[i]:
-                return True
-        return False
+        if self.yaml is None:
+            self.yaml = _yaml_under_permissions(self.lines)
+        if self.yaml[i]:
+            return True
+        if self.toml is None:
+            self.toml = _toml_under_permissions(self.lines)
+        return self.toml[i]
+
+
+class _ListCollector(object):
+    """_collect_args(lines, j, pos) for many keys on one line, without redoing shared work.
+
+    new_items(j, pos, key) yields the items _collect_args(lines, j, pos)
+    would return, in order, except ones it already yielded for the same key
+    text from the same starting state (their findings are already recorded):
+    a long line of 'allow: [' keys with no closing ']' would otherwise read
+    the rest of the line (and up to 51 more lines) once per key.
+    """
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.close_memo = {}  # line -> {(position, quote): index of the closing ']' or -1}
+        self.walked = {}      # (line, end of part, key) -> item search positions done
+        self.scanners = {}    # (line, end of part) -> _ItemScanner
+        self.below_done = set()  # (line, key, kind) whose following-line part was yielded
+
+    def _close(self, j, s):
+        """s + _find_unquoted(lines[j][s:], ']'), or -1."""
+        memo = self.close_memo.setdefault(j, {})
+        line = self.lines[j]
+        n = len(line)
+        k, quote = s, None
+        trail = []
+        res = -1
+        while k < n:
+            state = (k, quote)
+            if state in memo:
+                res = memo[state]
+                break
+            trail.append(state)
+            c = line[k]
+            if quote:
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == quote:
+                    quote = None
+            elif c in "\"'":
+                quote = c
+            elif c == "]":
+                res = k
+                break
+            k += 1
+        for state in trail:
+            memo[state] = res
+        return res
+
+    def new_items(self, j, pos, key):
+        lines = self.lines
+        line = lines[j]
+        q = _SPACES_RE.match(line, pos).end()
+        if q < len(line) and line[q] == "[":
+            s = q + 1
+            close = self._close(j, s)
+            end = close if close >= 0 else len(line)
+            done = self.walked.setdefault((j, end, key), set())
+            scanner = self.scanners.get((j, end))
+            if scanner is None:
+                scanner = self.scanners[(j, end)] = _ItemScanner(line, end)
+            e = s
+            while e not in done:
+                done.add(e)
+                found = scanner.search(e)
+                if found is None:
+                    break
+                yield found[1], j + 1
+                e = found[0]
+            if close >= 0 or (j, key, "[") in self.below_done:
+                return
+            self.below_done.add((j, key, "["))
+            k = j
+            while k + 1 < len(lines) and k - j <= 50:
+                k += 1
+                seg = lines[k]
+                c = _find_unquoted(seg, "]")
+                for item in _list_items(seg if c < 0 else seg[:c]):
+                    yield item, k + 1
+                if c >= 0:
+                    break
+        elif q == len(line) or line[q] == "#":
+            if (j, key, "-") in self.below_done:
+                return
+            self.below_done.add((j, key, "-"))
+            for item in _collect_args(lines, j, len(line)):
+                yield item
+        else:
+            stripped = line[pos:].strip()
+            for tok in _heuristic_tokens(_strip_yaml_comment(stripped)):
+                yield tok, j + 1
 
 
 def _analyze_blanket_approval(ctx):
@@ -2152,6 +2581,7 @@ def _analyze_blanket_approval(ctx):
     low = ctx.get("full_lower", "")
     allow_scope = _AllowScope(ctx, lines) if "permissions" in low else None
     mcp_ok = "mcp" in low
+    collector = _ListCollector(lines)
     hits = {}
     for i, raw in enumerate(lines):
         if _skip_config_line(raw):
@@ -2173,33 +2603,96 @@ def _analyze_blanket_approval(ctx):
             key = m.group(1)
             if key.lower() == "allow" and not (allow_scope and allow_scope.ok(i, line, m)):
                 continue
-            after = line[m.end():].strip()
-            if not after or after.startswith(("[", "#")):
-                items = _collect_args(lines, i, m.end())
+            # The key pattern ends in \s*, so m.end() is where line[m.end():].strip() starts.
+            e = m.end()
+            if e == len(line) or line[e] in "[#":
+                items = collector.new_items(i, e, key)
             else:
                 # Scalar value: only the value itself, never the rest of the line.
-                items = [(t, lineno) for t in _heuristic_tokens(after[:200])[:1]]
+                items = [(t, lineno) for t in _heuristic_tokens(line[e:e + 200])[:1]]
             for item, item_line in items:
                 found = _wildcard_scope(item)
                 if found:
                     _add_hit(hits, lines, item_line, _approval_message(found[0], key, found[1]))
+        flags = _FlagValues(line)
         for m in _ALLOWED_TOOLS_FLAG_RE.finditer(line):
             flag = m.group(1)
-            rest = line[m.end():]
-            rest = rest[1:] if rest.startswith("=") else rest
-            values = []
-            for t in _TOKEN_RE.finditer(rest):
-                if t.group(0).startswith("-"):
-                    break
-                values.append((t.group(0), lineno))
-            if not values and not _TOKEN_RE.search(rest):
+            scopes = flags.new_scopes(m.end(), flag)
+            if scopes is None:  # nothing after the flag on this line
                 value, vline = _first_value(lines, i, len(lines[i]))
-                values = [(value, vline)] if value else []
-            for value, vline in values:
-                found = _wildcard_scope(value)
+                scopes = [(_wildcard_scope(value), vline)] if value else []
+            else:
+                scopes = [(found, lineno) for found in scopes]
+            for found, vline in scopes:
                 if found:
                     _add_hit(hits, lines, vline, _approval_message(found[0], flag, found[1]))
     return hits
+
+
+class _FlagValues(object):
+    """The --allowedTools value loop of one line, without rescanning the rest of the line per flag.
+
+    For a flag ending at `end`, the original reads rest = line[end:] (one '='
+    dropped) and takes its _TOKEN_RE tokens up to the first one starting with
+    '-'. Those are the line's own tokens after the one holding `end`, plus
+    the tail of that one; consecutive flags share the same run of tokens.
+    """
+
+    def __init__(self, line):
+        self.line = line
+        self.spans = None
+        self.done = {}  # flag spelling -> token index its values were read up to
+
+    def new_scopes(self, end, flag):
+        """_wildcard_scope() of each value not yet read for this flag spelling, in
+        order; None when rest has no token at all."""
+        line = self.line
+        if self.spans is None:
+            self.spans = [(t.start(), t.end()) for t in _TOKEN_RE.finditer(line)]
+            self.ends = [e for _, e in self.spans]
+        a = end + 1 if line.startswith("=", end) else end
+        k = bisect.bisect_right(self.ends, a)
+        if k == len(self.spans):
+            return None
+        start, stop = self.spans[k]
+        if line[max(start, a)] == "-":
+            return []
+        if start >= a:
+            out = [_wildcard_scope(line[start:stop])]
+        else:
+            out = [_wildcard_scope_span(line, a, stop)]
+        j = max(k + 1, self.done.get(flag, 0))
+        while j < len(self.spans) and line[self.spans[j][0]] != "-":
+            out.append(_wildcard_scope(line[self.spans[j][0]:self.spans[j][1]]))
+            j += 1
+        if j > k + 1:
+            self.done[flag] = j
+        return out
+
+
+_TOOL_STAR_SPAN_RE = re.compile(r"([A-Za-z_][\w.-]*)\(\s*\*{1,2}\s*\)$")
+
+
+def _wildcard_scope_span(line, a, b):
+    """_wildcard_scope(line[a:b]) for a _TOKEN_RE token tail, copying it only on a hit.
+
+    A token has no whitespace, quotes or backticks, so the strip()s in
+    _wildcard_scope are no-ops and its tests reduce to the checks below.
+    """
+    n = b - a
+    if n <= 10:
+        return _wildcard_scope(line[a:b])
+    last = line[b - 1]
+    if last == ")":
+        m = _TOOL_STAR_SPAN_RE.match(line, a, b)
+        if m:
+            if m.group(1).lower() in _READ_ONLY_TOOLS:
+                return None
+            return line[a:b], "every %s call" % m.group(1)
+        return None
+    if last == "*" and line[a:a + 5].lower() == "mcp__":
+        return line[a:b], "every matching MCP tool"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2369,6 +2862,7 @@ _LOOP_LIMIT_KEYS = (
     "maxround",
     "maxrounds",
     "recursionlimit",
+    "maxconsecutiveautoreply",
     "maxtoolcalls",
     "maxbudget",
     "maxbudgetusd",
@@ -2376,7 +2870,7 @@ _LOOP_LIMIT_KEYS = (
     "maxcostusd",
 )
 _LOOP_HINT_RE = re.compile(
-    r"iteration|turn|round|recursion|tool_?calls|budget|cost", re.IGNORECASE
+    r"iteration|turn|round|recursion|auto_?reply|tool_?calls|budget|cost", re.IGNORECASE
 )
 _LOOP_KV_RE = re.compile(
     r"""(?:^|[\s{,\[(])["']?([A-Za-z_][\w.-]{0,80})["']?\s*[:=]\s*"""
@@ -2400,6 +2894,21 @@ def _unbounded_value(value):
     return False
 
 
+def _unbounded_loop(key, value):
+    """Is `key: value` an unbounded or non-positive loop/budget limit?
+
+    AutoGen's max_consecutive_auto_reply=0 means "never auto-reply" (a stop,
+    not a missing limit), so only that key's 0 is accepted; inf/-1 still count.
+    """
+    if not (_is_loop_key(key) and _unbounded_value(value)):
+        return False
+    norm = re.sub(r"[^a-z0-9]", "", key.rsplit(".", 1)[-1].lower())
+    if norm.endswith("maxconsecutiveautoreply"):
+        v = value.strip().strip("\"'").strip()
+        return not (_NUMBER_RE.match(v) and float(v) == 0)
+    return True
+
+
 def _loop_message(key, value):
     return (
         "Agent loop/budget limit '%s' set to %s (unbounded or non-positive; "
@@ -2418,7 +2927,7 @@ def _analyze_unbounded_loop(ctx):
         line = _code_text(raw, ctx)
         for m in _LOOP_KV_RE.finditer(line):
             key, value = m.group(1), m.group(2)
-            if _is_loop_key(key) and _unbounded_value(value):
+            if _unbounded_loop(key, value):
                 _add_hit(hits, lines, i + 1, _loop_message(key, value))
         toks = _heuristic_tokens(line)
         for k, tok in enumerate(toks):
@@ -2427,7 +2936,7 @@ def _analyze_unbounded_loop(ctx):
             name, eq, value = tok[2:].partition("=")
             if not eq:
                 value = toks[k + 1] if k + 1 < len(toks) else ""
-            if value and _is_loop_key(name) and _unbounded_value(value):
+            if value and _unbounded_loop(name, value):
                 _add_hit(hits, lines, i + 1, _loop_message("--" + name, value))
     return hits
 
@@ -2441,14 +2950,16 @@ _CRED_WORD_RE = re.compile(
     r"(?:^|_)(?:token|key|secret|password|passwd|pat|credentials?|apikey)(?:_|$)"
 )
 _SOCKET_SUFFIXES = ("docker.sock", "podman.sock")
+# "_id" as its own word, or glued to the credential word ("tokenid"); not "android", "valid".
+_CRED_ID_RE = re.compile(r"(?:^|_|token|key|secret)id$")
 
 
 def _admin_cred_name(name):
     norm = name.lstrip("-").lower().replace("-", "_")
     if re.search(r"(?:^|_)(?:file|path|dir|env|var)$", norm):
         return False  # names a file / env var holding the credential, not the value
-    if norm.endswith("id"):
-        return False  # an identifier (--aws-kms-master-key-id, ROOT_KEY_ID), not a secret
+    if _CRED_ID_RE.search(norm):
+        return False  # an identifier (--aws-kms-master-key-id, ROOT_KEY_ID, --root-tokenid), not a secret
     return bool(_ADMIN_SCOPE_RE.search(norm) and _CRED_WORD_RE.search(norm))
 
 
@@ -2466,10 +2977,16 @@ def _pg006_root_on(ctx, lines, lineno):
     """True when PG006 already reports a filesystem root on this line."""
     if not 0 < lineno <= len(lines):
         return False
-    return any(
-        msg.startswith("Over-broad filesystem root")
-        for msg, _ in (_detect_broad_mcp(lines[lineno - 1], ctx) or ())
-    )
+    # Once per line: a long line with many '-v /:/' would otherwise be rescanned per mount.
+    cache = ctx.setdefault("_pg006_root", {})
+    found = cache.get(lineno)
+    if found is None:
+        found = any(
+            msg.startswith("Over-broad filesystem root")
+            for msg, _ in (_detect_broad_mcp(lines[lineno - 1], ctx) or ())
+        )
+        cache[lineno] = found
+    return found
 
 
 def _docker_privilege_hits(argv, where, start, ctx, lines, hits):
@@ -2614,6 +3131,12 @@ _VERIFY_OFF_RES = (
         "cosign '--insecure-ignore-...' skips transparency-log/SCT checks",
     ),
 )
+# The line patterns above that a local-only curl / wget command may waive.
+_LOCAL_WAIVED = {
+    "--insecure": _VERIFY_OFF_RES[0],
+    "--no-check-certificate": _VERIFY_OFF_RES[2],
+}
+_WGET_RE = re.compile(r"wget", re.IGNORECASE)
 _TRUSTED_HOST_RE = re.compile(
     r"""(?<![\w-])(--trusted-host|--allow-insecure-host|PIP_TRUSTED_HOST|UV_INSECURE_HOST|"""
     r"""trusted[-_]host|allow[-_]insecure[-_]host)(?![\w-])""",
@@ -2648,11 +3171,48 @@ def _curl_k_tokens(tokens):
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
-def _curl_local_only(tokens):
-    """True when every URL in a curl command's tokens points at this machine.
+# Options that take the next token as their value (so it is not a target).
+_CURL_VALUE_LONG = frozenset((
+    "--abstract-unix-socket", "--aws-sigv4", "--cacert", "--capath", "--cert", "--cert-type",
+    "--ciphers", "--config", "--connect-timeout", "--connect-to", "--continue-at", "--cookie",
+    "--cookie-jar", "--crlfile", "--data", "--data-ascii", "--data-binary", "--data-raw",
+    "--data-urlencode", "--dns-servers", "--engine", "--form", "--form-string", "--ftp-port",
+    "--header", "--interface", "--json", "--key", "--key-type", "--limit-rate", "--max-filesize",
+    "--max-redirs", "--max-time", "--oauth2-bearer", "--output", "--output-dir", "--pass",
+    "--pinnedpubkey", "--proxy", "--proxy-header", "--proxy-user", "--quote", "--range",
+    "--referer", "--request", "--resolve", "--retry", "--retry-delay", "--retry-max-time",
+    "--speed-limit", "--speed-time", "--tls-max", "--trace", "--trace-ascii", "--unix-socket",
+    "--upload-file", "--url", "--user", "--user-agent", "--variable", "--write-out",
+))
+_WGET_VALUE_SHORT = frozenset("aABdeiIlDoOPQRtTUwX")
+_WGET_VALUE_LONG = frozenset((
+    "--accept", "--append-output", "--base", "--bind-address", "--body-data", "--body-file",
+    "--ca-certificate", "--ca-directory", "--certificate", "--directory-prefix", "--domains",
+    "--exclude-domains", "--execute", "--header", "--http-password", "--http-user",
+    "--input-file", "--level", "--limit-rate", "--load-cookies", "--method", "--output-document",
+    "--output-file", "--password", "--post-data", "--post-file", "--private-key",
+    "--proxy-password", "--proxy-user", "--quota", "--referer", "--reject", "--save-cookies",
+    "--timeout", "--tries", "--user", "--user-agent", "--wait",
+))
+_DUP_FD_RE = re.compile(r"^\d*[<>]&\d*-?$")  # 2>&1
+_REDIRECT_RE = re.compile(r"^(?:\d*>>?|&>>?|\d*<)(.*)$")  # '> file', '>file', '2>>log'
+# A bare host target: dotted name, [ipv6] or localhost, optional :port and path.
+_HOST_TARGET_RE = re.compile(
+    r"""^(?:\[[0-9A-Fa-f:.]*\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+\.?|localhost)(?::\d+)?(?:[/?#]\S*)?$""",
+    re.IGNORECASE,
+)
+_INSECURE_FLAGS = {"curl": "--insecure", "wget": "--no-check-certificate"}
 
-    Only scheme://host tokens (or --opt=scheme://host) count as URLs; a
-    command with none keeps its -k finding.
+
+def _curl_local_only(tokens, value_short=_CURL_VALUE_SHORT, value_long=_CURL_VALUE_LONG):
+    """True when a curl (or wget) command only talks to this machine.
+
+    Every scheme://host token (or --opt=scheme://host), option values
+    included, must be local, and there must be at least one. Every other
+    target (a word that is not an option or an option's value) must be a
+    local bare host as well; a variable ('$HOST', '%HOST%', '{{host}}') or a
+    remote bare host such as 'example.org/x' keeps the finding. Other words
+    (JSON/YAML key text the tokenizer picked up) are ignored.
     """
     urls = []
     for tok, _ in tokens:
@@ -2660,7 +3220,36 @@ def _curl_local_only(tokens):
             tok = tok.split("=", 1)[1]
         if _URL_SCHEME_RE.match(tok):
             urls.append(tok)
-    return bool(urls) and all(_is_local_host(_host_of(u)) for u in urls)
+    if not (urls and all(_is_local_host(_host_of(u)) for u in urls)):
+        return False
+    skip = False
+    for tok, _ in tokens:
+        if skip:
+            skip = False
+            continue
+        if _DUP_FD_RE.match(tok):
+            continue
+        r = _REDIRECT_RE.match(tok)
+        if r:
+            skip = not r.group(1)  # '> file': the next token is the file
+            continue
+        if tok.startswith("--"):
+            skip = "=" not in tok and tok in value_long
+            continue
+        if _SHORT_BUNDLE_RE.match(tok):
+            body = tok[1:]
+            for k, ch in enumerate(body):
+                if ch in value_short:
+                    skip = k == len(body) - 1
+                    break
+            continue
+        if _URL_SCHEME_RE.match(tok):
+            continue
+        if "$" in tok or "%" in tok or "{{" in tok or "`" in tok:
+            return False
+        if _HOST_TARGET_RE.match(tok) and not _is_local_host(_host_of(tok)):
+            return False
+    return True
 
 
 def _curl_message(tok):
@@ -2688,24 +3277,88 @@ def _cosign_problem(verb, tokens):
     )
 
 
-def _check_command_tokens(tokens, hits, lines):
-    """One pass over a logical command line: curl -k and cosign verify."""
-    mode = None
-    curl = []
-    cosign = None
+def _split_semicolons(tokens):
+    """tokens with a trailing ';' split off ('a;' -> 'a', ';'), plus a final '|' sentinel."""
     flushed = []
     for tok, ln in tokens:
         if tok.endswith(";") and len(tok) > 1:
             flushed.extend([(tok[:-1], ln), (";", ln)])
         else:
             flushed.append((tok, ln))
-    for tok, ln in flushed + [("|", 0)]:
+    flushed.append(("|", 0))
+    return flushed
+
+
+def _count_waived(tokens, flag, waived, local):
+    """waived[(flag, lineno, local)] += 1 for each `flag` token of one command."""
+    for tok, ln in tokens:
+        if tok == flag:
+            key = (flag, ln, local)
+            waived[key] = waived.get(key, 0) + 1
+
+
+def _wget_waivers(tokens, waived):
+    """Count the --no-check-certificate tokens of wget commands, local-only or not."""
+    cur = None
+    for tok, ln in _split_semicolons(tokens):
+        low = tok.lower()
+        name = _cmd_name(tok) if ("curl" in low or "cosign" in low or "wget" in low) else ""
+        if _is_separator_token(tok) or name in ("curl", "cosign", "wget"):
+            if cur is not None:
+                local = _curl_local_only(cur, _WGET_VALUE_SHORT, _WGET_VALUE_LONG)
+                _count_waived(cur, "--no-check-certificate", waived, local)
+            cur = [] if name == "wget" else None
+            continue
+        if cur is not None:
+            cur.append((tok, ln))
+
+
+def _drop_waived(hits, code, waived_sets):
+    """Remove a line's '--insecure' / '--no-check-certificate' finding when every
+    occurrence on the line belongs to a local-only curl / wget command.
+
+    waived_sets: one {(flag, lineno, local_only): count} per tokenizing pass.
+    A pass that saw the flag in a command that is not local-only keeps the
+    finding. Passes can see the same token, so local-only counts are compared
+    by their largest value, never their sum.
+    """
+    keys = set()
+    for w in waived_sets:
+        keys.update((flag, ln) for flag, ln, local in w if local)
+    for flag, ln in keys:
+        if any(w.get((flag, ln, False)) for w in waived_sets):
+            continue
+        count = max(w.get((flag, ln, True), 0) for w in waived_sets)
+        rx, what = _LOCAL_WAIVED[flag]
+        bucket = hits.get(ln)
+        if not bucket or not 0 < ln <= len(code):
+            continue
+        message = "Verification disabled: " + what
+        if count >= sum(1 for _ in rx.finditer(code[ln - 1])):
+            bucket[:] = [(m, s) for m, s in bucket if m != message]
+            if not bucket:
+                del hits[ln]
+
+
+def _check_command_tokens(tokens, hits, lines, waived=None):
+    """One pass over a logical command line: curl -k and cosign verify.
+
+    With `waived`, also counts the --insecure tokens of each curl command (see _drop_waived).
+    """
+    mode = None
+    curl = []
+    cosign = None
+    for tok, ln in _split_semicolons(tokens):
         low = tok.lower()
         name = _cmd_name(tok) if ("curl" in low or "cosign" in low) else ""
         if _is_separator_token(tok) or name in ("curl", "cosign"):
-            if mode == "curl" and not _curl_local_only(curl):
-                for t, l in _curl_k_tokens(curl):
-                    _add_hit(hits, lines, l, _curl_message(t))
+            if mode == "curl":
+                local = _curl_local_only(curl)
+                if not local:
+                    for t, l in _curl_k_tokens(curl):
+                        _add_hit(hits, lines, l, _curl_message(t))
+                if waived is not None:
+                    _count_waived(curl, "--insecure", waived, local)
             elif mode == "cosign":
                 problem = _cosign_problem(cosign[0], cosign[2])
                 if problem:
@@ -2753,16 +3406,25 @@ def _analyze_verification_disabled(ctx):
                 "Verification disabled: '%s' trusts a package host without TLS "
                 "certificate checks" % shown,
             )
+    waived_lines, waived_argvs = {}, {}
     for tokens in _logical_lines(code, _skip_config_line, _CURL_OR_COSIGN_RE):
         if tokens:
-            _check_command_tokens(tokens, hits, lines)
+            _check_command_tokens(tokens, hits, lines, waived_lines)
+    for tokens in _logical_lines(code, _skip_config_line, _WGET_RE):
+        if tokens:
+            _wget_waivers(tokens, waived_lines)
     if not (_is_github_workflow(ctx) or _is_github_action(ctx)):
         for argv, where in _command_argvs(ctx):
             pairs = list(zip(argv, where))
             for k, (tok, _) in enumerate(pairs):
                 if _cmd_name(tok) == "curl":
-                    _check_command_tokens(pairs[k:], hits, lines)
+                    _check_command_tokens(pairs[k:], hits, lines, waived_argvs)
                     break
+            for k, (tok, _) in enumerate(pairs):
+                if _cmd_name(tok) == "wget":
+                    _wget_waivers(pairs[k:], waived_argvs)
+                    break
+    _drop_waived(hits, code, (waived_lines, waived_argvs))
     return hits
 
 
@@ -2786,13 +3448,85 @@ _PIP_SHORT_INDEX_RE = re.compile(
 # requirements*.txt: "-i URL" at the start of a line is pip's --index-url.
 _REQ_SHORT_INDEX_RE = re.compile(r"""^\s*-i(?:\s+|=)["']?([^\s"']+)""")
 _GIT_DEP_RE = re.compile(r"""(?<![\w])git\+(?!file:)[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>`,\]}]+""")
-# package.json "repository"/"url" metadata is not a dependency.
-# pyproject [project.urls] keys (Source, "Bug Tracker", Changelog, ...) as well.
+# _GIT_DEP_RE.finditer() is quadratic on runs like 'git+git+git+...' (the scheme
+# part rescans the run from every 'git+'); _git_dep_spans() finds the same matches.
+_GIT_PLUS_RE = re.compile(r"""(?<![\w])git\+(?!file:)(?=[A-Za-z])""")
+_SCHEME_RUN_RE = re.compile(r"""[A-Za-z0-9+.-]*""")
+_GIT_BODY_RE = re.compile(r"""://[^\s"'<>`,\]}]+""")
+# package.json "repository"/"url" metadata is not a dependency. Reference
+# definition, matched against line[:start] by _metadata_key_before().
 _REPO_METADATA_KEY_RE = re.compile(
-    r"""["']?(?:url|repository|repo|homepage|bugs|source|source[ _-]?code|download|"""
-    r"""documentation|docs|changelog|issues|tracker|funding)["']?\s*[:=]\s*["']?$""",
+    r"""["']?(?:url|repository|repo|homepage|bugs)["']?\s*[:=]\s*["']?$""", re.IGNORECASE
+)
+_REPO_METADATA_WORD_RE = re.compile(r"""(?:url|repository|repo|homepage|bugs)$""", re.IGNORECASE)
+# pyproject [project.urls] / [tool.poetry.urls] keys (Source, "Bug Tracker", ...): only
+# inside those tables, where every value is a link; elsewhere 'source = "git+..."' is a dependency.
+_URLS_TABLE_WORD_RE = re.compile(
+    r"""(?:source|source[ _-]?code|download|documentation|docs|changelog|issues|tracker|funding)$""",
     re.IGNORECASE,
 )
+_INLINE_URLS_RE = re.compile(r"""^\s*["']?urls["']?\s*=\s*\{""")
+
+
+def _git_dep_spans(line):
+    """(start, end) of each _GIT_DEP_RE.finditer(line) match, in linear time."""
+    run_from, run_end = -1, -1
+    pos = 0
+    while True:
+        m = _GIT_PLUS_RE.search(line, pos)
+        if not m:
+            return
+        p = m.end()
+        # [A-Za-z][A-Za-z0-9+.-]* must be followed by '://': ':' is outside the
+        # class, so only the end of the whole run can work. One run serves every
+        # 'git+' inside it.
+        if not run_from <= p < run_end:
+            run_from, run_end = p, _SCHEME_RUN_RE.match(line, p).end()
+        body = _GIT_BODY_RE.match(line, run_end)
+        if body:
+            yield m.start(), body.end()
+            pos = body.end()
+        else:
+            pos = m.start() + 1
+
+
+def _metadata_key_before(line, end, words_re):
+    """Does line[:end] end in `KEY["']?\\s*[:=]\\s*["']?` (KEY from words_re)?
+
+    Same answer as searching line[:end] with _REPO_METADATA_KEY_RE (built
+    from those words), reading back from `end` instead of copying the prefix.
+    """
+    k = end
+    if k > 0 and line[k - 1] in "\"'":
+        k -= 1
+    while k > 0 and line[k - 1].isspace():
+        k -= 1
+    if k == 0 or line[k - 1] not in ":=":
+        return False
+    k -= 1
+    while k > 0 and line[k - 1].isspace():
+        k -= 1
+    if k > 0 and line[k - 1] in "\"'":
+        k -= 1
+    return bool(words_re.search(line, max(0, k - 16), k))
+
+
+def _toml_urls_lines(lines):
+    """Per line: inside a [project.urls] / [tool.poetry.urls] table (or a urls = {...} line of
+    [project] / [tool.poetry])?"""
+    out = []
+    table = ()
+    for line in lines:
+        m = _TOML_HEADER_RE.match(line)
+        if m:
+            table = tuple(p.strip().strip("\"'").lower() for p in m.group(1).split("."))
+            out.append(False)
+            continue
+        out.append(
+            table in (("project", "urls"), ("tool", "poetry", "urls"))
+            or (table in (("project",), ("tool", "poetry")) and bool(_INLINE_URLS_RE.match(line)))
+        )
+    return out
 
 
 def _is_plain_http(url):
@@ -2828,6 +3562,7 @@ def _analyze_dependency_source(ctx):
         return {}
     lines = _ctx_lines(ctx)
     pg008 = None
+    urls_table = None
     hits = {}
     code = [_code_text(l, ctx) for l in lines]
     for i, raw in enumerate(lines):
@@ -2849,9 +3584,13 @@ def _analyze_dependency_source(ctx):
             message = _index_message("-i", url)
             if message:
                 _add_hit(hits, lines, lineno, message)
-        for m in _GIT_DEP_RE.finditer(line):
-            spec = m.group(0).rstrip(").;")
-            if _COMMIT_SHA_RE.search(spec) or _REPO_METADATA_KEY_RE.search(line[:m.start()]):
+        for start, end in _git_dep_spans(line):
+            spec = line[start:end].rstrip(").;")
+            if _COMMIT_SHA_RE.search(spec) or _metadata_key_before(line, start, _REPO_METADATA_WORD_RE):
+                continue
+            if urls_table is None:
+                urls_table = _toml_urls_lines(lines) if _file_ext(ctx) == ".toml" else [False] * len(lines)
+            if urls_table[i] and _metadata_key_before(line, start, _URLS_TABLE_WORD_RE):
                 continue
             if pg008 is None:
                 pg008 = _cached_hits(ctx, "_pg008", _analyze_unpinned_launch)
