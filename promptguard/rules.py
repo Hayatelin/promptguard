@@ -12,6 +12,8 @@ literal, and rules are scoped to realistic config/prompt shapes.
 
 import bisect
 import json
+import json.decoder
+import json.scanner
 import os
 import re
 import shlex
@@ -1977,10 +1979,790 @@ def _analyze_expression_injection(ctx):
     return hits
 
 
+# ---------------------------------------------------------------------------
+# Shared JSON helpers (PG013, PG014)
+# ---------------------------------------------------------------------------
+#
+# These rules must report on the line of a specific key, so JSON is parsed
+# with the pure-Python scanner and every object/array remembers its
+# [start, end) offsets in the text.
+
+
+class _JDict(dict):
+    __slots__ = ("start", "end")
+
+
+class _JList(list):
+    __slots__ = ("start", "end")
+
+
+def _json_positions(text):
+    """json.loads() whose dicts/lists carry .start/.end text offsets."""
+    decoder = json.JSONDecoder()
+
+    def parse_object(s_and_end, *args):
+        start = s_and_end[1] - 1
+        obj, end = json.decoder.JSONObject(s_and_end, *args)
+        node = _JDict(obj)
+        node.start, node.end = start, end
+        return node, end
+
+    def parse_array(s_and_end, scan_once):
+        start = s_and_end[1] - 1
+        arr, end = json.decoder.JSONArray(s_and_end, scan_once)
+        node = _JList(arr)
+        node.start, node.end = start, end
+        return node, end
+
+    decoder.parse_object = parse_object
+    decoder.parse_array = parse_array
+    decoder.scan_once = json.scanner.py_make_scanner(decoder)
+    return decoder.decode(text)
+
+
+def _json_text(ctx):
+    """The file text ready for _json_positions (BOM blanked, offsets kept)."""
+    text = ctx.get("text", "")
+    if text.startswith("\ufeff"):
+        text = " " + text[1:]
+    if text.lstrip()[:1] not in ("{", "["):
+        return None
+    return text
+
+
+def _line_starts(text):
+    """Offsets where each line starts, split exactly like str.splitlines()."""
+    starts = [0]
+    pos = 0
+    for piece in text.splitlines(True):
+        pos += len(piece)
+        starts.append(pos)
+    return starts
+
+
+def _offset_line(starts, offset):
+    return max(1, bisect.bisect_right(starts, offset))
+
+
+def _key_needles(key):
+    needles = [json.dumps(key)]
+    raw = json.dumps(key, ensure_ascii=False)
+    if raw != needles[0]:
+        needles.append(raw)
+    return needles
+
+
+def _key_offset(text, node, key):
+    """Offset of `"key":` directly inside JSON object `node` (else node.start)."""
+    children = [
+        v for v in node.values() if isinstance(v, (_JDict, _JList))
+    ]
+    for needle in _key_needles(key):
+        rx = re.compile(re.escape(needle) + r"\s*:")
+        for m in rx.finditer(text, node.start, node.end):
+            p = m.start()
+            if not any(c.start <= p < c.end for c in children):
+                return p
+    return node.start
+
+
+def _item_offset(text, node, item):
+    """Offset of string `item` inside JSON array `node` (else node.start)."""
+    for needle in _key_needles(item):
+        p = text.find(needle, node.start, node.end)
+        if p >= 0:
+            return p
+    return node.start
+
+
+def _basename(ctx):
+    path = ctx.get("path") or "<text>"
+    if path == "<text>":
+        return ""
+    return re.split(r"[\\/]", path)[-1].lower()
+
+
+# ---------------------------------------------------------------------------
+# PG013: sub-agent / skill / plugin permission inheritance
+# ---------------------------------------------------------------------------
+
+_FM_KEY_RE = re.compile(r"""^(["']?)([A-Za-z_][\w-]*)\1[ \t]*:(?=\s|$)(.*)$""")
+_AGENT_DENY_KEYS = ("disallowedTools", "disallowed-tools", "disallowed_tools")
+_ALLOWED_TOOLS_KEYS = ("allowed-tools", "allowed_tools", "allowedTools")
+# "*", "mcp__*", or Tool(...) whose specifier is only "*"/":" (plus an
+# optional "domain:" prefix), e.g. Bash(*), Bash(:*), Read(**), WebFetch(domain:*).
+_WILDCARD_TOOL_RE = re.compile(
+    r"^(?:\*|mcp__\*.*|[A-Za-z][\w-]*\(\s*(?:domain\s*:\s*)?[*:\s]*\*[*:\s]*\))$",
+    re.IGNORECASE,
+)
+_NPM_INSTALL_SCRIPTS = ("preinstall", "install", "postinstall")
+_MCP_TOKEN_RE = re.compile(r"(?:^|[^a-z0-9])mcp(?:$|[^a-z0-9])")
+_EXTENSION_KEYWORDS = (
+    "modelcontextprotocol", "model-context-protocol", "claude-code",
+    "claude-plugin", "claude-code-plugin", "claude-skill", "agent-skill",
+    "agent-skills",
+)
+_MCP_SDK_DEPS = ("@modelcontextprotocol/sdk", "fastmcp", "mcp-framework")
+_AUTO_HOOK_EVENTS = (
+    ("SessionStart", "at every session start"),
+    ("Setup", "on claude --init/--maintenance"),
+)
+
+
+def _frontmatter_fields(lines):
+    """{key: (index, inline_value, [(index, line), ...])} of a leading --- block."""
+    if not lines or lines[0].lstrip("\ufeff").strip() != "---":
+        return None
+    end = None
+    for j in range(1, min(len(lines), 500)):
+        if lines[j].strip() == "---":
+            end = j
+            break
+    if end is None:
+        return None
+    keys = []
+    for i in range(1, end):
+        s = lines[i]
+        if not s or s[0] in " \t-#":
+            continue
+        m = _FM_KEY_RE.match(s)
+        if m:
+            keys.append((i, m.group(2), m.group(3)))
+    fields = {}
+    for k, (i, key, rest) in enumerate(keys):
+        stop = keys[k + 1][0] if k + 1 < len(keys) else end
+        if key not in fields:
+            fields[key] = (i, rest, [(j, lines[j]) for j in range(i + 1, stop)])
+    return fields
+
+
+def _split_tool_entries(s):
+    """'Read, Grep Bash(git add *)' -> ['Read', 'Grep', 'Bash(git add *)']."""
+    out = []
+    buf = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif depth == 0 and (ch == "," or ch.isspace()):
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return [e for e in (_unquote(x) for x in out) if e]
+
+
+def _fm_entries(field):
+    """[(entry, index)] for a front-matter string, flow list or block list."""
+    i, rest, cont = field
+    rest = _strip_yaml_comment(rest).strip()
+    out = []
+    if rest.startswith("["):
+        segs = [(i, rest[1:])]
+        if "]" not in rest:
+            for j, s in cont:
+                segs.append((j, _strip_yaml_comment(s)))
+                if "]" in s:
+                    break
+        for j, seg in segs:
+            out.extend((e, j) for e in _split_tool_entries(seg.split("]", 1)[0]))
+        return out
+    if rest and not _BLOCK_SCALAR_RE.match(rest):
+        return [(e, i) for e in _split_tool_entries(rest)]
+    for j, s in cont:
+        t = _strip_yaml_comment(s).strip()
+        if not t:
+            continue
+        m = re.match(r"-(?:\s+|$)(.*)$", t)
+        if m:
+            out.extend((e, j) for e in _split_tool_entries(m.group(1)))
+        elif rest:
+            out.extend((e, j) for e in _split_tool_entries(t))
+    return out
+
+
+def _is_agent_definition(ctx, fields):
+    path = ctx.get("path") or "<text>"
+    if path == "<text>":
+        return False
+    parts = [p for p in re.split(r"[\\/]+", path) if p]
+    name = parts[-1].lower() if parts else ""
+    if not name.endswith(".md") or name == "readme.md":
+        return False
+    if not any(p.lower() == "agents" for p in parts[:-1]):
+        return False
+    return "name" in fields and "description" in fields
+
+
+def _pg013_markdown(ctx, lines, hits):
+    fields = _frontmatter_fields(lines)
+    if not fields:
+        return
+    if _is_agent_definition(ctx, fields):
+        agent = _unquote(_strip_yaml_comment(fields["name"][1])) or "?"
+        if "tools" in fields:
+            for entry, j in _fm_entries(fields["tools"]):
+                if _WILDCARD_TOOL_RE.match(entry):
+                    _add_hit(
+                        hits, lines, j + 1,
+                        "Sub-agent '%s' lists wildcard tool entry '%s' in 'tools' "
+                        "(grants every matching tool)" % (agent, entry),
+                    )
+            return
+        if any(k in fields for k in _AGENT_DENY_KEYS):
+            return
+        near = [
+            k for k in fields
+            if k != "tools" and re.sub(r"[-_]", "", k.lower()) in ("tools", "allowedtools")
+        ]
+        note = ""
+        if near:
+            note = " ('%s' is not a field subagents recognize)" % near[0]
+        _add_hit(
+            hits, lines, fields["name"][0] + 1,
+            "Sub-agent '%s' omits 'tools', so it inherits every tool available "
+            "to subagents, MCP tools included%s" % (agent, note),
+        )
+        return
+    for key in _ALLOWED_TOOLS_KEYS:
+        if key not in fields:
+            continue
+        for entry, j in _fm_entries(fields[key]):
+            if _WILDCARD_TOOL_RE.match(entry):
+                _add_hit(
+                    hits, lines, j + 1,
+                    "Skill/command front matter pre-approves wildcard tool entry "
+                    "'%s' in '%s' (runs without a permission prompt)" % (entry, key),
+                )
+
+
+def _is_extension_package(data):
+    name = data.get("name")
+    if isinstance(name, str):
+        low = name.lower()
+        if low.startswith("@modelcontextprotocol/") or _MCP_TOKEN_RE.search(low):
+            return True
+    keywords = data.get("keywords")
+    if isinstance(keywords, list):
+        for kw in keywords:
+            if isinstance(kw, str) and (
+                kw.lower() in _EXTENSION_KEYWORDS or _MCP_TOKEN_RE.search(kw.lower())
+            ):
+                return True
+    for dep_key in ("dependencies", "peerDependencies", "optionalDependencies"):
+        deps = data.get(dep_key)
+        if isinstance(deps, dict) and any(d in deps for d in _MCP_SDK_DEPS):
+            return True
+    return False
+
+
+def _pg013_package(text, starts, data, lines, hits):
+    scripts = data.get("scripts")
+    if not isinstance(scripts, _JDict) or not _is_extension_package(data):
+        return
+    pkg = data.get("name") if isinstance(data.get("name"), str) else "?"
+    for key in _NPM_INSTALL_SCRIPTS:
+        value = scripts.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        lineno = _offset_line(starts, _key_offset(text, scripts, key))
+        _add_hit(
+            hits, lines, lineno,
+            "Install-time npm script '%s' in MCP/agent extension package '%s' "
+            "runs automatically on every install" % (key, pkg),
+        )
+
+
+def _pg013_plugin(text, starts, data, lines, hits, base):
+    # hooks.json wraps the event map in "hooks"; plugin.json may also give a
+    # list mixing file paths and inline event maps.
+    hooks = data.get("hooks")
+    event_maps = []
+    if isinstance(hooks, dict):
+        event_maps.append(hooks)
+    elif isinstance(hooks, list) and base == "plugin.json":
+        event_maps.extend(h for h in hooks if isinstance(h, dict))
+    for event_map in event_maps:
+        for event, when in _AUTO_HOOK_EVENTS:
+            groups = event_map.get(event)
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                inner = group.get("hooks") if isinstance(group, dict) else None
+                if not isinstance(inner, list):
+                    continue
+                for hook in inner:
+                    if not isinstance(hook, _JDict) or hook.get("type") != "command":
+                        continue
+                    cmd = hook.get("command")
+                    if not isinstance(cmd, str) or not cmd.strip():
+                        continue
+                    lineno = _offset_line(starts, _key_offset(text, hook, "command"))
+                    _add_hit(
+                        hits, lines, lineno,
+                        "Plugin hook on '%s' runs a command automatically %s: %s"
+                        % (event, when, _short(cmd)),
+                    )
+    commands = data.get("commands") if base == "plugin.json" else None
+    if isinstance(commands, dict):
+        for cname, spec in commands.items():
+            allowed = spec.get("allowedTools") if isinstance(spec, dict) else None
+            if not isinstance(allowed, _JList):
+                continue
+            for entry in allowed:
+                if isinstance(entry, str) and _WILDCARD_TOOL_RE.match(entry.strip()):
+                    lineno = _offset_line(starts, _item_offset(text, allowed, entry))
+                    _add_hit(
+                        hits, lines, lineno,
+                        "Plugin command '%s' pre-approves wildcard tool entry '%s' "
+                        "in allowedTools (runs without a permission prompt)"
+                        % (cname, entry.strip()),
+                    )
+
+
+def _analyze_permission_inheritance(ctx):
+    lines = _ctx_lines(ctx)
+    hits = {}
+    ext = _file_ext(ctx)
+    if ext in (".md", ""):
+        _pg013_markdown(ctx, lines, hits)
+    base = _basename(ctx)
+    if base in ("package.json", "hooks.json", "plugin.json"):
+        text = _json_text(ctx)
+        if text is None:
+            return hits
+        try:
+            data = _json_positions(text)
+        except (ValueError, RecursionError):
+            return hits
+        if not isinstance(data, _JDict):
+            return hits
+        starts = _line_starts(text)
+        if base == "package.json":
+            _pg013_package(text, starts, data, lines, hits)
+        else:
+            _pg013_plugin(text, starts, data, lines, hits, base)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG014: over-broad tool input schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA_KEYS = ("inputSchema", "input_schema", "parameters")
+_PATH_TOKENS = {
+    "path", "paths", "filepath", "filepaths", "filename", "filenames",
+    "pathname", "dir", "dirs", "dirname", "directory", "directories",
+    "folder", "folders", "cwd",
+}
+_PATH_LAST = {"file", "files"}
+_COMMAND_TOKENS = {
+    "command", "commands", "cmd", "cmds", "cmdline", "commandline", "shell",
+}
+_COMMAND_LAST = {"script"}
+_URL_TOKENS = {"url", "urls", "uri", "uris", "endpoint", "endpoints", "webhook", "href"}
+_SQL_TOKENS = {"sql"}
+_SQL_LAST = {"query", "statement"}
+_SQL_TOOL_TOKENS = {
+    "sql", "sqlite", "postgres", "postgresql", "mysql", "mssql", "db", "database",
+}
+_CODE_TOKENS = {"expression", "expr", "eval"}
+_CODE_LANG = {
+    "source", "python", "py", "js", "javascript", "ts", "typescript",
+    "program", "script", "lua", "ruby",
+}
+_TRIVIAL_PATTERNS = {
+    "", ".*", ".+", "(.*)", "(.+)", "[\\s\\S]*", "[\\s\\S]+",
+    "[\\S\\s]*", "[\\S\\s]+", "(?s).*", "(?s).+",
+}
+
+
+def _name_tokens(name):
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t]
+
+
+def _sink_category(param, tool_tokens):
+    tokens = _name_tokens(param)
+    if not tokens:
+        return None
+    tset = set(tokens)
+    last = tokens[-1]
+    if tset & _PATH_TOKENS or last in _PATH_LAST:
+        return "path"
+    if tset & _COMMAND_TOKENS or last in _COMMAND_LAST:
+        return "command"
+    if tset & _URL_TOKENS:
+        return "url"
+    if tset & _SQL_TOKENS or (last in _SQL_LAST and tool_tokens & _SQL_TOOL_TOKENS):
+        return "sql"
+    if (
+        tset & _CODE_TOKENS
+        or tokens == ["code"]
+        or (last == "code" and len(tokens) > 1 and tokens[-2] in _CODE_LANG)
+    ):
+        return "code"
+    return None
+
+
+def _schema_types(schema):
+    t = schema.get("type")
+    if isinstance(t, str):
+        return {t.lower()}
+    if isinstance(t, list):
+        return {x.lower() for x in t if isinstance(x, str)}
+    return set()
+
+
+def _is_constrained(schema):
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return True
+    if "const" in schema:
+        return True
+    max_len = schema.get("maxLength")
+    if isinstance(max_len, (int, float)) and not isinstance(max_len, bool):
+        return True
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str):
+        core = pattern
+        if core.startswith("^"):
+            core = core[1:]
+        if core.endswith("$") and not core.endswith("\\$"):
+            core = core[:-1]
+        if core not in _TRIVIAL_PATTERNS:
+            return True
+    for key in ("anyOf", "oneOf"):
+        alts = schema.get(key)
+        if isinstance(alts, list) and alts and all(
+            isinstance(a, dict) and _is_constrained(a) for a in alts
+        ):
+            return True
+    parts = schema.get("allOf")
+    if isinstance(parts, list) and any(
+        isinstance(a, dict) and _is_constrained(a) for a in parts
+    ):
+        return True
+    return False
+
+
+def _tool_schemas(node, out):
+    """Collect (tool_name, schema) for every tool definition in a JSON tree."""
+    if isinstance(node, dict):
+        name = node.get("name")
+        if isinstance(name, str):
+            for key in _SCHEMA_KEYS:
+                schema = node.get(key)
+                if not isinstance(schema, _JDict) or not isinstance(
+                    schema.get("properties"), _JDict
+                ):
+                    continue
+                if key == "parameters" and "object" not in _schema_types(schema):
+                    continue
+                out.append((name, schema))
+                break
+        for value in node.values():
+            _tool_schemas(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            _tool_schemas(value, out)
+
+
+def _broad_params(schema, tool_tokens, prefix, depth, out):
+    """Collect (label, category, properties_node, key, child) for loose sinks."""
+    props = schema.get("properties")
+    if not isinstance(props, _JDict) or depth > 5:
+        return
+    for pname, pschema in props.items():
+        if not isinstance(pschema, _JDict):
+            continue
+        label = prefix + pname
+        types = _schema_types(pschema)
+        target = None
+        if "string" in types:
+            target = pschema
+        elif "array" in types and isinstance(pschema.get("items"), dict):
+            items = pschema["items"]
+            if "string" in _schema_types(items):
+                target = items
+                label += "[]"
+        category = _sink_category(pname, tool_tokens)
+        if (
+            category
+            and target is not None
+            and "$ref" not in pschema
+            and not _is_constrained(target)
+        ):
+            out.append((label, category, props, pname, pschema))
+        if "object" in types:
+            _broad_params(pschema, tool_tokens, prefix + pname + ".", depth + 1, out)
+
+
+def _analyze_broad_schema(ctx):
+    if _file_ext(ctx) not in (".json", ".mcp", ""):
+        return {}
+    text = _json_text(ctx)
+    if text is None or not any(
+        '"%s"' % k in text for k in _SCHEMA_KEYS
+    ):
+        return {}
+    try:
+        data = _json_positions(text)
+    except (ValueError, RecursionError):
+        return {}
+    tools = []
+    _tool_schemas(data, tools)
+    if not tools:
+        return {}
+    lines = _ctx_lines(ctx)
+    starts = _line_starts(text)
+    hits = {}
+    for tool, schema in tools:
+        loose = []
+        _broad_params(schema, set(_name_tokens(tool)), "", 0, loose)
+        if not loose:
+            continue
+        extra = ""
+        if schema.get("additionalProperties") is not False:
+            extra = "; the schema also accepts undeclared properties (set additionalProperties: false)"
+        for label, category, props, key, child in loose:
+            offset = -1
+            for needle in _key_needles(key):
+                offset = text.rfind(needle, props.start, child.start)
+                if offset >= 0:
+                    break
+            lineno = _offset_line(starts, offset if offset >= 0 else props.start)
+            _add_hit(
+                hits, lines, lineno,
+                "Over-broad tool schema: '%s' parameter '%s' (%s) is a free-form "
+                "string (no enum, const, maxLength or non-trivial pattern)%s"
+                % (tool, label, category, extra),
+            )
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# PG021: checksum fetched from the same origin as the artifact
+# ---------------------------------------------------------------------------
+
+_DOWNLOAD_CMD_RE = re.compile(
+    r"(?<![\w.-])(curl|wget|aria2c|invoke-webrequest|iwr|invoke-restmethod|irm|"
+    r"start-bitstransfer)(?:\.exe)?(?![\w-])",
+    re.IGNORECASE,
+)
+_DOCKER_ADD_RE = re.compile(r"^\s*ADD\s", re.IGNORECASE)
+_SEGMENT_END_RE = re.compile(r"&&|\|\||\||;")
+_CURL_UPLOAD_RE = re.compile(
+    r"(?:^|\s)(?:-T|--upload-file|-F|--form|-d|--data(?:-[a-z]+)?)(?=[\s=]|$)|"
+    r"(?:^|\s)(?:-X|--request)[\s=]*[\"']?(?:PUT|POST|PATCH)\b",
+)
+_WGET_UPLOAD_RE = re.compile(
+    r"--(?:post|body)-(?:file|data)\b|--method[\s=]+[\"']?(?:PUT|POST|PATCH)\b",
+    re.IGNORECASE,
+)
+_PS_UPLOAD_RE = re.compile(
+    r"-Method\s+[\"']?(?:Put|Post|Patch)\b|-InFile\b|-TransferType\s+Upload\b",
+    re.IGNORECASE,
+)
+_URL_TOKEN_RE = re.compile(
+    r"""(https?://[^\s"'`<>|;()\\]+)"""
+    r"""|\$\{\{env\.([A-Za-z_]\w*)\}\}([^\s"'`<>|;()\\]*)"""
+    r"""|\$(?:env:)?\{?([A-Za-z_]\w*)\}?([^\s"'`<>|;()\\]*)""",
+    re.IGNORECASE,
+)
+_URL_ASSIGN_RE = re.compile(
+    r"""(?:^|[\s;(])(?:export\s+|(?:ARG|ENV|arg|env)\s+)?\$?(?:env:)?"""
+    r"""([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*|\s*:\s+)["']?(https?://[^\s"'`#]+)"""
+)
+_DOCKER_ENV_SPACE_RE = re.compile(
+    r"""^\s*ENV\s+([A-Za-z_]\w*)\s+["']?(https?://[^\s"'`#]+)""", re.IGNORECASE
+)
+_GH_EXPR_RE = re.compile(r"\$\{\{([^}\n]{0,200}?)\}\}")
+_PROSE_KEY_RE = re.compile(
+    r"""^\s*(?:-\s+)?["']?(?:name|description|title|summary)["']?\s*:""",
+    re.IGNORECASE,
+)
+_CHECKSUM_FILE_RES = (
+    re.compile(r"\.(?:sha(?:1|224|256|384|512)|md5|b2)(?:sum)?(?:\.txt)?$"),
+    re.compile(r"^(?:.*[-_.])?(?:sha(?:1|224|256|384|512)|md5|b2)sums?(?:\.txt)?$"),
+    re.compile(r"^(?:.*[-_.])?checksums?(?:\.txt|\.sha256)?$"),
+)
+# Signatures and certificates travel with checksums; they are not artifacts.
+_SIGNATURE_FILE_RE = re.compile(
+    r"\.(?:sig|asc|minisig|pem|crt|cert|sigstore|bundle|intoto\.jsonl)$", re.IGNORECASE
+)
+_SIGNATURE_VERIFY_RE = re.compile(
+    r"\bgpg2?\b[^\n|;&]{0,200}?\s--verify\b|\bgpgv2?\b|\bcosign\s+verify(?:-blob)?\b|"
+    r"\b(?:minisign|signify)\b[^\n|;&]{0,200}?\s-V\b|"
+    r"\bgh\s+attestation\s+verify\b|\bslsa-verifier\b"
+)
+
+
+def _is_dockerfile(ctx):
+    base = _basename(ctx)
+    return base == "dockerfile" or base.startswith("dockerfile.") or base.endswith(".dockerfile")
+
+
+# Code hosts where the owner/repo path, not the host, is the trust boundary.
+_MULTI_TENANT_HOSTS = (
+    "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+    "raw.githubusercontent.com",
+)
+
+
+def _url_origin(url):
+    """'host' (or 'host/owner/repo' on shared code hosts) of an http(s) URL."""
+    m = re.match(r"https?://([^/?#]+)([^?#]*)", url, re.IGNORECASE)
+    if not m:
+        return None
+    host = m.group(1).rsplit("@", 1)[-1].lower()
+    if host in _MULTI_TENANT_HOSTS:
+        parts = [p for p in m.group(2).split("/") if p][:2]
+        if len(parts) == 2:
+            return "/".join([host] + parts)
+    return host
+
+
+def _url_basename(url):
+    path = re.split(r"[?#]", url, maxsplit=1)[0].rstrip("/")
+    return path.rsplit("/", 1)[-1].strip("\"',")
+
+
+def _is_checksum_file(name):
+    low = name.lower()
+    return any(rx.search(low) for rx in _CHECKSUM_FILE_RES)
+
+
+def _pg021_logical_lines(lines):
+    """Yield [(index, text)] pieces joined by trailing '\\' or '`' continuations."""
+    pieces = []
+    for i, raw in enumerate(lines):
+        s = _strip_yaml_comment(raw)
+        if _PROSE_KEY_RE.match(s):
+            s = ""
+        s = _GH_EXPR_RE.sub(lambda m: "${{" + re.sub(r"\s+", "", m.group(1)) + "}}", s)
+        stripped = s.rstrip()
+        if stripped.endswith("\\") or stripped.endswith(" `"):
+            pieces.append((i, stripped[:-1]))
+            continue
+        pieces.append((i, s))
+        yield pieces
+        pieces = []
+    if pieces:
+        yield pieces
+
+
+def _is_upload(command, segment):
+    name = command.lower()
+    if name == "curl":
+        return bool(_CURL_UPLOAD_RE.search(segment))
+    if name == "wget":
+        return bool(_WGET_UPLOAD_RE.search(segment))
+    if name == "aria2c":
+        return False
+    return bool(_PS_UPLOAD_RE.search(segment))
+
+
+def _download_urls(pieces, dockerfile, assigned):
+    """[(url, index)] for every URL fetched on one logical line."""
+    texts = [t for _, t in pieces]
+    offsets = []
+    pos = 0
+    for t in texts:
+        offsets.append(pos)
+        pos += len(t) + 1
+    logical = " ".join(texts)
+    segments = []
+    cmds = list(_DOWNLOAD_CMD_RE.finditer(logical))
+    for k, m in enumerate(cmds):
+        limit = cmds[k + 1].start() if k + 1 < len(cmds) else len(logical)
+        end = _SEGMENT_END_RE.search(logical, m.end(), limit)
+        seg_end = end.start() if end else limit
+        segment = logical[m.end():seg_end]
+        if not _is_upload(m.group(1), segment):
+            segments.append((m.end(), seg_end))
+    if dockerfile and _DOCKER_ADD_RE.match(logical):
+        segments.append((0, len(logical)))
+    out = []
+    for start, end in segments:
+        for t in _URL_TOKEN_RE.finditer(logical, start, end):
+            if t.group(1):
+                url = t.group(1)
+            else:
+                var = t.group(2) or t.group(4)
+                rest = t.group(3) if t.group(2) else t.group(5)
+                if var not in assigned:
+                    continue
+                url = assigned[var] + (rest or "")
+            piece = bisect.bisect_right(offsets, t.start()) - 1
+            out.append((url, pieces[piece][0]))
+    return out
+
+
+def _analyze_same_origin_checksum(ctx):
+    dockerfile = _is_dockerfile(ctx)
+    if not (_is_yaml_like(ctx) or dockerfile):
+        return {}
+    text = ctx.get("text", "")
+    low = text.lower()
+    if not ("http://" in low or "https://" in low):
+        return {}
+    lines = _ctx_lines(ctx)
+    clean = [_strip_yaml_comment(s) for s in lines]
+    if any(_SIGNATURE_VERIFY_RE.search(s) for s in clean):
+        return {}
+    assigned = {}
+    for s in clean:
+        for m in _URL_ASSIGN_RE.finditer(s):
+            assigned.setdefault(m.group(1), m.group(2))
+        if dockerfile:
+            m = _DOCKER_ENV_SPACE_RE.match(s)
+            if m:
+                assigned.setdefault(m.group(1), m.group(2))
+    downloads = []
+    for pieces in _pg021_logical_lines(lines):
+        for url, idx in _download_urls(pieces, dockerfile, assigned):
+            host = _url_origin(url)
+            name = _url_basename(url)
+            if host and name:
+                downloads.append((host, name, idx))
+    checksums = [d for d in downloads if _is_checksum_file(d[1])]
+    if not checksums:
+        return {}
+    artifacts = [
+        d for d in downloads
+        if not _is_checksum_file(d[1]) and not _SIGNATURE_FILE_RE.search(d[1])
+    ]
+    hits = {}
+    for host, name, idx in checksums:
+        same = [a for a in artifacts if a[0] == host]
+        if not same:
+            continue
+        exact = [a for a in same if name.lower().startswith(a[1].lower() + ".")]
+        artifact = (exact or same)[0][1]
+        _add_hit(
+            hits, lines, idx + 1,
+            "Same-origin checksum: '%s' is downloaded from %s, the same origin as "
+            "the artifact '%s'; whoever can replace the artifact can replace the "
+            "checksum (pin the expected hash in the repo or verify a signature)"
+            % (name, host, artifact),
+        )
+    return hits
+
+
 _detect_unpinned_launch = _file_level("_pg008", _analyze_unpinned_launch)
 _detect_metadata_poisoning = _file_level("_pg009", _analyze_metadata_poisoning)
 _detect_untrusted_trigger = _file_level("_pg010", _analyze_untrusted_trigger)
 _detect_expression_injection = _file_level("_pg011", _analyze_expression_injection)
+_detect_permission_inheritance = _file_level("_pg013", _analyze_permission_inheritance)
+_detect_broad_schema = _file_level("_pg014", _analyze_broad_schema)
+_detect_same_origin_checksum = _file_level("_pg021", _analyze_same_origin_checksum)
 
 
 # ---------------------------------------------------------------------------
@@ -3725,6 +4507,24 @@ RULES = [
         "medium",
         "Risky dependency source (--extra-index-url, plain-http index/registry, git+ dependency without commit SHA)",
         _detect_dependency_source,
+    ),
+    Rule(
+        "PG013",
+        "medium",
+        "Sub-agent, skill or plugin inherits or pre-approves broad permissions (omitted or wildcard tools, auto-run install/session hooks)",
+        _detect_permission_inheritance,
+    ),
+    Rule(
+        "PG014",
+        "medium",
+        "Over-broad tool input schema (free-form path, command, URL, SQL or code string parameter)",
+        _detect_broad_schema,
+    ),
+    Rule(
+        "PG021",
+        "medium",
+        "Checksum downloaded from the same origin as the artifact it verifies",
+        _detect_same_origin_checksum,
     ),
 ]
 

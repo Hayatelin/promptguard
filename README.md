@@ -81,12 +81,15 @@ promptguard: OK - no issues found
 | **PG010** | 🔴 high   | GitHub workflows on untrusted triggers (`pull_request_target`, `issue_comment`, `workflow_run`, `issues`, `discussion`) that check out PR head code, or give an AI agent action write permissions or secrets. |
 | **PG011** | 🔴 high   | Workflow expression injection — attacker-controlled fields such as `github.event.issue.title`, `comment.body`, or `head_ref` expanded inside `run`, `script`, or an AI action's prompt input. |
 | **PG012** | 🔴 high   | Blanket tool approvals in agent configs — wildcard allow-list entries (`*`, or a tool name followed by `(*)`), `bypassPermissions` or `yolo` approval modes, MCP servers marked `trust: true`, and `enableAllProjectMcpServers`. |
+| **PG013** | 🟠 medium | Inherited or pre-approved permissions in sub-agents, skills, and plugins — agent definitions under `agents/` that omit `tools` or grant every tool with a wildcard, wildcard `allowed-tools` entries in skills and plugin commands, `preinstall` and `postinstall` scripts in MCP server packages, and plugin `SessionStart` or `Setup` command hooks. |
+| **PG014** | 🟠 medium | Over-broad tool input schemas — `inputSchema`, `input_schema`, or `parameters` properties named like a path, command, URL, SQL query, or code snippet that accept any string (no `enum`, `const`, `pattern`, or `maxLength`). |
 | **PG015** | 🟠 medium | Over-broad GitHub workflow tokens — `permissions: write-all`, or `contents: write` together with `id-token: write` in a workflow on an untrusted trigger. |
 | **PG016** | 🟠 medium | Output exfiltration channels — a markdown or HTML image, or a markdown link, whose URL query string carries a template placeholder (`{{…}}`, `${…}`) to an external host. |
 | **PG017** | 🟠 medium | Unbounded agent loops — `max_iterations`, `max_turns`, `max_round`, `recursion_limit`, or budget caps set to `0`, a negative number, `unlimited`, or `inf`. |
 | **PG018** | 🔴 high   | Privileged MCP containers — `docker run` with `--privileged`, the host root or the container engine socket mounted, host network or PID namespace, `SYS_ADMIN` or `ALL` capabilities, and admin or service-role tokens passed in server args. |
 | **PG019** | 🟠 medium | Disabled verification — `--insecure` or `-k` on a download command, `--trusted-host`, `strict-ssl=false`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, git `sslVerify` off, and `cosign verify` without `--certificate-identity`. |
 | **PG020** | 🟠 medium | Risky dependency sources — `--extra-index-url` (dependency confusion), package indexes or registries over plain `http://`, and `git+` dependencies not pinned to a 40-char commit SHA. |
+| **PG021** | 🟠 medium | Same-origin checksums in CI workflows — an artifact and its `.sha256` or `SHA256SUMS` file fetched from the same host, so a tampered release can ship a matching checksum. |
 
 ## Why now
 

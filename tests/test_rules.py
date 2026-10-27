@@ -1,10 +1,13 @@
 """Per-rule tests: each rule fires on bad input and stays quiet on clean input."""
 
+import json
+import os
+import tempfile
 import textwrap
 import time
 import unittest
 
-from promptguard.scanner import scan_text
+from promptguard.scanner import scan_path, scan_text, should_scan_file
 
 
 def rule_ids(findings):
@@ -1515,6 +1518,466 @@ class TestManyDistinctFindingsPerLine(unittest.TestCase):
         took, count = self.seconds("git+https://h%(i)d.io/r ", "requirements.txt")
         self.assertGreater(count, 1000)
         self.assertLess(took, 2.0)
+
+
+def timed_scan(text, path):
+    start = time.time()
+    findings = scan_text(text, path=path)
+    return findings, time.time() - start
+
+
+AGENT = ".claude/agents/reviewer.md"
+
+
+class TestPermissionInheritanceRule(unittest.TestCase):
+    def test_fires_on_agent_without_tools(self):
+        text = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            model: sonnet
+            ---
+            You review code.
+            """
+        found = scan_rule(text, "PG013", path=AGENT)
+        self.assertEqual([f.line for f in found], [2])
+        self.assertEqual(found[0].severity, "medium")
+        self.assertIn("Sub-agent 'reviewer' omits 'tools'", found[0].message)
+
+    def test_fires_on_wildcard_agent_tools(self):
+        inline = """\
+            ---
+            name: helper
+            description: General helper
+            tools: "*"
+            ---
+            """
+        found = scan_rule(inline, "PG013", path="plugins/acme/agents/helper.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("wildcard tool entry '*'", found[0].message)
+        block = """\
+            ---
+            name: helper
+            description: General helper
+            tools:
+              - Read
+              - mcp__*
+            ---
+            """
+        found = scan_rule(block, "PG013", path="agents/nested/helper.md")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("'mcp__*'", found[0].message)
+
+    def test_fires_on_wildcard_skill_allowed_tools(self):
+        text = """\
+            ---
+            name: release
+            description: Cut a release
+            allowed-tools: Read Grep Bash(git tag *) Bash(*)
+            ---
+            """
+        found = scan_rule(text, "PG013", path="skills/release/SKILL.md")
+        self.assertEqual([f.line for f in found], [4])
+        self.assertIn("'Bash(*)' in 'allowed-tools'", found[0].message)
+        self.assertNotIn("git tag", found[0].message)
+
+    def test_fires_on_mcp_package_install_script(self):
+        text = """\
+            {
+              "name": "@acme/mcp-server-weather",
+              "version": "1.0.0",
+              "scripts": {
+                "build": "tsc",
+                "postinstall": "node scripts/setup.js"
+              }
+            }
+            """
+        found = scan_rule(text, "PG013", path="package.json")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("Install-time npm script 'postinstall'", found[0].message)
+        self.assertIn("'@acme/mcp-server-weather'", found[0].message)
+
+    def test_fires_on_plugin_session_start_hook(self):
+        text = """\
+            {
+              "hooks": {
+                "SessionStart": [
+                  {
+                    "matcher": "startup",
+                    "hooks": [
+                      {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/boot.sh"}
+                    ]
+                  }
+                ],
+                "PostToolUse": [
+                  {"matcher": "Write", "hooks": [{"type": "command", "command": "fmt.sh"}]}
+                ]
+              }
+            }
+            """
+        found = scan_rule(text, "PG013", path="plugins/acme/hooks/hooks.json")
+        self.assertEqual([f.line for f in found], [7])
+        self.assertIn("'SessionStart'", found[0].message)
+
+    def test_quiet_on_readme_and_docs_front_matter(self):
+        text = """\
+            ---
+            name: Getting started
+            description: How to install the project
+            ---
+            # Getting started
+            """
+        self.assertEqual(scan_rule(text, "PG013", path="README.md"), [])
+        self.assertEqual(scan_rule(text, "PG013", path="docs/guide.md"), [])
+        self.assertEqual(scan_rule(text, "PG013", path="agents/README.md"), [])
+        self.assertEqual(scan_rule("# Agents\n\nNo front matter.\n", "PG013", path=AGENT), [])
+
+    def test_quiet_on_scoped_agents_and_skills(self):
+        scoped = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            tools: Read, Grep, Glob, mcp__github__*
+            ---
+            """
+        self.assertEqual(scan_rule(scoped, "PG013", path=AGENT), [])
+        deny = """\
+            ---
+            name: reviewer
+            description: Reviews pull requests
+            disallowedTools: Write, Edit
+            ---
+            """
+        self.assertEqual(scan_rule(deny, "PG013", path=AGENT), [])
+        skill = """\
+            ---
+            name: commit
+            description: Stage and commit
+            allowed-tools: Bash(git add *) Bash(git commit *) Read
+            ---
+            """
+        self.assertEqual(scan_rule(skill, "PG013", path="skills/commit/SKILL.md"), [])
+
+    def test_quiet_on_regular_packages_and_other_hooks(self):
+        web_app = json.dumps(
+            {"name": "my-web-app", "scripts": {"postinstall": "node setup.js"}}, indent=2
+        )
+        self.assertEqual(scan_rule(web_app, "PG013", path="package.json"), [])
+        mcp_build = json.dumps(
+            {"name": "mcp-server-x", "scripts": {"prepare": "tsc", "build": "tsc"}}, indent=2
+        )
+        self.assertEqual(scan_rule(mcp_build, "PG013", path="package.json"), [])
+        settings = json.dumps(
+            {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "x.sh"}]}]}}
+        )
+        self.assertEqual(scan_rule(settings, "PG013", path=".claude/settings.json"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            ---
+            name: reviewer  # promptguard:ignore
+            description: Reviews pull requests
+            ---
+            """
+        self.assertEqual(scan_rule(text, "PG013", path=AGENT), [])
+
+    def test_performance_400kb_line(self):
+        entries = " ".join("Read(src/file%d.py)" % i for i in range(25000))
+        line = "allowed-tools: " + entries + " Bash(*)"
+        self.assertGreaterEqual(len(line), 400000)
+        text = "---\nname: big\ndescription: big\n" + line + "\n---\n"
+        findings, elapsed = timed_scan(text, "skills/big/SKILL.md")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual([f.line for f in only(findings, "PG013")], [4])
+
+
+TOOLS = "tools.json"
+
+
+class TestBroadToolSchemaRule(unittest.TestCase):
+    def test_fires_on_mcp_path_parameter(self):
+        text = """\
+            {
+              "tools": [
+                {
+                  "name": "read_file",
+                  "description": "Read a file",
+                  "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                      "path": {"type": "string", "description": "File to read"},
+                      "encoding": {"type": "string"}
+                    },
+                    "required": ["path"]
+                  }
+                }
+              ]
+            }
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual([f.line for f in found], [9])
+        self.assertEqual(found[0].severity, "medium")
+        message = found[0].message
+        self.assertIn("'read_file' parameter 'path' (path)", message)
+        self.assertIn("additionalProperties: false", message)
+
+    def test_fires_on_function_url_with_format_only(self):
+        text = """\
+            {"type": "function", "function": {"name": "fetch_page", "parameters": {
+              "type": "object",
+              "properties": {"targetUrl": {"type": "string", "format": "uri"}},
+              "additionalProperties": false}}}
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual([f.line for f in found], [3])
+        self.assertIn("'targetUrl' (url)", found[0].message)
+        self.assertNotIn("additionalProperties", found[0].message)
+
+    def test_fires_on_sql_nested_and_array_parameters(self):
+        text = """\
+            [
+              {"name": "run_sql", "input_schema": {"type": "object",
+                "properties": {"query": {"type": "string"}}}},
+              {"name": "bulk_export", "input_schema": {"type": "object",
+                "properties": {
+                  "options": {"type": "object", "properties": {
+                    "outputDir": {"type": "string"}}},
+                  "files": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": false}}
+            ]
+            """
+        found = scan_rule(text, "PG014", path=TOOLS)
+        self.assertEqual(sorted(f.line for f in found), [3, 7, 8])
+        messages = " ".join(f.message for f in found)
+        self.assertIn("'run_sql' parameter 'query' (sql)", messages)
+        self.assertIn("'options.outputDir' (path)", messages)
+        self.assertIn("'files[]' (path)", messages)
+
+    def test_quiet_when_constrained(self):
+        text = """\
+            {"name": "ops", "inputSchema": {"type": "object", "properties": {
+              "path": {"type": "string", "enum": ["a.txt", "b.txt"]},
+              "url": {"type": "string", "pattern": "^https://api\\\\.example\\\\.com/"},
+              "command": {"type": "string", "maxLength": 64},
+              "dir": {"type": "string", "const": "/srv/data"}
+            }}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_non_sink_names_and_search_query(self):
+        text = """\
+            [
+              {"name": "search_docs", "inputSchema": {"type": "object", "properties": {
+                "query": {"type": "string"}, "zip_code": {"type": "string"},
+                "file_id": {"type": "string"}, "path_depth": {"type": "integer"}}}}
+            ]
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_missing_additional_properties_alone(self):
+        text = """\
+            {"name": "get_weather", "inputSchema": {"type": "object",
+              "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_quiet_on_yaml_and_non_tool_parameters(self):
+        yaml_text = """\
+            tools:
+              - name: read_file
+                inputSchema:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+            """
+        self.assertEqual(scan_rule(yaml_text, "PG014", path="tools.yaml"), [])
+        arm = '{"name": "deploy", "parameters": {"storagePath": {"type": "string"}}}'
+        self.assertEqual(scan_rule(arm, "PG014", path="azuredeploy.json"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            {"name": "read_file", "inputSchema": {"type": "object", "properties": {
+              "path": {"type": "string", "description": "sandboxed # promptguard:ignore"}
+            }}}
+            """
+        self.assertEqual(scan_rule(text, "PG014", path=TOOLS), [])
+
+    def test_performance_400kb_line(self):
+        tools = []
+        size = 0
+        while size < 400000:
+            tool = {
+                "name": "tool_%d" % len(tools),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "enum": ["a", "b"]},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            }
+            tools.append(tool)
+            size += len(json.dumps(tool)) + 2
+        tools.append(
+            {"name": "last", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}}
+        )
+        text = json.dumps({"tools": tools})
+        self.assertGreaterEqual(len(text), 400000)
+        findings, elapsed = timed_scan(text, TOOLS)
+        self.assertLess(elapsed, 2.0)
+        found = only(findings, "PG014")
+        self.assertEqual(len(found), 1)
+        self.assertIn("'last' parameter 'url'", found[0].message)
+
+
+RELEASE = ".github/workflows/release.yml"
+
+
+class TestSameOriginChecksumRule(unittest.TestCase):
+    def test_fires_on_release_checksum_from_same_host(self):
+        text = """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: |
+                      curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz
+                      curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz.sha256
+                      sha256sum -c tool.tar.gz.sha256
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [8])
+        self.assertEqual(found[0].severity, "medium")
+        message = found[0].message
+        self.assertIn("'tool.tar.gz.sha256' is downloaded from github.com/acme/tool", message)
+        self.assertIn("artifact 'tool.tar.gz'", message)
+
+    def test_fires_on_sha256sums_after_line_continuation(self):
+        text = """\
+            steps:
+              - run: |
+                  wget -q \\
+                    https://dl.example.com/v2/tool_linux_amd64.zip
+                  wget -q https://dl.example.com/v2/SHA256SUMS
+                  sha256sum --ignore-missing -c SHA256SUMS
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [5])
+        self.assertIn("'SHA256SUMS'", found[0].message)
+        self.assertIn("'tool_linux_amd64.zip'", found[0].message)
+
+    def test_fires_on_shared_base_url_variable(self):
+        text = """\
+            env:
+              BASE_URL: https://dl.example.com/tool/v1
+            jobs:
+              fetch:
+                steps:
+                  - run: curl -LO "$BASE_URL/tool.tgz"
+                  - run: curl -LO "${{ env.BASE_URL }}/tool.tgz.sha256"
+            """
+        found = scan_rule(text, "PG021", path=RELEASE)
+        self.assertEqual([f.line for f in found], [7])
+        self.assertIn("dl.example.com", found[0].message)
+
+    def test_fires_in_dockerfile_text(self):
+        text = """\
+            FROM debian:12
+            ADD https://example.com/dl/tool.tgz /tmp/tool.tgz
+            RUN curl -fsSL https://example.com/dl/tool.tgz.sha256 -o /tmp/tool.tgz.sha256 \\
+             && cd /tmp && sha256sum -c tool.tgz.sha256
+            """
+        found = scan_rule(text, "PG021", path="Dockerfile")
+        self.assertEqual([f.line for f in found], [3])
+
+    @unittest.skipUnless(
+        should_scan_file("Dockerfile"),
+        "Dockerfile scanning arrives with batch 3 (scanner scope change)",
+    )
+    def test_dockerfile_integration_after_batch_3(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "Dockerfile"), "w") as fh:
+                fh.write(
+                    "FROM debian:12\n"
+                    "RUN curl -fsSLO https://example.com/dl/tool.tgz \\\n"
+                    " && curl -fsSLO https://example.com/dl/tool.tgz.sha256 \\\n"
+                    " && sha256sum -c tool.tgz.sha256\n"
+                )
+            found = only(scan_path(d), "PG021")
+            self.assertEqual([f.line for f in found], [3])
+
+    def test_quiet_on_pinned_hash(self):
+        text = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://github.com/acme/tool/releases/download/v1.2.3/tool.tar.gz
+                  echo "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  tool.tar.gz" | sha256sum -c -
+            """
+        self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [])
+
+    def test_quiet_on_other_host_or_signed_checksums(self):
+        other = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://cdn.example.net/tool.tar.gz
+                  curl -fsSLO https://checksums.example.org/tool.tar.gz.sha256
+                  sha256sum -c tool.tar.gz.sha256
+            """
+        self.assertEqual(scan_rule(other, "PG021", path=RELEASE), [])
+        signed = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_linux_amd64.zip
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_SHA256SUMS
+                  curl -fsSLO https://releases.example.com/tool/1.0/tool_1.0_SHA256SUMS.sig
+                  gpg --verify tool_1.0_SHA256SUMS.sig tool_1.0_SHA256SUMS
+                  sha256sum --ignore-missing -c tool_1.0_SHA256SUMS
+            """
+        self.assertEqual(scan_rule(signed, "PG021", path=RELEASE), [])
+
+    def test_quiet_on_uploads_comments_and_markdown(self):
+        upload = """\
+            steps:
+              - run: |
+                  curl -T dist/tool.tgz https://repo.example.com/upload/tool.tgz
+                  curl -T dist/tool.tgz.sha256 https://repo.example.com/upload/tool.tgz.sha256
+                  # curl -LO https://repo.example.com/upload/tool.tgz.sha256
+            """
+        self.assertEqual(scan_rule(upload, "PG021", path=RELEASE), [])
+        docs = """\
+            curl -LO https://x.example.com/tool.tgz
+            curl -LO https://x.example.com/tool.tgz.sha256
+            """
+        self.assertEqual(scan_rule(docs, "PG021", path="docs/install.md"), [])
+
+    def test_ignore_directive(self):
+        text = """\
+            steps:
+              - run: |
+                  curl -fsSLO https://x.example.com/tool.tgz
+                  curl -fsSLO https://x.example.com/tool.tgz.sha256  # promptguard:ignore
+            """
+        self.assertEqual(scan_rule(text, "PG021", path=RELEASE), [])
+
+    def test_performance_400kb_line(self):
+        cmds = " && ".join(
+            "curl -fsSLO https://mirror%d.example.com/tool%d.tgz" % (i % 40, i)
+            for i in range(9000)
+        )
+        line = "      - run: " + cmds + " && curl -fsSLO https://mirror3.example.com/tool3.tgz.sha256"
+        self.assertGreaterEqual(len(line), 400000)
+        text = (
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + line + "\n"
+        )
+        findings, elapsed = timed_scan(text, RELEASE)
+        self.assertLess(elapsed, 2.0)
+        found = only(findings, "PG021")
+        self.assertEqual([f.line for f in found], [6])
+        self.assertIn("artifact 'tool3.tgz'", found[0].message)
 
 
 if __name__ == "__main__":
