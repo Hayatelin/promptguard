@@ -14,6 +14,7 @@ import bisect
 import json
 import json.decoder
 import json.scanner
+import math
 import os
 import re
 import shlex
@@ -71,25 +72,80 @@ _INJECTION_RE = re.compile(
 
 # A "SYSTEM:" style override embedded inside content (quoted strings, list
 # items, markdown blockquotes, tool/user content) rather than a top-level key.
-_SYSTEM_OVERRIDE_RE = re.compile(
-    r"""(["'>\-\|]\s*|\bcontent['"]?\s*[:=]\s*["']?.*?)"""
-    r"""\b(system|assistant)\s*:\s*\S""",
+#
+# "Inside content" means the marker either follows one of the characters
+# " ' > - | (optionally separated by whitespace), or comes anywhere after a
+# `content:` / `content=` key on the same line. This is the condition the
+# original single regex
+#     (["'>\-\|]\s*|\bcontent['"]?\s*[:=]\s*["']?.*?)\b(system|assistant)\s*:\s*\S
+# expressed; it is evaluated piecewise so long lines stay linear-time (the
+# lazy `.*?` backtracked quadratically on lines with many `content:` keys).
+_ROLE_WORD_RE = re.compile(r"\b(?:system|assistant)\s*:(?=\s*\S)", re.IGNORECASE)
+_CONTENT_KEY_RE = re.compile(r"""\bcontent['"]?\s*[:=]""", re.IGNORECASE)
+_CONTENT_PREFIX_CHARS = "\"'>-|"
+
+# Chat-format role markers (PG002, 1.1.0): ChatML / Zephyr-style special
+# tokens, Llama 2 / Llama 3 control tokens, and XML-style role tags.
+_ROLE_NAMES = r"(?:system|assistant|developer|tool|user)"
+_ROLE_TOKEN_RE = re.compile(
+    r"<\|im_start\|>[ \t]*" + _ROLE_NAMES + r"\b"
+    r"|<\|" + _ROLE_NAMES + r"\|>"
+    r"|<\|start_header_id\|>[ \t]*(?:system|assistant|developer|tool|user|ipython)"
+    r"[ \t]*<\|end_header_id\|>"
+    r"|\[INST\]|<<SYS>>"
+    r"|</?[ \t]*(?:system|assistant|developer)[ \t]*>",
     re.IGNORECASE,
 )
+# Upper-case role prefixes only: "Developer: Jane Doe" / "- tool: search" are
+# ordinary README credits and YAML keys.
+_ROLE_PREFIX_RE = re.compile(r"\b(?:DEVELOPER|TOOL)[ \t]*:(?=\s*\S)")
+_XML_SYSTEM_TAG_RE = re.compile(r"</?[ \t]*system[ \t]*>", re.IGNORECASE)
+# Key at the start of a line (`key:`, `"key":`, `KEY=`, `- key:`,
+# `export KEY=`, `{"key":` of a one-line object). PG002 uses it to skip
+# chat-template / stop-sequence / special-token keys; PG007 to spot
+# public-by-design keys.
+_LINE_KEY_RE = re.compile(r"""^\s*(?:export\s+|-\s+|\{\s*)?["']?([A-Za-z_][\w.-]*)["']?\s*[:=]""")
 
 # Placeholders that interpolate external / untrusted content into a prompt.
-_PLACEHOLDER_RE = re.compile(
-    r"\{\{\s*([a-z0-9_]*"
-    r"(?:web|url|tool|input|user|email|search|doc|page|content|output|fetch|scrape|rss|comment|review|message)"
-    r"[a-z0-9_]*)\s*\}\}"
-    r"|\$\{\s*([a-z0-9_]*"
-    r"(?:web|url|tool|input|user|email|search|doc|page|content|output|fetch|scrape|rss|comment|review|message)"
-    r"[a-z0-9_]*)\s*\}"
-    r"|\{\s*([a-z0-9_]*"
-    r"(?:web_content|tool_output|web_results|search_results|user_input|email_body|page_content|scraped|fetched_url)"
-    r"[a-z0-9_]*)\s*\}",
+#
+# A candidate is `{{ name }}`, `${ name }` or `{ name }`; it counts when its
+# name contains one of the words below (the single-brace form only for the
+# compound names). This is the same match the original single regex made,
+# split into "find candidate, then test name" so long identifier runs no
+# longer backtrack quadratically.
+_PLACEHOLDER_CANDIDATE_RE = re.compile(
+    r"\{\{\s*([a-z0-9_]+)\s*\}\}"
+    r"|\$\{\s*([a-z0-9_]+)\s*\}"
+    r"|\{\s*([a-z0-9_]+)\s*\}",
     re.IGNORECASE,
 )
+_PLACEHOLDER_WORD_RE = re.compile(
+    r"web|url|tool|input|user|email|search|doc|page|content|output|fetch|scrape|rss|comment|review|message",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_SINGLE_WORD_RE = re.compile(
+    r"web_content|tool_output|web_results|search_results|user_input|email_body|page_content|scraped|fetched_url",
+    re.IGNORECASE,
+)
+# Memory / retrieval / model-output names (PG003, 1.1.0). Matched as whole
+# name segments (snake_case or camelCase) in `{{ }}` and `{ }` only; `${ }` is
+# shell / env interpolation where these are ordinary variable names.
+_PLACEHOLDER_NEW_WORDS = frozenset((
+    "memory", "memories", "history", "histories", "context", "contexts",
+    "retrieved", "chunk", "chunks", "response", "responses", "summary",
+    "summaries", "transcript", "transcripts",
+))
+# A segment from this list marks a setting or identifier, not content:
+# {{chunk_size}}, {{max_history}}, {{response_format}}, {{context_window}}.
+_PLACEHOLDER_SETTING_WORDS = frozenset((
+    "size", "limit", "limits", "window", "length", "len", "max", "min",
+    "count", "num", "number", "k", "top", "timeout", "ttl", "time", "ms",
+    "latency", "dir", "path", "file", "id", "ids", "type", "mode", "enabled",
+    "format", "model", "key", "token", "tokens", "overlap", "strategy",
+    "threshold", "version", "name", "index", "idx", "level", "depth",
+    "budget", "turns", "code", "status", "schema", "config",
+    "kube", "k8s", "docker", "cluster", "namespace",
+))
 
 # Delimiter / guard markers that, if present near a placeholder, indicate the
 # author wrapped untrusted content. Their absence is what we flag.
@@ -182,7 +238,7 @@ _SECRET_RES = [
         "Hardcoded API key",
         re.compile(
             r"""(?:api[_-]?key|apikey|secret|access[_-]?token|password)"""
-            r"""\s*[:=]\s*["'][^"'\s]{12,}["']""",
+            r"""\s*[:=]\s*["']([^"'\s]{12,})["']""",
             re.IGNORECASE,
         ),
         False,
@@ -197,6 +253,75 @@ _SECRET_PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Secret formats added in 1.1.0. Unlike the three original tokens above they
+# go through the placeholder filter (documentation often shows
+# "xoxb-your-token" or a key body of x's).
+_PEM_KEY_RE = re.compile(r"-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH) )?PRIVATE KEY-----")
+_PEM_LEAD_RE = re.compile(r"""^(?:\s|\\[nr]|["',])+""")
+_SLACK_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])xox[abprs]-(?:[0-9]+-)+[0-9A-Za-z]{8,}(?![0-9A-Za-z])"
+)
+_GOOGLE_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{16,}"
+)
+# GitHub fine-grained personal access token: github_pat_ + 22 + "_" + 59.
+_GITHUB_PAT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59,}(?![A-Za-z0-9_])"
+)
+# Stripe live secret / restricted key. Test-mode keys (sk_test_, rk_test_)
+# only reach Stripe's test data and fill its documentation: masked, not
+# reported by format (a secret-named assignment still is).
+_STRIPE_LIVE_RE = re.compile(r"(?<![A-Za-z0-9_])[sr]k_live_[0-9A-Za-z]{24,}(?![0-9A-Za-z])")
+# AWS secret access key: 40 base64 characters, recognized next to its key
+# name or on a line that also holds an access key id (AKIA...).
+_AWS_SECRET_VALUE_RE = re.compile(r"(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40,}(?![A-Za-z0-9/+=])")
+_AWS_SECRET_NAMED_RE = re.compile(
+    r"aws[_.-]?secret[_.-]?(?:access[_.-]?)?key[\"']?(?:[ \t]*[:=][ \t]*|[ \t]+)[\"']?"
+    r"([A-Za-z0-9/+]{40,})(?![A-Za-z0-9/+=])",
+    re.IGNORECASE,
+)
+_AWS_KEY_ID_RE = _SECRET_RES[0][1]
+# A quoted key and a quoted value: "password": "...", 'PGPASSWORD': '...'.
+_QUOTED_KEY_ASSIGN_RE = re.compile(
+    r"""(["'])([A-Za-z_][\w.-]{0,80})\1[ \t]*:[ \t]*(["'])([^"'\s]{8,512})\3"""
+)
+# scheme://user:password@host (user may be empty: redis://:pw@host).
+_CONN_STRING_RE = re.compile(
+    r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,30}://"
+    r"([^\s:/@\"'<>]{0,128}):([^\s/@\"'<>]{1,128})@[^\s/:@\"'<>]"
+)
+_CONN_GENERIC_PASSWORDS = frozenset((
+    "pass", "password", "passwd", "pwd", "pw", "secret", "changeme", "user",
+    "username",
+))
+# Unquoted assignments: KEY=value anywhere (.env, Dockerfile ENV/ARG, .npmrc,
+# "-e KEY=value" args), `key: value` at the start of a YAML line, and the
+# legacy Dockerfile form `ENV KEY value`. Quoted values stay with the
+# original "Hardcoded API key" pattern.
+_ASSIGN_EQ_RE = re.compile(
+    r"(?<![\w.-])([A-Za-z_][\w.-]{0,80})[ \t]*=[ \t]*([^\s\"'`,;{}\[\]()<>=]{8,}={0,2})"
+)
+_ASSIGN_COLON_RE = re.compile(
+    r"^\s*(?:-\s+)?([A-Za-z_][\w.-]{0,80})[ \t]*:[ \t]+"
+    r"([^\s\"'`,;{}\[\]()<>]{8,})[ \t]*(?:#.*)?$"
+)
+_ASSIGN_DOCKER_RE = re.compile(
+    r"^\s*(?:ENV|ARG)[ \t]+([A-Za-z_][\w.-]{0,80})[ \t]+([^\s\"'`=]{8,})[ \t]*$",
+    re.IGNORECASE,
+)
+_SECRET_KEY_LAST = frozenset((
+    "secret", "token", "password", "passwd", "pwd", "pass", "apikey",
+    "credential", "credentials",
+))
+_SECRET_KEY_LAST2 = frozenset((
+    "apikey", "secretkey", "accesskey", "privatekey", "authkey",
+    "encryptionkey", "signingkey", "masterkey",
+))
+# Keys that are public by design (NEXT_PUBLIC_*, Supabase anon key,
+# Stripe publishable key).
+_PUBLIC_KEY_SEGMENTS = frozenset(("public", "publishable", "anon"))
+
 
 # ---------------------------------------------------------------------------
 # Detectors
@@ -210,6 +335,70 @@ def _detect_injection(line, ctx):
         )
 
 
+def _in_content_position(line, pos, content_end):
+    """True if line[pos:] starts inside content (see _ROLE_WORD_RE notes)."""
+    if content_end is not None and content_end <= pos:
+        return True
+    k = pos - 1
+    while k >= 0 and line[k].isspace():
+        k -= 1
+    return k >= 0 and line[k] in _CONTENT_PREFIX_CHARS
+
+
+def _content_end(line):
+    m = _CONTENT_KEY_RE.search(line)
+    return m.end() if m else None
+
+
+def _has_role_word_override(line):
+    content_end = _content_end(line)
+    return any(
+        _in_content_position(line, m.start(), content_end)
+        for m in _ROLE_WORD_RE.finditer(line)
+    )
+
+
+def _is_template_key(key):
+    """chat_template, prompt_format, stop / stop_sequences, eos_token, ..."""
+    segments = _key_segments(key)
+    return bool(segments) and (
+        "template" in segments
+        or "format" in segments
+        or segments[0] == "stop"
+        or segments[-1] in ("token", "tokens")
+    )
+
+
+def _embedded_role_marker(line):
+    """First chat-format role marker inside content, or None."""
+    # Every _ROLE_TOKEN_RE match contains "<" or "[" (INST); every
+    # _ROLE_PREFIX_RE match "DEVELOPER" or "TOOL".
+    if "<" not in line and "[" not in line and "DEVELOPER" not in line and "TOOL" not in line:
+        return None
+    content_end = None
+    desc_line = None
+    hits = []
+    for rx in (_ROLE_TOKEN_RE, _ROLE_PREFIX_RE):
+        for m in rx.finditer(line):
+            if desc_line is None:
+                # First candidate: template / stop-sequence keys never report.
+                key = _LINE_KEY_RE.match(line)
+                if key and _is_template_key(key.group(1)):
+                    return None
+                content_end = _content_end(line)
+                desc_line = bool(_DESC_KEY_RE.search(line))
+            start, end = m.span()
+            quote = line[start - 1] if start else ""
+            if quote in ("\"", "'") and line[end:end + 1] == quote:
+                continue  # a bare token string: stop lists, tokenizer configs
+            if desc_line and _XML_SYSTEM_TAG_RE.match(m.group(0)):
+                continue  # PG009 owns <system> pseudo-tags in descriptions
+            if _in_content_position(line, start, content_end):
+                hits.append((start, "".join(m.group(0).split())))
+                break
+    return min(hits)[1] if hits else None
+
+
 def _detect_system_override(line, ctx):
     low = line.lower()
     # Only fire when it looks embedded in content, not a top-level system key.
@@ -220,25 +409,82 @@ def _detect_system_override(line, ctx):
         return
     if re.match(r"""-?\s*role\s*[:=]\s*["']?system""", stripped, re.IGNORECASE):
         return
-    if _SYSTEM_OVERRIDE_RE.search(line) and ("system:" in low or "assistant:" in low):
+    if ("system:" in low or "assistant:" in low) and _has_role_word_override(line):
         yield (
             "Embedded role override ('SYSTEM:'/'ASSISTANT:') inside content",
             line.strip(),
         )
+        return
+    marker = _embedded_role_marker(line)
+    if marker:
+        yield (
+            "Embedded role override %r inside content" % marker,
+            line.strip(),
+        )
+
+
+def _name_segments(name):
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
+    return [s for s in name.lower().split("_") if s]
+
+
+def _is_new_untrusted_name(name):
+    # An all-upper-case name ({{ KUBE_CONTEXT }}, {HISTORY}) is an environment
+    # / build variable, not interpolated content. Only the 1.1.0 word list is
+    # restricted this way; the original lists match any case.
+    if not re.search(r"[a-z]", name):
+        return False
+    segments = _name_segments(name)
+    return any(s in _PLACEHOLDER_NEW_WORDS for s in segments) and not any(
+        s in _PLACEHOLDER_SETTING_WORDS for s in segments
+    )
+
+
+def _untrusted_placeholder(line):
+    """Name of the placeholder PG003 reports on this line, or None.
+
+    Placeholders from the original word list win over the 1.1.0 additions so
+    lines the original rule flagged keep the same message.
+    """
+    first_new = None
+    for m in _PLACEHOLDER_CANDIDATE_RE.finditer(line):
+        double, dollar, single = m.groups()
+        if double is not None:
+            if _PLACEHOLDER_WORD_RE.search(double):
+                return double
+            if first_new is None and _is_new_untrusted_name(double):
+                first_new = double
+        elif dollar is not None:
+            if _PLACEHOLDER_WORD_RE.search(dollar):
+                return dollar
+        else:
+            if _PLACEHOLDER_SINGLE_WORD_RE.search(single):
+                return single
+            if first_new is None and _is_new_untrusted_name(single):
+                first_new = single
+    return first_new
+
+
+def _file_has_delimiter(ctx):
+    """Does the file contain a _DELIMITER_HINTS marker? (once per text, not per line)"""
+    low = ctx.get("full_lower", "")
+    cached = ctx.get("_delimited")
+    if cached is None or cached[0] is not low:
+        cached = (low, any(h in low for h in _DELIMITER_HINTS))
+        ctx["_delimited"] = cached
+    return cached[1]
 
 
 def _detect_untrusted_placeholder(line, ctx):
-    m = _PLACEHOLDER_RE.search(line)
-    if not m:
+    placeholder = _untrusted_placeholder(line)
+    if not placeholder:
         return
-    placeholder = next(g for g in m.groups() if g) if any(m.groups()) else m.group(0)
-    low = ctx.get("full_lower", "")
     # If the file shows any delimiter / guard hint, assume the author handled it.
-    if any(h in low for h in _DELIMITER_HINTS):
+    if _file_has_delimiter(ctx):
         return
     yield (
         "Untrusted content placeholder %r interpolated without delimiters/guards"
-        % ("{{%s}}" % placeholder if placeholder else m.group(0)),
+        % ("{{%s}}" % placeholder),
         line.strip(),
     )
 
@@ -318,7 +564,14 @@ def _detect_broad_mcp(line, ctx):
 
 
 def _detect_secret(line, ctx):
+    # .env templates (.env.example / .sample / .template / .dist) carry
+    # placeholder values: only structured tokens are checked there, and every
+    # one of them goes through the placeholder filter.
+    template = _ctx_kind(ctx) == "env-template"
+    labels = []
     for label, rx, high_confidence in _SECRET_RES:
+        if template and not high_confidence:
+            continue
         m = rx.search(line)
         if not m:
             continue
@@ -326,12 +579,637 @@ def _detect_secret(line, ctx):
         # Only the generic key/value pattern is filtered against placeholders;
         # structured tokens (AKIA.../sk-.../ghp_...) are high-confidence even if
         # they happen to contain words like "example".
-        if not high_confidence and _SECRET_PLACEHOLDER_RE.search(matched):
+        if (template or not high_confidence) and _SECRET_PLACEHOLDER_RE.search(matched):
             continue
-        yield (
-            "Possible %s committed in config/prompt" % label,
-            line.strip(),
-        )
+        labels.append(label)
+    if _ANY_NEW_SECRET_HINT_RE.search(line):  # else no 1.1.0 check can match
+        for label, check in _STRUCTURED_SECRET_CHECKS:
+            if check(line, ctx):
+                labels.append(label)
+        # Inferred secrets: at most one per line, only when no token pattern
+        # above already reported this line, and never in .env templates.
+        if not labels and not template:
+            for label, check in _INFERRED_SECRET_CHECKS:
+                if check(line, ctx):
+                    labels.append(label)
+                    break
+    if not labels:
+        return
+    snippet, values = _mask_secrets(line, ctx)
+    for label in labels:
+        yield _mask_text("Possible %s committed in config/prompt" % label, values), snippet
+
+
+# ---------------------------------------------------------------------------
+# Secret masking: findings never repeat a secret value. Every value on the
+# line that a PG007 pattern would read as a secret, and every URL password,
+# is replaced by its first four characters + "***" ("***" alone when shorter
+# than 8 characters): by PG007 itself, and for every rule by the scanner
+# (mask_line_findings).
+# ---------------------------------------------------------------------------
+
+_MASK = "***"
+# Quoted value of a secret-looking key ("token": "...", password='...').
+# Masking only: the detectors keep their own quoted-value pattern.
+_QUOTED_ASSIGN_RE = re.compile(
+    r"""(?<![\w.-])["']?([A-Za-z_][\w.-]{0,80})["']?[ \t]*[:=][ \t]*(["'])([^"'\s]{1,512})\2"""
+)
+_PEM_BODY_END_RE = re.compile(r"""\\[nr]|-----|["']""")
+_PEM_LEAD_AT_RE = re.compile(r"""(?:\s|\\[nr]|["',])*""")  # _PEM_LEAD_RE at a position
+_PEM_BODY_RUN_RE = re.compile(r"[A-Za-z0-9+/]{16,}")
+# Masking only, unanchored: the detectors' _ASSIGN_COLON_RE / _ASSIGN_DOCKER_RE
+# end at the line end, a mask must also cover `x: tok password: pw` and
+# `ENV DB_PASSWORD pw<TAB>more`.
+# The groups sit in a lookahead so overlapping candidates are all tried
+# (`ENV ENV DB_PASSWORD pw`, `x: password: pw`).
+_MASK_COLON_RE = re.compile(
+    r"(?<![\w.-])(?=([A-Za-z_][\w.-]{0,80})[ \t]*:[ \t]+([^\s\"'`,;{}\[\]()<>]{8,}))"
+)
+_MASK_DOCKER_RE = re.compile(
+    r"(?<![\w.-])(?:ENV|ARG)[ \t]+(?=([A-Za-z_][\w.-]{0,80})[ \t]+([^\s\"'`=]{8,}))",
+    re.IGNORECASE,
+)
+# Password of any scheme://user:password@host userinfo (up to the last "@"
+# before the path); user@host without a password is left alone.
+_URL_PASSWORD_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@\"'<>]*:([^\s/\"'<>]*[^\s/\"'<>@])@"
+)
+# Command-line flag values (--token X, --api-key=X, --password X, and in a
+# JSON argument list "--password", "X") and Authorization header credentials
+# (Bearer / Basic, with a digit).
+_FLAG_VALUE_RE = re.compile(
+    r"(?<![\w-])--?([A-Za-z][\w-]{0,40})(?:=|[ \t]+|[\"'][ \t]*,[ \t]*)[\"']?([^\s\"'`,;|&<>()\[\]{}$/~.-][^\s\"'`,;|&<>()\[\]{}]{7,})"
+)
+_AUTH_VALUE_RE = re.compile(
+    r"\b(?:Bearer|Basic)[ \t]+((?=[A-Za-z0-9._~+/-]*[0-9])[A-Za-z0-9._~+/-]{8,}=*)",
+    re.IGNORECASE,
+)
+# Token shapes masked wherever they appear (a superset of what is reported).
+_MASK_TOKEN_RES = (
+    (re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"), "github_pat_"),
+    (re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{20,}"), "_"),
+    (re.compile(r"(?<![A-Za-z0-9_])[sr]k_(?:live|test)_[0-9A-Za-z]{16,}"), "k_"),
+    (re.compile(r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])"), "npm_"),
+    # Base64 DER of a PKCS#1 / PKCS#8 private key (a PEM body without its header).
+    (re.compile(r"(?<![A-Za-z0-9+/])MII[A-Za-z0-9+/]{3}IBA[AD][A-Za-z0-9+/]{20,}=*"), "MII"),
+)
+_AWS_HINT_RE = re.compile(r"aws", re.IGNORECASE)
+
+
+def _mask_value(value):
+    return value[:4] + _MASK if len(value) >= 8 else _MASK
+
+
+def _mask_text(text, values):
+    for value in values:
+        if len(value) >= 4 and value in text:
+            text = text.replace(value, _mask_value(value))
+    return text
+
+
+def _mixed_alnum(value):
+    return (
+        any(c.isupper() for c in value)
+        and any(c.islower() for c in value)
+        and any(c.isdigit() for c in value)
+    )
+
+
+def _aws_secret_spans(line):
+    """40-character AWS secret access key values (named, or next to AKIA...)."""
+    spans = []
+    if _AWS_HINT_RE.search(line):
+        spans.extend(m.span(1) for m in _AWS_SECRET_NAMED_RE.finditer(line)
+                     if _mixed_alnum(m.group(1)))
+    if "AKIA" in line and _AWS_KEY_ID_RE.search(line):
+        spans.extend(m.span() for m in _AWS_SECRET_VALUE_RE.finditer(line)
+                     if _mixed_alnum(m.group(0)))
+    return spans
+
+
+def _aws_secret_check(line, ctx):
+    # Reported at exactly 40 characters; longer runs are only masked.
+    return any(
+        end - start == 40 and not _SECRET_PLACEHOLDER_RE.search(line[start:end])
+        for start, end in _aws_secret_spans(line)
+    )
+
+
+def _secret_spans(line, ctx):
+    """(start, end) of every secret-looking value on the line."""
+    spans = []
+    for _label, rx, _high in _SECRET_RES:
+        for m in rx.finditer(line):
+            spans.append(m.span(1) if m.lastindex else m.span())
+    for rx, hint in ((_SLACK_TOKEN_RE, "xox"), (_GOOGLE_KEY_RE, "AIza"), (_JWT_RE, "eyJ")):
+        if hint in line:
+            spans.extend(m.span() for m in rx.finditer(line))
+    for rx, hint in _MASK_TOKEN_RES:
+        if hint in line:
+            spans.extend(m.span() for m in rx.finditer(line))
+    spans.extend(_aws_secret_spans(line))
+    if "-----BEGIN " in line:
+        for m in _PEM_KEY_RE.finditer(line):
+            start = _PEM_LEAD_AT_RE.match(line, m.end()).end()
+            end = _PEM_BODY_END_RE.search(line, start)
+            end = end.start() if end else len(line)
+            if end > start and _PEM_BODY_RUN_RE.search(line, start, end):
+                spans.append((start, end))
+    # Values recognized by their key, flag or URL position: a bare reference
+    # ($TOKEN, ${DB_PASSWORD}, %API_KEY%, <your-key>, %s) is left readable.
+    if "://" in line and "@" in line:
+        for rx, group in ((_CONN_STRING_RE, 2), (_URL_PASSWORD_RE, 1)):
+            spans.extend(m.span(group) for m in rx.finditer(line)
+                         if not _REFERENCE_RE.fullmatch(m.group(group)))
+    if "-" in line:
+        for m in _FLAG_VALUE_RE.finditer(line):
+            name = m.group(1)
+            if _is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]:
+                spans.append(m.span(2))
+    if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
+        spans.extend(m.span(1) for m in _AUTH_VALUE_RE.finditer(line))
+    if _SECRET_KEY_HINT_RE.search(line):
+        for rx in (_MASK_DOCKER_RE, _MASK_COLON_RE, _ASSIGN_EQ_RE):
+            for m in rx.finditer(line):
+                value = m.group(2)
+                if ("://" not in value and not _REFERENCE_RE.fullmatch(value)
+                        and _is_secret_key(m.group(1), ctx)):
+                    spans.append(m.span(2))
+        for m in _QUOTED_ASSIGN_RE.finditer(line):
+            if not _REFERENCE_RE.fullmatch(m.group(3)) and _is_secret_key(m.group(1), ctx):
+                spans.append(m.span(3))
+    return spans
+
+
+# Every _secret_spans() source needs one of these literals: the key words of
+# _SECRET_KEY_HINT_RE (assignments, flags, the quoted api_key pattern) and the
+# token / URL / header hints. A text without any has nothing to mask.
+# Matched against the lower-cased text (several times faster than one
+# case-insensitive alternation when thousands of short messages are masked).
+_MASK_HINT_RE = re.compile(
+    r"secret|token|pass|pwd|key|credential|auth|akia|sk-|gh[pousr]_|github_pat_|k_live_|k_test_|"
+    r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws"
+)
+
+
+def _has_mask_hint(text):
+    return _MASK_HINT_RE.search(text.lower()) is not None
+
+
+def may_hold_secrets(text_lower):
+    """False when a lower-cased file text has nothing masking could find."""
+    return _MASK_HINT_RE.search(text_lower) is not None
+# A whole value that only names another value. "$uper$ecret1" is not one.
+_REFERENCE_RE = re.compile(
+    r"\$\{[A-Za-z_][\w.:-]*\}|\$[A-Za-z_]\w*|%[A-Za-z_]\w*%|<[^<>]*>|%[sd]|%\([A-Za-z_]\w*\)[sd]"
+)
+
+
+def _mask_secrets(line, ctx):
+    """(masked line.strip(), raw secret values) for a PG007 finding."""
+    masked, values = _mask_spans(line, ctx)
+    return masked.strip(), values
+
+
+def _mask_spans(line, ctx):
+    """(line with every _secret_spans() value masked, raw values longest first).
+
+    The result for the line being scanned is kept in ctx: PG007 and the
+    scanner both ask for it.
+    """
+    memo = ctx.get("_mask_memo") if ctx is not None else None
+    if memo is not None and memo[0] is line:
+        return memo[1]
+    result = _mask_spans_uncached(line, ctx)
+    if ctx is not None:
+        ctx["_mask_memo"] = (line, result)
+    return result
+
+
+def _mask_spans_uncached(line, ctx):
+    if not _has_mask_hint(line):
+        return line, []
+    merged = []
+    for start, end in sorted(_secret_spans(line, ctx)):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    pieces = []
+    values = []
+    pos = 0
+    for start, end in merged:
+        value = line[start:end]
+        values.append(value)
+        pieces.append(line[pos:start])
+        pieces.append(_mask_value(value))
+        pos = end
+    pieces.append(line[pos:])
+    values.sort(key=len, reverse=True)
+    # A value found at one position may appear again elsewhere on the line
+    # (API_KEY=abc... and later abc... again): mask every occurrence.
+    return _mask_fragment("".join(pieces), values), values
+
+
+# (values list, long values, short values, values by 5-char prefix, len):
+# the tables for the values of the line being masked. Every finding on a line
+# masks its message against the same list, so the tables are built once per
+# line instead of once per finding (findings x values was quadratic).
+_FRAGMENT_TABLES = [None, None, None, None, -1]
+
+
+def _fragment_tables(values):
+    cached = _FRAGMENT_TABLES
+    if cached[0] is values and cached[4] == len(values):
+        return cached[1], cached[2], cached[3]
+    long_values = [v for v in values if len(v) >= 5]
+    short_values = [v for v in values if len(v) < 5]
+    by_prefix = {}
+    for value in long_values:
+        by_prefix.setdefault(value[:5], []).append(value)
+    cached[:] = [values, long_values, short_values, by_prefix, len(values)]
+    return long_values, short_values, by_prefix
+
+
+def _mask_fragment(text, values):
+    """Mask raw secret `values` of a line inside another text (message, snippet).
+
+    A full occurrence is masked, and so is a prefix of five or more characters
+    cut short by the end of the text or by "..." (_short). A value shorter
+    than five characters is masked only in URL-password position (":pw@").
+    """
+    if not values or not text:
+        return text
+    long_values, short_values, by_prefix = _fragment_tables(values)
+    for value in short_values:
+        if ":" + value + "@" in text:
+            text = text.replace(":" + value + "@", ":" + _MASK + "@")
+    if not long_values:
+        return text
+    n = len(text)
+    if len(long_values) <= 16:
+        # Few values: find the candidate positions with str.find.
+        starts = set()
+        for value in long_values:
+            i = text.find(value[:5])
+            while i >= 0:
+                starts.add(i)
+                i = text.find(value[:5], i + 1)
+        starts = sorted(starts)
+    else:
+        starts = range(n - 4)  # many values: one dict lookup per position
+    pieces = []
+    pos = 0
+    for i in starts:
+        if i < pos:
+            continue
+        best = None
+        for value in by_prefix.get(text[i:i + 5], ()):
+            k = 5
+            while k < len(value) and i + k < n and text[i + k] == value[k]:
+                k += 1
+            if (k == len(value) or i + k == n or text.startswith("...", i + k)) and (
+                best is None or k > best[0]
+            ):
+                best = (k, value)
+        if best is None:
+            continue
+        pieces.append(text[pos:i])
+        pieces.append(_mask_value(best[1]))
+        pos = i + best[0]
+    pieces.append(text[pos:])
+    return "".join(pieces)
+
+
+def mask_line_findings(line, ctx, results, cache=None):
+    """Mask secrets in every (message, snippet) found on `line`, any rule.
+
+    The values are those _secret_spans() finds on the line: what PG007 reads
+    as a secret (whether or not PG007 reports the line) and the password of
+    every scheme://user:password@host. A snippet equal to the line becomes
+    the span-masked line. Any other text (a message, a snippet built from
+    part of the line or from another line) is span-masked on its own and
+    then has the line's raw values replaced (_mask_fragment). `cache` maps
+    a text to its span-masked form (messages repeat from line to line).
+    """
+    masked, values = _mask_spans(line, ctx)
+    masked = masked.strip()
+    stripped = line.strip()
+    if cache is None:
+        cache = {}
+    out = []
+    for message, snippet in results:
+        if snippet == stripped or snippet == masked:
+            snippet = masked
+        else:
+            snippet = _mask_other_text(snippet, values, ctx, cache)
+        out.append((_mask_other_text(message, values, ctx, cache), snippet))
+    return out
+
+
+def _mask_other_text(text, values, ctx, cache):
+    if not isinstance(text, str) or not text:
+        return text
+    hit = cache.get(text)
+    if hit is None:
+        hit = cache[text] = _mask_spans_uncached(text, ctx)[0]
+    return _mask_fragment(hit, values) if values else hit
+
+
+def _key_segments(key):
+    return _name_segments(re.sub(r"[.-]", "_", key))
+
+
+def _is_public_key(segments):
+    return any(s in _PUBLIC_KEY_SEGMENTS for s in segments)
+
+
+def _is_secret_key(key, ctx=None):
+    segments = _key_segments(key)
+    # existingSecret / existing_secret (Helm charts) name a Secret object.
+    if not segments or _is_public_key(segments) or "existing" in segments:
+        return False
+    if segments == ["auth"]:
+        # npm `_auth=<base64 user:pass>`; elsewhere a bare `auth:` key usually
+        # names a scheme (auth: oauth2-device-flow-v2).
+        return key.lower() == "_auth" or (ctx is not None and _ctx_kind(ctx) == "npmrc")
+    last = segments[-1]
+    return (
+        last in _SECRET_KEY_LAST
+        or last.endswith(("password", "passwd"))  # PGPASSWORD, DBPASSWORD
+        or "".join(segments[-2:]) in _SECRET_KEY_LAST2
+        or "".join(segments[-3:]) == "secretkeybase"  # Rails SECRET_KEY_BASE
+    )
+
+
+# A part of a dash / underscore separated identifier: a word with up to three
+# trailing digits (oauth2, prod01, HS256) or a short number / version (1, v2, 1x).
+_IDENT_PART_RE = re.compile(r"[A-Za-z]{2,}[0-9]{0,3}|[A-Za-z]?[0-9]{1,3}[A-Za-z]?")
+# AWS SigV4 credential scope: <access key id>/<yyyymmdd>/<region>/<service>/...
+_SIGV4_SCOPE_RE = re.compile(r"[A-Za-z0-9]+/[0-9]{8}/")
+
+
+def _looks_like_identifier(value):
+    """oauth2-device-flow-v2, aws-creds-prod1, my-token-secret-1, JWT-HS256-v2.
+
+    Two or more parts split on "-" / "_", every part matching _IDENT_PART_RE
+    (at most 16 characters), and at least two parts with two or more letters.
+    Random secrets fail the part test (mixed letters and digits, long digit
+    runs: UUIDs, hex, base64).
+    """
+    parts = re.split(r"[-_]", value)
+    if len(parts) < 2:
+        return False
+    words = 0
+    mixed = 0
+    for part in parts:
+        if len(part) > 16 or not _IDENT_PART_RE.fullmatch(part):
+            return False
+        if sum(c.isalpha() for c in part) >= 2:
+            words += 1
+        if _random_case(part):
+            if len(part) >= 10:
+                return False  # kLmNoPqRs, AbCdEfGhIjKlMn
+            mixed += 1
+    if mixed >= 2:
+        return False  # prod-xKq-mZp-wRt-3
+    if _high_entropy_with_digit(value):
+        return False  # kqzpwxrt_vbnmhgfd_ljkcsd5
+    return words >= 2
+
+
+# Humps of a mixed-case word: an acronym, a capitalized or lower-case word,
+# or a lone capital (getHTTPSUrl -> get HTTPS Url; kLmNoPq -> k Lm No Pq).
+_CASE_HUMP_RE = re.compile(r"[A-Z]{2,}(?![a-z])|[A-Z]?[a-z]+|[A-Z]")
+
+
+def _random_case(part):
+    """Case changes with no word structure: kLmNoPqRs, xKq, aBcDeFgHiJ.
+
+    The part has a lower-case letter followed by a capital and its humps
+    average under three letters; CamelCase words (getAccessToken,
+    MyServiceName, parseXmlFile, iPhoneApp) average three or more.
+    """
+    if not re.search(r"[a-z][A-Z]", part):
+        return False
+    humps = _CASE_HUMP_RE.findall(part)
+    return sum(len(h) for h in humps) < 3 * len(humps)
+
+
+def _high_entropy_with_digit(value):
+    """At least 16 characters with a digit, >= 4.3 bits per character and
+    >= 0.9 of the maximum for its length (English identifiers of any length
+    stay near 4.1 bits and well under 0.9)."""
+    n = len(value)
+    if n < 16 or not any(c.isdigit() for c in value):
+        return False
+    counts = {}
+    for c in value:
+        counts[c] = counts.get(c, 0) + 1
+    bits = -sum(k / n * math.log(k / n, 2) for k in counts.values())
+    return bits >= 4.3 and bits >= 0.9 * math.log(n, 2)
+
+
+def _plausible_secret_value(value):
+    """Does an unquoted value look like a secret rather than a name?
+
+    At least 8 characters, letters and digits, not a reference ($VAR, %VAR%,
+    {...}, <...>, a path) or placeholder, not a dash / underscore identifier
+    (_looks_like_identifier) and not a SigV4 credential scope. A single word
+    with digits (Password123, hunter2hunter2) is reported: that is the usual
+    shape of a real weak password, and nothing in the value tells it apart
+    from a label.
+    """
+    return (
+        len(value) >= 8
+        and value[0] not in "$%{<*&!/~."
+        and not _SECRET_PLACEHOLDER_RE.search(value)
+        and bool(re.search(r"[A-Za-z]", value))
+        and bool(re.search(r"[0-9]", value))
+        and not _looks_like_identifier(value)
+        and not _SIGV4_SCOPE_RE.match(value)
+    )
+
+
+def _line_key_is_public(line):
+    m = _LINE_KEY_RE.match(line)
+    return bool(m) and _is_public_key(_key_segments(m.group(1)))
+
+
+def _token_check(rx, hint, public_aware=False):
+    """Check for one token pattern; `hint` is a literal every match contains."""
+
+    def check(line, ctx):
+        if hint not in line:
+            return False
+        for m in rx.finditer(line):
+            if _SECRET_PLACEHOLDER_RE.search(m.group(0)):
+                continue
+            if public_aware and _line_key_is_public(line):
+                return False
+            return True
+        return False
+
+    return check
+
+
+# A Slack token cut short by a placeholder: xoxb-1234-5678-<token>,
+# xoxb-1234-[redacted], xoxb-1234-5678abcd<ellipsis>.
+_SLACK_PLACEHOLDER_NEXT = ("<", "[", "...", chr(0x2026))
+
+
+def _slack_check(line, ctx):
+    if "xox" not in line:
+        return False
+    for m in _SLACK_TOKEN_RE.finditer(line):
+        if _SECRET_PLACEHOLDER_RE.search(m.group(0)):
+            continue
+        rest = line[m.end():m.end() + 4]
+        if rest.startswith("-"):
+            rest = rest[1:]
+        if rest.startswith(_SLACK_PLACEHOLDER_NEXT):
+            continue
+        return True
+    return False
+
+
+def _pem_body_is_illustration(body):
+    """A code fence, bracketed text or prose where the key body should be."""
+    if body.startswith("Proc-Type:"):
+        return False  # encrypted legacy PEM header
+    return body.startswith(("```", "~~~", "(", "[", "<", "{")) or len(body.split()) > 1
+
+
+def _pem_header(line):
+    """First PEM header that is not prose, or None.
+
+    Prose names both markers with no key body between them: "paste your key
+    between -----BEGIN PRIVATE KEY----- and -----END PRIVATE KEY-----".
+    """
+    end = body = None
+    for m in _PEM_KEY_RE.finditer(line):
+        if end is None or 0 <= end < m.end():
+            end = line.find("-----END ", m.end())
+        if end < 0:
+            return m
+        if body is None or (body is not False and body.start() < m.end()):
+            body = _PEM_BODY_RUN_RE.search(line, m.end()) or False
+        if body is not False and body.start() < end:
+            return m
+    return None
+
+
+def _pem_check(line, ctx):
+    if "-----BEGIN " not in line:
+        return False
+    m = _pem_header(line)
+    if not m:
+        return False
+    rest = _PEM_LEAD_RE.sub("", line[m.end():m.end() + 200])
+    if rest:
+        body = _PEM_BODY_END_RE.split(rest, 1)[0].strip()
+    else:
+        # Body on the next non-empty line (at most three lines down).
+        lines = ctx.get("lines") or []
+        lineno = ctx.get("lineno") or 0
+        for nxt in lines[lineno:lineno + 3] if lineno > 0 else ():
+            if nxt.strip():
+                rest = nxt.strip()
+                break
+        body = rest
+    rest = rest[:80]
+    if rest.startswith("-----END"):
+        return False  # header-only illustration
+    if _SECRET_PLACEHOLDER_RE.search(rest):
+        return False
+    return not (body and _pem_body_is_illustration(body[:200]))
+
+
+def _conn_string_check(line, ctx):
+    if "://" not in line or "@" not in line:
+        return False
+    for m in _CONN_STRING_RE.finditer(line):
+        user, password = m.group(1), m.group(2)
+        if (
+            password[0] in "$%{"
+            or password.lower() in _CONN_GENERIC_PASSWORDS
+            or password == user
+            or not password.strip("*xX.")
+            or _SECRET_PLACEHOLDER_RE.search(password)
+            or (password.isdigit() and len(password) <= 5)  # host:8080@path
+        ):
+            continue
+        return True
+    return False
+
+
+# Every key _is_secret_key() accepts contains one of these words.
+_SECRET_KEY_HINT_RE = re.compile(r"secret|token|pass|pwd|key|credential|auth", re.IGNORECASE)
+# The literals the 1.1.0 secret checks start from (each check's own hint).
+_ANY_NEW_SECRET_HINT_RE = re.compile(
+    r"-----BEGIN |xox|AIza|eyJ|://|secret|token|pass|pwd|key|credential|auth|"
+    r"github_pat_|k_live_|aws|AKIA",
+    re.IGNORECASE,
+)
+
+
+def _unquoted_assignment_check(line, ctx):
+    if not _SECRET_KEY_HINT_RE.search(line):
+        return False
+    for rx in (_ASSIGN_DOCKER_RE, _ASSIGN_COLON_RE, _ASSIGN_EQ_RE):
+        for m in rx.finditer(line):
+            value = m.group(2)
+            if "://" in value:
+                continue  # a URL: _conn_string_check decides
+            after = line[m.end(2):m.end(2) + 1]
+            if after == "(":
+                continue  # a function call: token=get_token(...)
+            if after in ("<", "[", chr(0x2026)):
+                continue  # cut short by a placeholder: xoxb-1234-<token>, abc[...]
+            if _is_secret_key(m.group(1), ctx) and _plausible_secret_value(value):
+                return True
+    return False
+
+
+# Quoted values that name or reference a secret rather than hold one:
+# SOPS-encrypted values, AWS / GCP secret-manager references, tokenizer and
+# model names that land in "token" / "api_key" fields of example configs.
+_QUOTED_REFERENCE_VALUE_RE = re.compile(
+    r"ENC\[|arn:aws[\w-]*:|projects/[^/\s]+/secrets/|"
+    r"(?:cl100k|o200k|p50k|r50k)_base$|"
+    r"(?:claude|gpt|gemini|llama|mistral|text-embedding)-[a-z0-9.-]+$"
+)
+
+
+def _quoted_key_check(line, ctx):
+    """JSON / dict style "password": "...", "PGPASSWORD": "..."."""
+    if not _SECRET_KEY_HINT_RE.search(line):
+        return False
+    for m in _QUOTED_KEY_ASSIGN_RE.finditer(line):
+        value = m.group(4)
+        if (
+            _is_secret_key(m.group(2), ctx)
+            and not _QUOTED_REFERENCE_VALUE_RE.match(value)
+            and _plausible_secret_value(value)
+        ):
+            return True
+    return False
+
+
+_STRUCTURED_SECRET_CHECKS = [
+    ("PEM private key", _pem_check),
+    ("Slack token", _slack_check),
+    ("Google API key", _token_check(_GOOGLE_KEY_RE, "AIza")),
+    ("JWT", _token_check(_JWT_RE, "eyJ", public_aware=True)),
+    ("GitHub fine-grained token", _token_check(_GITHUB_PAT_RE, "github_pat_")),
+    ("Stripe live key", _token_check(_STRIPE_LIVE_RE, "k_live_")),
+    ("AWS secret access key", _aws_secret_check),
+]
+_INFERRED_SECRET_CHECKS = [
+    ("password in connection string", _conn_string_check),
+    ("hardcoded secret (unquoted assignment)", _unquoted_assignment_check),
+    ("hardcoded secret (quoted assignment)", _quoted_key_check),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +1221,167 @@ def _detect_secret(line, ctx):
 # analyzes a file once, caches {lineno: [(message, snippet), ...]} in ctx, and
 # its per-line detector just looks up ctx["lineno"].
 
-def _file_ext(ctx):
-    """Lower-cased extension of ctx["path"]; "" for scan_text() input."""
+_ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+# Pseudo-extension per config-file kind, so a bare "Dockerfile" is never
+# mistaken for extension-less scan_text() input ("").
+_KIND_EXT = {
+    "env": ".env",
+    "env-template": ".env",
+    "dockerfile": ".dockerfile",
+    "npmrc": ".npmrc",
+}
+
+
+# Suffixes the scanner reads in every file (scanner.SCAN_SUFFIXES). A name
+# such as ".env.json" or "Dockerfile.md" keeps its suffix's handling.
+_TYPED_SUFFIXES = (".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".mcp", ".cursorrules")
+
+
+# Environment names accepted after ".env." (.env.local, .env.production,
+# .env.development.local, ...). Anything else (.env.ts, .env.js, .env.py,
+# .env.d.ts, .env.bak, .env.vault) is source code, a backup or an encrypted
+# vault, not a dotenv file.
+_ENV_NAMES = frozenset((
+    "local", "development", "develop", "dev", "production", "prod", "test",
+    "testing", "staging", "stage", "ci", "docker", "preview", "qa", "uat",
+    "sandbox", "demo", "e2e", "defaults",
+))
+_ENV_TEMPLATE_NAMES = frozenset(s[1:] for s in _ENV_TEMPLATE_SUFFIXES)
+# Last-dot-segments that make "Dockerfile.<x>" something other than a
+# Dockerfile: templates rendered into one, images, source code, docs, data,
+# archives and backups. Any other name (prod, dev, alpine, server, ...) is a
+# Dockerfile variant.
+_NOT_DOCKERFILE_SEGMENTS = frozenset((
+    # templates
+    "template", "tpl", "tmpl", "j2", "jinja", "jinja2", "in", "erb",
+    "mustache", "hbs", "liquid", "gotmpl", "njk",
+    # images
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp",
+    # source code
+    "go", "py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "rb", "java", "kt",
+    "rs", "c", "h", "cc", "cpp", "cs", "php", "sh", "bash", "ps1", "pl",
+    "lua", "swift", "scala", "vim", "el",
+    # docs and data
+    "md", "rst", "txt", "html", "htm", "adoc", "pdf", "json", "yaml", "yml",
+    "toml", "xml", "ini", "cfg", "csv", "log", "lock",
+    # archives and backups
+    "zip", "gz", "tgz", "tar", "bak", "orig", "old", "swp", "rej", "patch",
+    "diff", "tmp",
+))
+_NAME_SEGMENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
+
+
+def config_file_kind(path):
+    """Config-file kind matched by name, or None.
+
+    The name is lower-cased and split on ".":
+      "env":          ".env", or ".env." + segments that are all _ENV_NAMES
+                      (.env.local, .env.production.local).
+      "env-template": the same, with at least one segment in example /
+                      sample / template / dist (.env.example,
+                      .env.local.example).
+      "dockerfile":   "dockerfile"; "dockerfile." + segments that are plain
+                      names ([a-z0-9][a-z0-9_-]*) none of which is in
+                      _NOT_DOCKERFILE_SEGMENTS (Dockerfile.prod,
+                      Dockerfile.alpine; not Dockerfile.template, .j2, .png,
+                      .go); "<name>.dockerfile" with a non-empty name whose
+                      segments pass the same test.
+      "npmrc":        ".npmrc".
+    Names ending in one of _TYPED_SUFFIXES are never config files of these
+    kinds (".env.json" is JSON, "Dockerfile.md" is markdown).
+    """
+    if not path or path == "<text>":
+        return None
+    name = re.split(r"[\\/]", path)[-1].lower()
+    if name.endswith(_TYPED_SUFFIXES):
+        return None
+    if name == ".env":
+        return "env"
+    if name.startswith(".env."):
+        segments = name[5:].split(".")
+        if not all(s in _ENV_NAMES or s in _ENV_TEMPLATE_NAMES for s in segments):
+            return None
+        return "env-template" if any(s in _ENV_TEMPLATE_NAMES for s in segments) else "env"
+    if name == "dockerfile":
+        return "dockerfile"
+    if name.startswith("dockerfile."):
+        segments = name[11:].split(".")
+    elif name.endswith(".dockerfile"):
+        segments = name[:-11].split(".")
+    else:
+        segments = None
+    if segments is not None:
+        if all(_NAME_SEGMENT_RE.match(s) and s not in _NOT_DOCKERFILE_SEGMENTS for s in segments):
+            return "dockerfile"
+        return None
+    if name == ".npmrc":
+        return "npmrc"
+    return None
+
+
+# Rules that do not run on each config-file kind; scanner.scan_text skips
+# them. Every other rule runs. The rules that check the file type themselves
+# (PG012, PG017-PG020) accept a kind through _kind_enabled(), so this table is
+# the only place that decides.
+#   PG002/PG003: these files are written by the operator, not untrusted
+#     content, and ${VAR} expansion is everywhere.
+#   PG004/PG005/PG006: SHELL, RUN apt-get purge, WORKDIR / and ROOT_PATH=/
+#     are ordinary build and app settings.
+#   PG008: build-time installs, like CI steps.
+#   PG010/PG011/PG015: GitHub workflows only.  PG013: markdown and
+#     package/plugin JSON only.  PG014: tool-schema JSON only.
+#   PG018: Dockerfiles only (an .env or .npmrc does not start containers).
+#   PG021: Dockerfiles only (the others hold no download commands).
+#   PG012/PG017: not in .npmrc (no agent settings there).
+#   PG007 runs everywhere; in .env templates it checks structured tokens
+#     only (_detect_secret), since their assignments hold placeholder values.
+_CONFIG_FILE_SKIP = (
+    "PG002", "PG003", "PG004", "PG005", "PG006", "PG008", "PG010", "PG011",
+    "PG013", "PG014", "PG015",
+)
+KIND_SKIP_RULES = {
+    "env": frozenset(_CONFIG_FILE_SKIP + ("PG018", "PG021")),
+    "env-template": frozenset(_CONFIG_FILE_SKIP + ("PG018", "PG021")),
+    "dockerfile": frozenset(_CONFIG_FILE_SKIP),
+    "npmrc": frozenset(_CONFIG_FILE_SKIP + ("PG012", "PG017", "PG018", "PG021")),
+}
+
+
+def _ctx_kind(ctx):
+    """config_file_kind() of ctx["path"], cached in ctx."""
     path = ctx.get("path") or "<text>"
+    cached = ctx.get("_kind")
+    if cached is None or cached[0] != path:
+        cached = (path, config_file_kind(path))
+        ctx["_kind"] = cached
+    return cached[1]
+
+
+def _kind_enabled(ctx, rule_id):
+    """True when ctx is a config file of a kind that rule_id runs on."""
+    kind = _ctx_kind(ctx)
+    return kind is not None and rule_id not in KIND_SKIP_RULES[kind]
+
+
+def _file_ext(ctx):
+    """Lower-cased extension of ctx["path"]; "" for scan_text() input.
+
+    Called per line by several rules, so the answer is cached in ctx.
+    """
+    path = ctx.get("path") or "<text>"
+    cached = ctx.get("_ext")
+    if cached is None or cached[0] != path:
+        cached = (path, _compute_file_ext(ctx, path))
+        ctx["_ext"] = cached
+    return cached[1]
+
+
+def _compute_file_ext(ctx, path):
     if path == "<text>":
         return ""
+    kind = _ctx_kind(ctx)
+    if kind:
+        return _KIND_EXT[kind]
     name = os.path.basename(path).lower()
     if name in ("mcp.json", ".mcp.json"):
         return ".json"
@@ -406,6 +1440,8 @@ def _file_level(key, analyzer):
             ctx[key] = cache
         return cache.get(ctx.get("lineno"), ())
 
+    # scanner.scan_text reads the cache directly once it exists.
+    detector.cache_key = key
     return detector
 
 
@@ -2280,27 +3316,33 @@ _DOC_DIRS = (
 def _is_agent_definition(ctx, fields):
     """True for a Claude Code sub-agent file, not a skill or a docs page.
 
-    Location decides first: anything under .claude/agents/, or a direct child
-    of a plugin's agents/ folder that is not inside a docs tree.  Deeper or
-    docs-tree files under some agents/ folder count only when their front
-    matter carries an agent-only field such as tools or model.
+    Location decides first: anything under .claude/agents/ (a file named
+    skill.md only as a direct child; deeper it is a skill folder's entry
+    file), or a direct child of a plugin's agents/ folder whose own parent
+    is not a docs folder (only that folder is checked, so a docs or site
+    folder higher up an absolute path does not matter). Other files under
+    some agents/ folder count only when their front matter carries an
+    agent-only field such as tools or model.
     """
     path = ctx.get("path") or "<text>"
     if path == "<text>":
         return False
     parts = [p.lower() for p in re.split(r"[\\/]+", path) if p]
     name = parts[-1] if parts else ""
-    if not name.endswith(".md") or name in ("readme.md", "skill.md"):
+    if not name.endswith(".md") or name == "readme.md":
         return False
     dirs = parts[:-1]
     if "agents" not in dirs:
         return False
     if "name" not in fields or "description" not in fields:
         return False
+    parent = dirs[-2] if len(dirs) >= 2 else ""
+    if name == "skill.md":
+        return dirs[-1] == "agents" and parent == ".claude"
     for k in range(1, len(dirs)):
         if dirs[k] == "agents" and dirs[k - 1] == ".claude":
             return True
-    if dirs[-1] == "agents" and not any(d in _DOC_DIRS for d in dirs):
+    if dirs[-1] == "agents" and parent not in _DOC_DIRS:
         return True
     return any(k in fields for k in _AGENT_ONLY_KEYS)
 
@@ -2762,13 +3804,21 @@ _CHECKSUM_FILE_RES = (
 _SIGNATURE_FILE_RE = re.compile(
     r"\.(?:sig|asc|minisig|pem|crt|cert|sigstore|bundle|intoto\.jsonl)$", re.IGNORECASE
 )
+# A short-option bundle holding -V, built from each tool's getopt string:
+# minisign "CGSVRHhc:flm:oP:p:qQs:t:vWx:", signify "CGSVzc:ehm:np:qs:t:x:".
+# Flags without an argument in any order, then at most one flag that takes
+# an argument (its value is the next word): -V, -Vm, -qVm, -Vp. Words such
+# as -Verbose, or -Vm2 with the value attached, do not count.
+_MINISIGN_V_BUNDLE = r"[CGSRHhfloqQvW]*V[CGSVRHhfloqQvW]*[cmPpstx]?"
+_SIGNIFY_V_BUNDLE = r"[CGSzehnq]*V[CGSVzehnq]*[cmpstx]?"
 # Signature checks that waive PG021 for the whole file.  "-V" may be merged
 # with other short flags (minisign -Vm file).  gpg --decrypt is not listed:
 # it prints a bad or missing signature as a warning and still exits 0 for
 # encrypted-only input, so it does not gate the download on a signature.
 _SIGNATURE_VERIFY_RE = re.compile(
     r"\bgpg2?\b[^\n|;&]{0,200}?\s--verify\b|\bgpgv2?\b|\bcosign\s+verify(?:-blob)?\b|"
-    r"\b(?:minisign|signify)\b[^\n|;&]{0,200}?\s-[A-Za-z]*V[A-Za-z]*\b|"
+    r"\bminisign\b[^\n|;&]{0,200}?\s-" + _MINISIGN_V_BUNDLE + r"(?![\w-])|"
+    r"\bsignify\b[^\n|;&]{0,200}?\s-" + _SIGNIFY_V_BUNDLE + r"(?![\w-])|"
     r"\bopenssl\s+dgst\b[^\n|;&]{0,200}?\s-verify\b|\bsigstore\s+verify\b|"
     r"\bgh\s+attestation\s+verify\b|\bslsa-verifier\b"
 )
@@ -2852,8 +3902,19 @@ def _is_upload(command, segment):
     return bool(_PS_UPLOAD_RE.search(segment))
 
 
-def _download_urls(pieces, dockerfile, assigned):
-    """[(url, index)] for every URL fetched on one logical line."""
+# Characters of variable-expanded URL text ($BASE/tool.tgz) built per file.
+# Every expansion copies the variable's value, so a long value referenced
+# many times would otherwise cost (value length x references) time and
+# memory; once the budget is spent, further references are not expanded.
+# Real files stay far below it (a 300-character URL used 3,000 times).
+_PG021_EXPAND_BUDGET = 1000000
+
+
+def _download_urls(pieces, dockerfile, assigned, budget):
+    """[(url, index)] for every URL fetched on one logical line.
+
+    budget is a one-item list: characters left for variable expansion.
+    """
     if len(pieces) == 1:
         logical = pieces[0][1]
         offsets = None
@@ -2892,7 +3953,12 @@ def _download_urls(pieces, dockerfile, assigned):
                 rest = t.group(3) if t.group(2) else t.group(5)
                 if var not in assigned:
                     continue
-                url = assigned[var] + (rest or "")
+                value = assigned[var]
+                size = len(value) + len(rest or "")
+                if size > budget[0]:
+                    continue  # expansion budget spent (see _PG021_EXPAND_BUDGET)
+                budget[0] -= size
+                url = value + (rest or "")
             if offsets is None:
                 out.append((url, pieces[0][0]))
             else:
@@ -2970,8 +4036,9 @@ def _analyze_same_origin_checksum(ctx):
                 assigned.setdefault(m.group(1), m.group(2))
     checksums = []
     artifacts = []
+    budget = [_PG021_EXPAND_BUDGET]
     for pieces in _pg021_logical_lines(clean):
-        for url, idx in _download_urls(pieces, dockerfile, assigned):
+        for url, idx in _download_urls(pieces, dockerfile, assigned, budget):
             host = _url_origin(url)
             name = _url_basename(url)
             if host and name:
@@ -3052,13 +4119,53 @@ def _is_comment_line(line):
 
 def _code_text(line, ctx):
     """The line without a trailing ' # comment' (JSON lines are kept as is)."""
-    if _file_ext(ctx) in (".json", ".mcp"):
-        return line
+    if "#" not in line or _file_ext(ctx) in (".json", ".mcp"):
+        return line  # _strip_yaml_comment only changes lines with a '#'
     return _strip_yaml_comment(line)
 
 
+def _config_code(lines, ctx):
+    """_code_text() of every line; in .npmrc a ';' comment line becomes ''.
+
+    Computed once per file (PG019 and PG020 share it; neither changes it).
+    """
+    cached = ctx.get("_config_code")
+    if cached is None or cached[0] is not lines:
+        cached = (lines, _compute_config_code(lines, ctx))
+        ctx["_config_code"] = cached
+    return cached[1]
+
+
+def _compute_config_code(lines, ctx):
+    if _file_ext(ctx) in (".json", ".mcp"):
+        code = list(lines)
+    else:
+        code = [_strip_yaml_comment(l) if "#" in l else l for l in lines]
+    if _ctx_kind(ctx) == "npmrc":
+        code = ["" if l.lstrip().startswith(";") else l for l in code]
+    return code
+
+
+# First character _DESCRIPTIVE_LINE_RE can see after leading whitespace.
+_DESCRIPTIVE_FIRST = frozenset("-\"'dDsStThHcCnN")
+
+
+def _raw_skips(ctx, lines):
+    """[_skip_config_line(l) for l in lines], computed once per file."""
+    cached = ctx.get("_raw_skips")
+    if cached is None or cached[0] is not lines:
+        cached = (lines, [_skip_config_line(l) for l in lines])
+        ctx["_raw_skips"] = cached
+    return cached[1]
+
+
 def _skip_config_line(line):
-    return _is_comment_line(line) or bool(_DESCRIPTIVE_LINE_RE.match(line))
+    s = line.lstrip()
+    if not s:
+        return False
+    if s[0] == "#" or s.startswith("//"):
+        return True  # _is_comment_line
+    return s[0] in _DESCRIPTIVE_FIRST and bool(_DESCRIPTIVE_LINE_RE.match(line))
 
 
 def _host_of(value):
@@ -3086,7 +4193,11 @@ def _first_value(lines, i, pos):
     YAML block lists, backslash continuations). Returns ("", None) if the
     next thing is another option or nothing.
     """
-    m = _OPTION_VALUE_RE.match(lines[i], pos)
+    # The value is read from at most _OPTION_VALUE_SPAN characters, like
+    # the 2000-character cap on the next-line fallback: a line holding many
+    # options inside one long word (".npmrc" "@a:registry=@a:registry=...")
+    # would otherwise rescan the rest of the line for each of them.
+    m = _OPTION_VALUE_RE.match(lines[i], pos, pos + _OPTION_VALUE_SPAN)
     if m and m.group(1):
         value, lineno = m.group(1), i + 1
     else:
@@ -3104,6 +4215,7 @@ def _first_value(lines, i, pos):
 
 
 _OPTION_VALUE_RE = re.compile(r"""["']?\s*[=:,]?\s*[\[(]?\s*["']?([^\s"',\[\]{}()]*)""")
+_OPTION_VALUE_SPAN = 2048
 
 
 def _command_argvs(ctx):
@@ -3145,6 +4257,8 @@ def _analyze_command_argvs(ctx):
             out.append((argv, where))
         return out
     for i, line in enumerate(lines):
+        if not line:
+            continue  # neither heuristic matches an empty line
         lineno = i + 1
         if not _DESCRIPTIVE_LINE_RE.match(line):
             start = _inline_launch_start(line)
@@ -3186,20 +4300,25 @@ def _cli_options(argv, start, value_flags):
         return
 
 
-def _logical_lines(lines, skip, want):
+def _logical_lines(lines, skips, want):
     """Yield [(token, lineno)] per command line, joining trailing-backslash lines.
 
-    Only command lines with a physical line matching `want` are tokenized.
+    skips[i] is True for a line to leave out (comments, descriptions). Only
+    command lines with a physical line matching `want` are tokenized.
     """
     group = []
     for i, raw in enumerate(lines):
-        if skip(raw):
+        if skips[i]:
             if group:
                 yield _group_tokens(group, want)
                 group = []
             continue
         s = raw.rstrip()
         cont = s.endswith("\\")
+        if not group and not cont:
+            # A one-line command: _group_tokens([(s, i + 1)], want) inline.
+            yield [(tok, i + 1) for tok in _heuristic_tokens(s)] if s and want.search(s) else []
+            continue
         group.append((s[:-1] if cont else s, i + 1))
         if not cont:
             yield _group_tokens(group, want)
@@ -3267,6 +4386,8 @@ _BYPASS_RES = (
         "project .mcp.json declares",
     ),
 )
+# Every _BYPASS_RES match contains one of these (all four are case-insensitive).
+_BYPASS_HINT_RE = re.compile(r"bypass|yolo|enableallprojectmcpservers", re.IGNORECASE)
 _TRUST_TRUE_RE = re.compile(r"""(?:^|[\s{,])["']?trust["']?\s*[:=]\s*["']?true\b""", re.IGNORECASE)
 
 
@@ -3599,7 +4720,7 @@ class _ListCollector(object):
 
 
 def _analyze_blanket_approval(ctx):
-    if _file_ext(ctx) not in _CONFIG_EXTS:
+    if _file_ext(ctx) not in _CONFIG_EXTS and not _kind_enabled(ctx, "PG012"):
         return {}
     lines = _ctx_lines(ctx)
     low = ctx.get("full_lower", "")
@@ -3607,12 +4728,13 @@ def _analyze_blanket_approval(ctx):
     mcp_ok = "mcp" in low
     collector = _ListCollector(lines)
     hits = {}
+    skips = _raw_skips(ctx, lines)
     for i, raw in enumerate(lines):
-        if _skip_config_line(raw):
-            continue
+        if not raw or skips[i]:
+            continue  # no pattern below matches an empty line
         line = _code_text(raw, ctx)
         lineno = i + 1
-        for rx, what in _BYPASS_RES:
+        for rx, what in (_BYPASS_RES if _BYPASS_HINT_RE.search(line) else ()):
             if rx.search(line):
                 _add_hit(hits, lines, lineno, "Blanket approval: " + what)
         if mcp_ok and _TRUST_TRUE_RE.search(line):
@@ -3638,9 +4760,11 @@ def _analyze_blanket_approval(ctx):
                 found = _wildcard_scope(item)
                 if found:
                     _add_hit(hits, lines, item_line, _approval_message(found[0], key, found[1]))
-        flags = _FlagValues(line)
+        flags = None
         for m in _ALLOWED_TOOLS_FLAG_RE.finditer(line):
             flag = m.group(1)
+            if flags is None:
+                flags = _FlagValues(line)
             scopes = flags.new_scopes(m.end(), flag)
             if scopes is None:  # nothing after the flag on this line
                 value, vline = _first_value(lines, i, len(lines[i]))
@@ -3941,7 +5065,7 @@ def _loop_message(key, value):
 
 
 def _analyze_unbounded_loop(ctx):
-    if _file_ext(ctx) not in _CONFIG_EXTS:
+    if _file_ext(ctx) not in _CONFIG_EXTS and not _kind_enabled(ctx, "PG017"):
         return {}
     lines = _ctx_lines(ctx)
     hits = {}
@@ -4001,6 +5125,8 @@ def _pg006_root_on(ctx, lines, lineno):
     """True when PG006 already reports a filesystem root on this line."""
     if not 0 < lineno <= len(lines):
         return False
+    if not _kind_enabled(ctx, "PG006") and _ctx_kind(ctx) is not None:
+        return False  # PG006 does not run on this config file (Dockerfile LABEL run=...)
     # Once per line: a long line with many '-v /:/' would otherwise be rescanned per mount.
     cache = ctx.setdefault("_pg006_root", {})
     found = cache.get(lineno)
@@ -4079,14 +5205,81 @@ def _is_ci_config(ctx):
     return name == "jenkinsfile" or name.startswith("jenkinsfile.") or name.endswith(".jenkinsfile")
 
 
+_DOCKER_INSTR_RE = re.compile(r"\s*([A-Za-z]+)(?:[ \t]+([A-Za-z]+))?")
+_DOCKER_ESCAPE_RE = re.compile(r"\s*#\s*escape\s*=\s*(\S)", re.IGNORECASE)
+_HEREDOC_RE = re.compile(r"""<<-?[ \t]*["']?([A-Za-z_][\w.-]*)["']?""")
+
+
+def _dockerfile_run_lines(lines):
+    """Set of 1-based line numbers inside RUN / ONBUILD RUN instructions.
+
+    Follows line continuations (the escape character, '\\' unless a
+    '# escape=' parser directive changes it; comment and blank lines inside a
+    continuation do not end it) and here-documents (RUN <<EOF ... EOF).
+    """
+    escape = "\\"
+    for s in lines[:20]:
+        st = s.strip()
+        if not st.startswith("#"):
+            break
+        m = _DOCKER_ESCAPE_RE.match(s)
+        if m:
+            escape = m.group(1)
+            break
+    out = set()
+    n = len(lines)
+    i = 0
+    while i < n:
+        st = lines[i].strip()
+        if not st or st.startswith("#"):
+            i += 1
+            continue
+        m = _DOCKER_INSTR_RE.match(lines[i])
+        word = m.group(1).upper() if m else ""
+        is_run = word == "RUN" or (word == "ONBUILD" and (m.group(2) or "").upper() == "RUN")
+        delims = []
+        j = i
+        while True:
+            s = lines[j]
+            if is_run:
+                out.add(j + 1)
+            if "<<" in s:
+                delims.extend(_HEREDOC_RE.findall(s))
+            j += 1
+            if not s.rstrip().endswith(escape):
+                break
+            while j < n and (not lines[j].strip() or lines[j].lstrip().startswith("#")):
+                if is_run:
+                    out.add(j + 1)
+                j += 1
+            if j >= n:
+                break
+        for delim in delims:
+            while j < n and lines[j].strip() != delim:
+                if is_run:
+                    out.add(j + 1)
+                j += 1
+            if j < n:
+                if is_run:
+                    out.add(j + 1)
+                j += 1
+        i = j
+    return out
+
+
 def _analyze_container_privilege(ctx):
-    if _file_ext(ctx) not in _CONFIG_EXTS:
+    if _file_ext(ctx) not in _CONFIG_EXTS and not _kind_enabled(ctx, "PG018"):
         return {}
     if _is_github_workflow(ctx) or _is_github_action(ctx) or _is_ci_config(ctx):
         return {}
     lines = _ctx_lines(ctx)
     hits = {}
+    # Dockerfile RUN steps execute at build time, like CI steps; a launch
+    # command in LABEL run=..., CMD or ENTRYPOINT is how the image is run.
+    build_lines = _dockerfile_run_lines(lines) if _ctx_kind(ctx) == "dockerfile" else ()
     for argv, where in _command_argvs(ctx):
+        if build_lines and where and where[0] in build_lines:
+            continue
         for i, tok in enumerate(argv):
             nxt = argv[i + 1].lower() if i + 1 < len(argv) else ""
             if _launcher_name(tok) == "docker" and nxt == "run":
@@ -4154,6 +5347,12 @@ _VERIFY_OFF_RES = (
         re.compile(r"(?<![\w-])--insecure-ignore-(?:tlog|sct)(?:=(?:true|1))?(?![\w=-])"),
         "cosign '--insecure-ignore-...' skips transparency-log/SCT checks",
     ),
+)
+# Every _VERIFY_OFF_RES match contains one of these (case-insensitively).
+_VERIFY_OFF_HINT_RE = re.compile(
+    r"insecure|no-check-certificate|strict[-_]?ssl|NODE_TLS_REJECT_UNAUTHORIZED|"
+    r"GIT_SSL_NO_VERIFY|http\.sslverify",
+    re.IGNORECASE,
 )
 # The line patterns above that a local-only curl / wget command may waive.
 _LOCAL_WAIVED = {
@@ -4407,19 +5606,23 @@ def _check_command_tokens(tokens, hits, lines, waived=None):
 
 
 def _analyze_verification_disabled(ctx):
-    if _file_ext(ctx) not in _CONFIG_TXT_EXTS:
+    if _file_ext(ctx) not in _CONFIG_TXT_EXTS and not _kind_enabled(ctx, "PG019"):
         return {}
     lines = _ctx_lines(ctx)
     hits = {}
-    code = [_code_text(l, ctx) for l in lines]
+    code = _config_code(lines, ctx)
+    skips = _raw_skips(ctx, lines)
     for i, raw in enumerate(lines):
-        if _skip_config_line(raw):
+        if skips[i]:
             continue
         line = code[i]
+        if not line:
+            continue  # comment-only or blank: no pattern below matches ""
         lineno = i + 1
-        for rx, what in _VERIFY_OFF_RES:
-            if rx.search(line):
-                _add_hit(hits, lines, lineno, "Verification disabled: " + what)
+        if _VERIFY_OFF_HINT_RE.search(line):
+            for rx, what in _VERIFY_OFF_RES:
+                if rx.search(line):
+                    _add_hit(hits, lines, lineno, "Verification disabled: " + what)
         for m in _TRUSTED_HOST_RE.finditer(line):
             value, _ = _first_value(code, i, m.end())
             if value and _is_local_host(_host_of(value)):
@@ -4431,10 +5634,11 @@ def _analyze_verification_disabled(ctx):
                 "certificate checks" % shown,
             )
     waived_lines, waived_argvs = {}, {}
-    for tokens in _logical_lines(code, _skip_config_line, _CURL_OR_COSIGN_RE):
+    code_skips = [_skip_config_line(c) for c in code]
+    for tokens in _logical_lines(code, code_skips, _CURL_OR_COSIGN_RE):
         if tokens:
             _check_command_tokens(tokens, hits, lines, waived_lines)
-    for tokens in _logical_lines(code, _skip_config_line, _WGET_RE):
+    for tokens in _logical_lines(code, code_skips, _WGET_RE):
         if tokens:
             _wget_waivers(tokens, waived_lines)
     if not (_is_github_workflow(ctx) or _is_github_action(ctx)):
@@ -4582,17 +5786,20 @@ def _index_message(opt, value):
 
 
 def _analyze_dependency_source(ctx):
-    if _file_ext(ctx) not in _CONFIG_TXT_EXTS:
+    if _file_ext(ctx) not in _CONFIG_TXT_EXTS and not _kind_enabled(ctx, "PG020"):
         return {}
     lines = _ctx_lines(ctx)
     pg008 = None
     urls_table = None
     hits = {}
-    code = [_code_text(l, ctx) for l in lines]
+    code = _config_code(lines, ctx)
+    skips = _raw_skips(ctx, lines)
     for i, raw in enumerate(lines):
-        if _skip_config_line(raw):
+        if skips[i]:
             continue
         line = code[i]
+        if not line:
+            continue  # comment-only or blank: no pattern below matches ""
         lineno = i + 1
         for m in _INDEX_OPT_RE.finditer(line):
             value, _ = _first_value(code, i, m.end())
@@ -4651,7 +5858,7 @@ RULES = [
     Rule(
         "PG002",
         "high",
-        "Embedded role override (SYSTEM:/ASSISTANT:) inside untrusted content",
+        "Embedded role override (SYSTEM:/ASSISTANT:/DEVELOPER:/TOOL:, ChatML/Llama role tokens, <system> tags) inside untrusted content",
         _detect_system_override,
     ),
     Rule(
