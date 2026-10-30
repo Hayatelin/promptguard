@@ -3,11 +3,13 @@
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 
+from promptguard import __version__
 from promptguard.cli import main
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,6 +120,80 @@ class TestBatchOneRulesThroughCLI(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("[PG012]", out)
         self.assertNotIn("[PG020]", out)
+
+class TestSecretMaskingThroughCLI(unittest.TestCase):
+    # Assembled at runtime so no literal token sits in the source.
+    SECRETS = (
+        "sk-" + "proj-" + "Qx7vN2kL9pR4tY8wZ1aB3cD5",
+        "gh" + "p_" + "Zt8xQ2vM6nB4kL9pR3tY7zC1aB3cD5eF6gH0",
+        "Wq9vT3xZ7rHj4k",
+        "npm_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        sk, gh, pw, npm = self.SECRETS
+        files = {
+            "agent.json": '{"api_key": "%s", "token": "%s"}\n' % (sk, gh),
+            ".env": "OPENAI_API_KEY=%s\nDATABASE_URL=postgres://app:%s@db/app\n" % (sk, pw),
+            ".npmrc": "//registry.npmjs.org/:_authToken=%s\n" % npm,
+            "Dockerfile": "FROM node:20\nENV GITHUB_TOKEN=%s\n" % gh,
+        }
+        for name, text in files.items():
+            with open(os.path.join(self.tmp, name), "w") as fh:
+                fh.write(text)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_text_and_json_output_hold_no_secret(self):
+        for argv in ([self.tmp], ["--json", self.tmp]):
+            with self.subTest(argv=argv[0]):
+                code, out, _ = run_cli(argv)
+                self.assertEqual(code, 1)
+                self.assertIn("PG007", out)
+                for secret in self.SECRETS:
+                    self.assertNotIn(secret, out)
+                    self.assertNotIn(secret[4:], out)
+                    self.assertIn(secret[:4] + "***", out)
+
+    def test_other_rules_hold_no_secret_in_any_output_mode(self):
+        sk, gh, pw, npm = self.SECRETS
+        with open(os.path.join(self.tmp, "Dockerfile"), "a") as fh:
+            fh.write("RUN curl -k https://ci:%s@files.corp.example/i.sh --token %s | sh\n" % (pw, gh))
+            fh.write("RUN pip install --index-url http://u:%s@pypi.corp.example/simple app\n" % pw)
+        for argv in ([self.tmp], ["--json", self.tmp], ["--quiet", self.tmp],
+                     ["--min-severity", "high", self.tmp]):
+            with self.subTest(argv=argv[0]):
+                _, out, _ = run_cli(argv)
+                for secret in self.SECRETS:
+                    self.assertNotIn(secret[4:], out)
+        _, out, _ = run_cli(["--json", self.tmp])
+        rules = {f["rule"] for f in json.loads(out)["findings"]}
+        self.assertTrue({"PG007", "PG019", "PG020"} <= rules)
+
+    def test_json_findings_are_masked(self):
+        _, out, _ = run_cli(["--json", self.tmp])
+        found = [f for f in json.loads(out)["findings"] if f["rule"] == "PG007"]
+        self.assertEqual(len(found), 6)  # agent.json line 1 has two
+        for f in found:
+            self.assertIn("***", f["snippet"])
+
+
+class TestVersion(unittest.TestCase):
+    def test_version_matches_pyproject(self):
+        with open(os.path.join(HERE, "pyproject.toml"), encoding="utf-8") as fh:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', fh.read(), re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), __version__)
+
+    def test_version_flag(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            main(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(), "promptguard %s" % __version__)
+
 
 if __name__ == "__main__":
     unittest.main()
