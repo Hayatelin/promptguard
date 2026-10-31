@@ -155,19 +155,63 @@ looks for structured tokens (`AKIA…`, `sk-…`, `ghp_…`, `github_pat_…`,
 not for passwords or generic `KEY=value` / `"key": "value"` assignments. A
 local `.env` is scanned even when git ignores it.
 
-Findings mask the secrets promptguard recognizes (PG007 formats,
-credential-named values, URL passwords and secret query parameters) on the
-same line: in the message and snippet of every rule, each such value keeps its
-first four characters followed by `***` (values shorter than eight characters
-become `***`), in the text and the `--json` output alike. Credential-named
-values include the admin credential names of PG018 (such as
-`SUPABASE_SERVICE_ROLE_KEY`) even when the value is plain hex; secret query
-parameters are `key`, `token`, `access_token`, `api_key`, `apikey`, `secret`,
-`client_secret`, `password`, `pwd`, `sig`, `signature` and `auth` (and other
-credential-named parameters); a URL password runs up to the last `@` before
-the host. Masking is not complete: values in formats promptguard does not
-recognize (such as an HTTP client's `-u user:pass`, `docker login -p`, or a
-cookie) and a value repeated on another line are shown as written.
+Findings mask the secrets promptguard recognizes: PG007 formats,
+credential-named values, URL passwords, secret query parameters, the password
+of `-u` / `--user user:pass` and the cookies of `-b` / `--cookie` in a command
+line of the libcurl client (its name on the line itself or on the lines that
+line continues with a trailing `\`), the password of `login ... -p` (and
+`--password`), and cookie values (`Cookie:` / `Set-Cookie:` headers).
+In the message and snippet of every rule, each such value keeps its first four
+characters followed by `***`, and a value shorter than eight characters
+becomes `***`, in the text and the `--json` output alike. A value found on one
+line is also masked where it appears in the findings of any other line of the
+same file, before or after it, when it looks like a secret: it holds a digit,
+both upper- and lower-case letters, or a character other than a letter.
+
+`-p` counts only when a `login` word of the same command comes before it, with
+nothing but flags, flag values and registry hosts in between (`docker login -u
+me -p X` and `["login", "-p", "X"]` are masked; `ssh -p 2222` and `cp -p file`
+on a line that also says login are not). A value ends at whitespace, a quote or
+an escaped quote (`\"`, `\'`, `\\\"`, as inside a JSON string): `"pw"`,
+`\"pw\"` and `API_TOKEN=\"pw\"` mask `pw` and keep the quotes and
+backslashes. A run of `` ` `` `,` `.` `;` `)` `]` or `\` at the end of a value
+is not part of it when whitespace, a quote, a backtick or the end of the line
+follows, and `](` ends a value (a Markdown link): `(-u me:pw)`, `-u me:pw,`
+and `[-u me:pw](https://x)` keep their punctuation. The same characters inside
+a value are masked with it.
+
+Credential-named values include the admin credential names of PG018 (such as
+`SUPABASE_SERVICE_ROLE_KEY`) even when the value is plain hex, and are masked
+whatever their length in JSON, YAML, `.env`, unquoted assignments and
+command-line flags (`--token ab` shows `--token ***`). Left as written:
+references (`$TOKEN`, `${DB_PASSWORD}`, `%API_KEY%`, `<your-key>`, `%s`) and,
+when the value is not in quotes and shorter than eight characters, `true`,
+`false`, `null`, `none`, `nil`, `yes`, `no`, `on`, `off`, `~`, `-`, the YAML
+block markers `|` `>` `|-` `>-` `|+` `>+`, and the head of a template or call
+(`${{ secrets.X }}`, `x(...)`); a quoted value (`"password": "no"`) is masked.
+Secret query parameters are `key`, `token`, `access_token`, `api_key`,
+`apikey`, `secret`, `client_secret`, `password`, `passwd`, `pass`, `pwd`,
+`pw`, `sig`, `signature` and `auth` (and other credential-named parameters);
+the name alone decides, so `?key=mainkeyfile` shows `?key=main***`. Values of
+`password`, `pw`, `pwd`, `pass`, `passwd`, `token`, `access_token`, `secret`,
+`client_secret`, `api_key` and `apikey` (in any case) are masked at any length
+(`?pw=abc` shows `?pw=***`); the other names need eight or more characters.
+Empty values, references (`?token=$TOKEN`), templates
+(`?token={{ secrets.T }}`) and the short literals above (`?secret=none`) are
+left as written. A URL password runs up to the `@` before the host:
+comma-separated URLs are taken one by one, an `@` in a path (`/@scope/pkg`) or
+after the host (`?email=x@y.com`) is not part of it, and a password may start
+with `/`. Cookie attributes (`Path`, `Domain`, `Expires` ...) are not masked.
+
+Masking is not complete: values in formats promptguard does not recognize
+(such as HTTPie's `-a user:pass`, `mysql -pPASSWORD`, or `-u user:pass`
+outside a libcurl command line) are shown as written, and so is a password
+that holds whitespace, an escaped quote, or spliced quotes
+(`'ab'\''cd'`). A password made only of letters in one case (`hunterxyz`,
+`ADMINPASS`) is masked on its own line but not where it is repeated on other
+lines; on other lines a value is also looked for only when it is five or more
+characters long, or in URL-password position (`:pw@`). A URL password that
+starts with `/` is not looked for without that `/`.
 
 ## Usage in CI
 

@@ -3475,7 +3475,8 @@ class TestSecretQueryParameterMasking(unittest.TestCase):
             "?token=${API_TOKEN}",
             "?key={{api_key}}",
             "?token=%API_TOKEN%",
-            "?token=short",
+            "?key=short",
+            "?sig=abc",
             "?keyword=abcdefghijk&sort_key=created_at_desc",
         ):
             line = "curl -k https://h.example/x%s" % query
@@ -3519,7 +3520,9 @@ class TestUrlPasswordWithAt(unittest.TestCase):
             "curl -k https://deploy@files.example/a@b.example",
             "curl -k http://localhost:8080/api/user@example.com",
             "curl -k http://[::1]:8080/x@y.example",
-            "curl -k http://host:/x@y.example",
+            # v1.1.1: "http://host:/x@y.example" left this list. A password may
+            # start with "/" (https://user:/abc123@host), and the two shapes
+            # cannot be told apart; it is now masked (test_masking_v111).
         ):
             with self.subTest(line=line):
                 found = only(scan_text(line + "\n", path="a.md"), "PG004")

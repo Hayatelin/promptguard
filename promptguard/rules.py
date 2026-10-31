@@ -604,19 +604,94 @@ def _detect_secret(line, ctx):
 # Secret masking: findings mask the secrets recognized on their line. Every
 # value on the line that a PG007 pattern would read as a secret, every value
 # of a credential-named key (PG007 key names, PG018 admin credential names),
-# every URL password and every secret query parameter is replaced by its
-# first four characters + "***" ("***" alone when shorter than 8
+# every URL password, every secret query parameter, the password of
+# `curl -u user:pass` and `docker login -p`, and cookie values are replaced by
+# their first four characters + "***" ("***" alone when shorter than 8
 # characters): by PG007 itself, and for every rule by the scanner
-# (mask_line_findings). Other formats and values repeated on other lines are
-# not masked.
+# (mask_line_findings). A value found on one line is also masked where it
+# appears in the findings of any other line of the same file
+# (file_mask_values / file_mask_tables).
 # ---------------------------------------------------------------------------
 
 _MASK = "***"
 # Quoted value of a secret-looking key ("token": "...", password='...').
-# Masking only: the detectors keep their own quoted-value pattern.
+# Masking only: the detectors keep their own quoted-value pattern. No length
+# cap: every candidate starts at a quote right after ":" / "=" and the value
+# stops at the next quote or space, so the scans do not overlap (linear).
+# Inside a JSON / shell string a quote may be escaped: \"value\" and \'value\'
+# are quoted values too (the backslash is left readable, not masked).
+# A value opened by a plain quote keeps its escapes ("pa\"ss" is one value;
+# it still ends at the next plain quote, so the scans stay linear). In a
+# lookahead: {"c": "API_TOKEN=\"pw\""} is tried at "c" and at API_TOKEN.
 _QUOTED_ASSIGN_RE = re.compile(
-    r"""(?<![\w.-])["']?([A-Za-z_][\w.-]{0,80})["']?[ \t]*[:=][ \t]*(["'])([^"'\s]{1,512})\2"""
+    r"""(?<![\w.-])(?=\\{0,3}["']?([A-Za-z_][\w.-]{0,80})\\{0,3}["']?[ \t]*[:=][ \t]*(\\{1,3})?(["'])"""
+    r"""((?(2)(?:[^"'\s\\]|\\(?!\\{0,2}["']))+|(?:[^"'\s\\]|\\\S)+))(?(2)\\{1,3})\3)"""
 )
+# Unquoted credential-named value after "=" (masking only, any length; the
+# detector's _ASSIGN_EQ_RE keeps its 8-character minimum). A value never
+# starts with an escaped quote and stops before one (API_TOKEN=\"pw\").
+_MASK_EQ_RE = re.compile(
+    r"(?<![\w.-])([A-Za-z_][\w.-]{0,80})[ \t]*=[ \t]*(?!\\{1,3}[\"'])"
+    r"((?:[^\s\"'`,;{}\[\]()<>=\\]|\\(?!\\{0,2}[\"']))+={0,2})"
+)
+# Values shorter than 8 characters that are not secrets: YAML / JSON literals
+# and block indicators (password: false, token: null, secret: |).
+_SHORT_NON_SECRETS = frozenset((
+    "true", "false", "null", "none", "nil", "yes", "no", "on", "off", "~",
+    "|", ">", "|-", ">-", "|+", ">+", "-",
+))
+# curl -u / --user user:password (the password part; -u alone prompts).
+# The raw value runs to whitespace, a quote or an escaped quote (\" \');
+# _value_end() then cuts the punctuation that ends it in text.
+_CURL_USER_RE = re.compile(
+    r"(?<![\w-])(?:-u|--user)(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+    r"([^\s\"':\\]*):((?:[^\s\"'\\]|\\(?!\\{0,2}[\"']))+)"
+)
+# docker / podman / helm ... login -p X (--password X is a credential flag).
+_LOGIN_P_RE = re.compile(
+    r"(?<![\w-])-p(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+    r"((?:[^\s\"'`|&;<>()\\]|\\(?!\\{0,2}[\"']))+)"
+)
+# Cookie header (Cookie: / Set-Cookie: / "Cookie": "...") and curl -b /
+# --cookie: the start of the name=value list.
+_COOKIE_HEADER_RE = re.compile(
+    r"(?<![\w-])(?:set-)?cookie\\{0,3}[\"']?[ \t]*:[ \t]*(?:\\{0,3}[\"'])?", re.IGNORECASE
+)
+_COOKIE_FLAG_RE = re.compile(
+    r"(?<![\w-])(?:-b|--cookie)(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+)
+_COOKIE_PAIR_RE = re.compile(
+    r"[ \t]*([^\s=;,\"'\\]+)=((?:[^;\s\"'`\\]|\\(?!\\{0,2}[\"']))*)[ \t]*;?"
+)
+# Value boundary (curl -u, login -p, cookie values): punctuation that ends a
+# value in prose or markup is not part of it. A run of these characters at
+# the end of the raw value is cut when whitespace, a quote, a backtick or the
+# end of the line follows it (`curl -u a:pw`, (curl -u a:pw), -u a:pw; and
+# `-u a:pw,` keep the comma, paren and backtick readable), and "](" ends a
+# Markdown link target ([curl -u me:pw](https://x)). The same characters
+# inside a value (pa,ss  pa)ss) are kept: masking over-covers a secret, it
+# never splits one in the middle.
+_VALUE_END_PUNCT = frozenset("`,.;)]\\")
+
+
+def _value_end(line, start, end):
+    """End of the value line[start:end] once trailing punctuation is cut."""
+    link = line.find("](", start, end)
+    if link > start:
+        end = link
+    cut = end
+    while cut > start and (line[cut - 1] in _VALUE_END_PUNCT or line[cut - 1] in "|&<>("):
+        cut -= 1
+    nxt = line[end:end + 1]
+    if cut < end and (not nxt or nxt.isspace() or nxt in "\"'`\\];|&<>()"):
+        return cut
+    return end
+_COOKIE_ATTRS = frozenset((
+    "path", "domain", "expires", "max-age", "samesite", "secure", "httponly",
+    "priority", "partitioned",
+))
+_CURL_WORD_RE = re.compile(r"\bcurl\b", re.IGNORECASE)
+_LOGIN_WORD_RE = re.compile(r"\blogin\b", re.IGNORECASE)
 _PEM_BODY_END_RE = re.compile(r"""\\[nr]|-----|["']""")
 _PEM_LEAD_AT_RE = re.compile(r"""(?:\s|\\[nr]|["',])*""")  # _PEM_LEAD_RE at a position
 _PEM_BODY_RUN_RE = re.compile(r"[A-Za-z0-9+/]{16,}")
@@ -626,10 +701,12 @@ _PEM_BODY_RUN_RE = re.compile(r"[A-Za-z0-9+/]{16,}")
 # The groups sit in a lookahead so overlapping candidates are all tried
 # (`ENV ENV DB_PASSWORD pw`, `x: password: pw`).
 _MASK_COLON_RE = re.compile(
-    r"(?<![\w.-])(?=([A-Za-z_][\w.-]{0,80})[ \t]*:[ \t]+([^\s\"'`,;{}\[\]()<>]{8,}))"
+    r"(?<![\w.-])(?=([A-Za-z_][\w.-]{0,80})[ \t]*:[ \t]+(?!\\{1,3}[\"'])"
+    r"((?:[^\s\"'`,;{}\[\]()<>\\]|\\(?!\\{0,2}[\"']))+))"
 )
 _MASK_DOCKER_RE = re.compile(
-    r"(?<![\w.-])(?:ENV|ARG)[ \t]+(?=([A-Za-z_][\w.-]{0,80})[ \t]+([^\s\"'`=]{8,}))",
+    r"(?<![\w.-])(?:ENV|ARG)[ \t]+(?=([A-Za-z_][\w.-]{0,80})[ \t]+(?:\\{0,3}[\"'])?(?!\\{1,3}[\"'])"
+    r"((?:[^\s\"'`=\\]|\\(?!\\{0,2}[\"']))+))",
     re.IGNORECASE,
 )
 # Password of any scheme://user:password@host userinfo (_url_password_spans).
@@ -637,15 +714,38 @@ _MASK_DOCKER_RE = re.compile(
 _URL_SCHEME_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
 )
-_URL_USER_RE = re.compile(r"[^\s:/@\"'<>]*:")
+# The user part stops at "," too: https://a.example,https://u:pw@b.example
+# is two URLs, not the user "a.example,https".
+_URL_USER_RE = re.compile(r"[^\s:/@\"'<>,]*:")
 _URL_RUN_END_RE = re.compile(r"[\s\"'<>]")
-_URL_PORT_RE = re.compile(r"[0-9]+[/?#]|/")  # host:8080/path, not a password
+_URL_PORT_RE = re.compile(r"[0-9]+[/?#]")  # host:8080/path, not a password
+# A host after "@": name with a dot, localhost or [IPv6], optional port, then
+# a path / query / fragment or the end of the URL.
+_URL_HOST_AT_RE = re.compile(
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|localhost)(?::[0-9]+)?(?=[/?#]|$)"
+)
 # Secret query parameters: ?token=..., &api_key=..., &amp;sig=..., \u0026key=...
 _QUERY_PARAM_RE = re.compile(r"(?:[?&]|&amp;|\\u0026)([A-Za-z_][\w.-]{0,63})=")
-_QUERY_VALUE_RE = re.compile(r"[^\s&\"'<>`\\]{8,}")
+# Query value length rule (the one place to change it): a secret query
+# parameter value needs _QUERY_VALUE_MIN characters (?key=, ?sig=, ?auth= ...),
+# except for the password / token names of _QUERY_SHORT_NAMES, whose shorter
+# values become "***" too (?pw=abc). References ($VAR, ${VAR}), template
+# heads ({{ ... }}), empty values and the short literals of _SHORT_NON_SECRETS
+# (?secret=none) are left as written.
+_QUERY_VALUE_MIN = 8
+_QUERY_SHORT_NAMES = frozenset((
+    "password", "pw", "pwd", "pass", "passwd", "token", "access_token", "secret",
+    "client_secret", "api_key", "apikey",
+))
+_QUERY_VALUE_RE = re.compile(r"[^\s&\"'<>`\\]+")
+
+
+def _query_value_min(name):
+    """Shortest masked value of the secret query parameter `name`."""
+    return 1 if name.lower() in _QUERY_SHORT_NAMES else _QUERY_VALUE_MIN
 _QUERY_SECRET_NAMES = frozenset((
     "key", "token", "access_token", "api_key", "apikey", "secret", "client_secret",
-    "password", "pwd", "sig", "signature", "auth",
+    "password", "passwd", "pass", "pwd", "pw", "sig", "signature", "auth",
 ))
 _TEMPLATE_REF_RE = re.compile(r"\{\{[^{}]*\}\}")
 # Admin credential names (PG018) may hold "pat" without any other key word.
@@ -656,7 +756,8 @@ _ADMIN_HINT_RE = re.compile(r"admin|root|superuser|service|master|global", re.IG
 # JSON argument list "--password", "X") and Authorization header credentials
 # (Bearer / Basic, with a digit).
 _FLAG_VALUE_RE = re.compile(
-    r"(?<![\w-])--?([A-Za-z][\w-]{0,40})(?:=|[ \t]+|[\"'][ \t]*,[ \t]*)[\"']?([^\s\"'`,;|&<>()\[\]{}$/~.-][^\s\"'`,;|&<>()\[\]{}]{7,})"
+    r"(?<![\w-])--?([A-Za-z][\w-]{0,40})(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+    r"([^\s\"'`,;|&<>()\[\]{}$/~.\\-](?:[^\s\"'`,;|&<>()\[\]{}\\]|\\(?!\\{0,2}[\"']))*)"
 )
 _AUTH_VALUE_RE = re.compile(
     r"\b(?:Bearer|Basic)[ \t]+((?=[A-Za-z0-9._~+/-]*[0-9])[A-Za-z0-9._~+/-]{8,}=*)",
@@ -736,40 +837,212 @@ def _secret_spans(line, ctx):
     # Values recognized by their key, flag or URL position: a bare reference
     # ($TOKEN, ${DB_PASSWORD}, %API_KEY%, <your-key>, %s) is left readable.
     if "://" in line and "@" in line:
+        # host:8080?email=x@y.com is a port and a query, not a password.
         spans.extend(m.span(2) for m in _CONN_STRING_RE.finditer(line)
-                     if not _REFERENCE_RE.fullmatch(m.group(2)))
+                     if not _REFERENCE_RE.fullmatch(m.group(2))
+                     and not _URL_PORT_RE.match(m.group(2)))
         spans.extend(_url_password_spans(line))
     if "=" in line and ("?" in line or "&" in line or "\\u0026" in line):
         spans.extend(_query_secret_spans(line, ctx))
     if "-" in line:
         for m in _FLAG_VALUE_RE.finditer(line):
             name = m.group(1)
-            if (_is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]
-                    or _admin_value_name(name)):
+            if ((_is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]
+                    or _admin_value_name(name)) and _maskable_value(line, *m.span(2))):
                 spans.append(m.span(2))
+        lower = line.lower()
+        # A continuation line (the previous line ends with "\") belongs to
+        # the command started on the lines before it.
+        prev = None
+        curl = "curl" in lower and _CURL_WORD_RE.search(line) is not None
+        if not curl and ("-u" in line or "--user" in line or "-b" in line):
+            prev = _continued_command(line, ctx)
+            curl = "curl" in prev.lower() and _CURL_WORD_RE.search(prev) is not None
+        if curl:
+            for m in _CURL_USER_RE.finditer(line):
+                start = m.start(2)
+                end = _value_end(line, start, m.end(2))
+                # -u 1000:1000 is a uid:gid (docker / sudo shapes), not curl's.
+                if m.group(1).isdigit() and line[start:end].isdigit():
+                    continue
+                if end > start and _maskable_value(line, start, end):
+                    spans.append((start, end))
+            for m in _COOKIE_FLAG_RE.finditer(line):
+                spans.extend(_cookie_value_spans(line, m.end()))
+        elif "--cookie" in lower:
+            for m in _COOKIE_FLAG_RE.finditer(line):
+                if m.group().startswith("--"):
+                    spans.extend(_cookie_value_spans(line, m.end()))
+        if "-p" in line:
+            if prev is None and not ("login" in lower and _LOGIN_WORD_RE.search(line)):
+                prev = _continued_command(line, ctx)
+            spans.extend(_login_password_spans(line, prev or ""))
+    if "ookie" in line or "OOKIE" in line:
+        for m in _COOKIE_HEADER_RE.finditer(line):
+            spans.extend(_cookie_value_spans(line, m.end()))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
         spans.extend(m.span(1) for m in _AUTH_VALUE_RE.finditer(line))
     # Credential-named values: what PG007 reads by key name, and the admin
     # credential names of PG018 (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT), whatever
-    # the value looks like (PG007 does not report a plain hex value).
+    # the value looks like (PG007 does not report a plain hex value) and
+    # whatever its length (a short value becomes "***").
     if _SECRET_KEY_HINT_RE.search(line) or ("pat" in line.lower() and _PAT_WORD_RE.search(line)):
-        for rx in (_MASK_DOCKER_RE, _MASK_COLON_RE, _ASSIGN_EQ_RE):
+        for rx in (_MASK_DOCKER_RE, _MASK_COLON_RE, _MASK_EQ_RE):
             for m in rx.finditer(line):
                 value = m.group(2)
-                if ("://" not in value and not _REFERENCE_RE.fullmatch(value)
+                if rx is _MASK_EQ_RE and line[m.start(1) - 1:m.start(1)] in ("?", "&", ";"):
+                    # A URL query parameter: _query_secret_spans, whose value
+                    # stops at "&" (8+ characters).
+                    continue
+                if ("://" not in value and _maskable_value(line, *m.span(2))
                         and _mask_key(m.group(1), ctx)):
                     spans.append(m.span(2))
         for m in _QUOTED_ASSIGN_RE.finditer(line):
-            value = m.group(3)
+            value = m.group(4)
             if _REFERENCE_RE.fullmatch(value):
                 continue
             if _is_secret_key(m.group(1), ctx) or (len(value) >= 8 and _admin_value_name(m.group(1))):
-                spans.append(m.span(3))
+                spans.append(m.span(4))
     return spans
 
 
 def _mask_key(name, ctx):
     return _is_secret_key(name, ctx) or _admin_value_name(name)
+
+
+def _maskable_value(line, start, end):
+    """Is line[start:end], found in a credential position, a value to mask?
+
+    Not a bare reference ($TOKEN, ${DB_PASSWORD}, <your-key>). A value of
+    eight or more characters is always masked; a shorter one unless it is a
+    YAML / JSON literal or block indicator (false, null, |) or the head of a
+    template (`$` of `${{ secrets.X }}`, `x` of `x(...)`).
+    """
+    value = line[start:end]
+    if not value or _REFERENCE_RE.fullmatch(value):
+        return False
+    if len(value) >= 8:
+        return True
+    if value.lower() in _SHORT_NON_SECRETS:
+        return False
+    return line[end:end + 1] not in ("{", "(", "[", "<")
+
+
+def _cookie_value_spans(line, pos):
+    """Value spans of the name=value; name=value list starting at `pos`.
+
+    Cookie attributes (Path=/, Domain=..., Expires=...) are left readable.
+    """
+    spans = []
+    while True:
+        m = _COOKIE_PAIR_RE.match(line, pos)
+        if m is None or m.end() == pos:
+            return spans
+        start = m.start(2)
+        end = _value_end(line, start, m.end(2))
+        if (end > start and m.group(1).lower() not in _COOKIE_ATTRS
+                and _maskable_value(line, start, end)):
+            spans.append((start, end))
+        if end < m.end(2):
+            return spans  # the list ended in punctuation: (Cookie: a=b), ...
+        pos = m.end()
+
+
+# Where a command ends: the next one may hold another "-p" (ssh -p 2222).
+_COMMAND_SEP_RE = re.compile(r"[;|&`()\n]|(?<![\"']),[ \t]")
+# How many lines back a "\" continuation is followed (bounds the cost of a
+# file where every line ends with "\").
+_CONTINUATION_LOOKBACK = 20
+
+
+def _continued_command(line, ctx):
+    """The text of the lines this line continues ("\\" at their end), or "".
+
+    Only the scanned line itself (ctx["lines"][ctx["lineno"] - 1]) has
+    previous lines; a message or snippet masked with the same ctx has none.
+    """
+    if ctx is None:
+        return ""
+    lines = ctx.get("lines")
+    idx = ctx.get("lineno")
+    if not lines or not idx or idx < 2 or idx > len(lines) or lines[idx - 1] is not line:
+        return ""
+    parts = []
+    i = idx - 2
+    while i >= 0 and len(parts) < _CONTINUATION_LOOKBACK and lines[i].endswith("\\"):
+        parts.append(lines[i][:-1])
+        i -= 1
+    return " ".join(reversed(parts))
+
+
+def _login_password_spans(line, prev):
+    """Value spans of `login ... -p X` (docker / podman / helm registry ...).
+
+    The "-p" counts only when a "login" word comes before it in the same
+    command (on this line, or on the lines it continues), with nothing but
+    flags, flag values and registry hosts in between: `ssh -p 2222` and
+    `cp -p file` next to the word login are not passwords.
+    """
+    spans = []
+    if "login" not in line.lower() and "login" not in prev.lower():
+        return spans
+    # One pass: the text between two "-p" is read once (linear).
+    state = _login_state(prev, _NO_LOGIN)
+    pos = 0
+    for m in _LOGIN_P_RE.finditer(line):
+        state = _login_state(line[pos:m.start()], state)
+        pos = m.end()
+        if not state[0]:
+            continue
+        state = (True, False, state[2])  # still the login command after "-p X"
+        start = m.start(1)
+        end = _value_end(line, start, m.end(1))
+        if end > start and _maskable_value(line, start, end):
+            spans.append((start, end))
+    return spans
+
+
+# (inside a login command, next word is a flag value, a bare registry name
+# may still follow: only after `docker login`, `podman login`, ...)
+_NO_LOGIN = (False, False, False)
+_REGISTRY_LOGIN_RE = re.compile(
+    r"\b(?:docker|podman|nerdctl|buildah|skopeo|oras|finch|helm(?:[\s\"',]){1,6}registry)"
+    r"(?:[\s\"',:\[]|\bargs\b){1,16}login\Z",
+    re.IGNORECASE,
+)
+
+
+def _login_state(text, state):
+    """_login_password_spans state after `text`."""
+    last = None
+    for last in _COMMAND_SEP_RE.finditer(text):
+        pass
+    if last is not None:
+        text = text[last.end():]
+        state = _NO_LOGIN
+    found = None
+    for found in _LOGIN_WORD_RE.finditer(text):
+        pass
+    if found is not None:
+        bare = _REGISTRY_LOGIN_RE.search(text, 0, found.end()) is not None
+        text = text[found.end():]
+        state = (True, False, bare)
+    if not state[0]:
+        return _NO_LOGIN
+    flag_value, bare = state[1], state[2]
+    for word in text.split():
+        word = word.strip("\"',[]\\")  # JSON argv: "login", "-u", "x", "-p"
+        if not word:
+            continue
+        if word.startswith("-"):
+            flag_value = "=" not in word
+        elif flag_value or "." in word or ":" in word:
+            flag_value = False  # a flag's value or a registry host
+        elif bare:
+            bare = False  # one bare registry name: docker login localhost -p x
+        else:
+            return _NO_LOGIN
+    return (True, flag_value, bare)
 
 
 def _admin_value_name(name):
@@ -780,13 +1053,18 @@ def _admin_value_name(name):
 def _url_password_spans(line):
     """Password spans of every scheme://user:password@host on the line.
 
-    The password runs to the last "@" of the URL (a password may hold "@",
-    ":", "/" or "#"), not counting an "@" right after "/" (npm /@scope/
-    paths). host:port/path and [IPv6]:port are not a user and a password.
+    A URL ends at whitespace, a quote, or where the next scheme:// of the same
+    run begins (https://a.example,https://u:pw@b.example is two URLs). The
+    password runs to the last "@" of the URL (a password may hold "@", ":",
+    "/" or "#"), not counting an "@" right after "/" (npm /@scope/ and
+    /home/u/@x/ paths), unless an earlier "@" is followed by a host and a
+    path, query or fragment holding that last "@" (?email=x@y.com,
+    /pkg@1.0). host:port/path and [IPv6]:port are not a user and a password.
+    Each URL is looked at once and the URLs of a run do not overlap: linear.
     """
     spans = []
     pos = 0
-    run_end = last_at = -1
+    run_end = -1
     while True:
         idx = line.find("://", pos)
         if idx < 0:
@@ -794,27 +1072,47 @@ def _url_password_spans(line):
         pos = idx + 3
         if not idx or line[idx - 1] not in _URL_SCHEME_CHARS or line.startswith("[", pos):
             continue
-        m = _URL_USER_RE.match(line, pos)
+        if pos >= run_end:
+            end = _URL_RUN_END_RE.search(line, pos)
+            run_end = end.start() if end else len(line)
+        m = _URL_USER_RE.match(line, pos, run_end)
         if m is None:
             continue
         start = m.end()
-        if start >= run_end:
-            # Every URL of one run (up to whitespace or a quote) ends at the
-            # same last "@": look it up once per run.
-            end = _URL_RUN_END_RE.search(line, start)
-            run_end = end.start() if end else len(line)
-            last_at = line.rfind("@", start, run_end)
-            while last_at > start and line[last_at - 1] == "/":
-                last_at = line.rfind("@", start, last_at)
-        if last_at <= start:
-            pos = max(pos, run_end)  # no password "@" after this point in the run
+        # This URL ends where the next scheme:// of the run starts.
+        url_end = run_end
+        nxt = line.find("://", start, run_end)
+        if nxt >= 0:
+            url_end = nxt
+            while url_end > start and line[url_end - 1] in _URL_SCHEME_CHARS:
+                url_end -= 1
+            if url_end > start and line[url_end - 1] == ",":
+                url_end -= 1
+        at = _url_password_end(line, start, url_end)
+        if at < 0 or _URL_PORT_RE.match(line, start, at):
             continue
-        if _URL_PORT_RE.match(line, start, last_at):
-            continue
-        value = line[start:last_at]
-        if not _REFERENCE_RE.fullmatch(value):
-            spans.append((start, last_at))
-        pos = max(pos, last_at)
+        if not _REFERENCE_RE.fullmatch(line[start:at]):
+            spans.append((start, at))
+        pos = max(pos, at)
+
+
+def _url_password_end(line, start, end):
+    """Position of the "@" that ends a URL password in line[start:end], or -1."""
+    last_at = line.rfind("@", start, end)
+    while last_at > start and line[last_at - 1] == "/":
+        last_at = line.rfind("@", start, last_at)
+    if last_at <= start:
+        return -1
+    # An earlier "@" followed by a host and then "/", "?" or "#" ends the
+    # userinfo: the later "@" sits in the path, query or fragment.
+    at = line.find("@", start, last_at)
+    while at >= 0:
+        if at > start and line[at - 1] != "/":
+            h = _URL_HOST_AT_RE.match(line, at + 1, end)
+            if h is not None and h.end() < last_at:
+                return at
+        at = line.find("@", at + 1, last_at)
+    return last_at
 
 
 def _query_secret_name(name, ctx):
@@ -836,10 +1134,15 @@ def _query_secret_spans(line, ctx):
         if not _query_secret_name(m.group(1), ctx):
             continue
         v = _QUERY_VALUE_RE.match(line, m.end())
-        if v is None:
+        if v is None or v.end() - v.start() < _query_value_min(m.group(1)):
             continue
         value = v.group()
         if _REFERENCE_RE.fullmatch(value) or _TEMPLATE_REF_RE.fullmatch(value):
+            continue
+        if len(value) < _QUERY_VALUE_MIN and (
+                value.startswith(("{", "$", "<")) or not _maskable_value(line, *v.span())):
+            # A short value: a template head (?token={{ secrets.T }}), a
+            # literal (?secret=none) or a reference, as in other formats.
             continue
         spans.append(v.span())
         last = v.end()
@@ -849,12 +1152,14 @@ def _query_secret_spans(line, ctx):
 # Every _secret_spans() source needs one of these literals: the key words of
 # _SECRET_KEY_HINT_RE (assignments, flags, the quoted api_key pattern), "pat"
 # (PG018 admin names), the sig / signature query parameters and the token /
-# URL / header hints. A text without any has nothing to mask.
+# URL / header hints, "pw=" (query parameter), "cookie", and "curl" / "login"
+# (curl -u / -b, docker login -p). A text without any has nothing to mask.
 # Matched against the lower-cased text (several times faster than one
 # case-insensitive alternation when thousands of short messages are masked).
 _MASK_HINT_RE = re.compile(
     r"secret|token|pass|pwd|key|credential|auth|akia|sk-|gh[pousr]_|github_pat_|k_live_|k_test_|"
-    r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws|sig=|signature="
+    r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws|sig=|signature=|pw=|"
+    r"cookie|curl|login"
 )
 
 
@@ -897,7 +1202,9 @@ def _mask_spans(line, ctx):
 
 
 def _mask_spans_uncached(line, ctx):
-    if not _has_mask_hint(line):
+    if not _has_mask_hint(line) and not (
+            "-" in line and _has_mask_hint(_continued_command(line, ctx))):
+        # (A "\" continuation line `  -u admin:pw \` holds no hint itself.)
         return line, []
     merged = []
     for start, end in sorted(_secret_spans(line, ctx)):
@@ -915,116 +1222,285 @@ def _mask_spans_uncached(line, ctx):
         pieces.append(_mask_value(value))
         pos = end
     pieces.append(line[pos:])
-    values.sort(key=len, reverse=True)
+    # One entry per distinct value (a line with thousands of URLs may repeat
+    # one password thousands of times), longest first.
+    values = sorted(dict.fromkeys(values), key=len, reverse=True)
     # A value found at one position may appear again elsewhere on the line
     # (API_KEY=abc... and later abc... again): mask every occurrence.
-    return _mask_fragment("".join(pieces), values), values
+    masked = "".join(pieces)
+    if len(values) <= 4 and not any(_may_reappear(masked, v) for v in values):
+        # The usual line: one or two values, none of them left in the
+        # masked line (building the fragment tables costs more than this).
+        return masked, values
+    return _mask_fragment(masked, values), values
 
 
-# (values list, long values, short values, values by 5-char prefix, len):
-# the tables for the values of the line being masked. Every finding on a line
-# masks its message against the same list, so the tables are built once per
-# line instead of once per finding (findings x values was quadratic).
-_FRAGMENT_TABLES = [None, None, None, None, -1]
+def _may_reappear(text, value):
+    """Could _mask_fragment(text, [value]) change `text`?"""
+    if len(value) < 5:
+        return ":" + value + "@" in text
+    return value[:5] in text
+
+
+# The tables _mask_fragment() reads for one values list: (key, (long values,
+# short values, values by 5-char prefix)). Every finding on a line masks its
+# message against the same list, so the tables are built once per line
+# instead of once per finding (findings x values was quadratic).
+# The cache key is a tuple copy of the list, compared by value, so a caller
+# may reuse or change a list it passed before: the 1.1.0 key (the list's
+# identity and length) returned stale tables after an in-place change that
+# kept the length. Comparing two tuples costs one pass over identical
+# elements, far less than rebuilding the tables. The file-level tables
+# (file_mask_tables) are built once per file and passed in explicitly.
+_FRAGMENT_TABLES = [None, None]
 
 
 def _fragment_tables(values):
+    key = tuple(values)
     cached = _FRAGMENT_TABLES
-    if cached[0] is values and cached[4] == len(values):
-        return cached[1], cached[2], cached[3]
+    if cached[0] == key:
+        return cached[1]
+    tables = _build_fragment_tables(key)
+    cached[:] = [key, tables]
+    return tables
+
+
+def _build_fragment_tables(values):
+    """(long values, short values, matcher) for _mask_fragment.
+
+    matcher = (5-character prefixes, value set, distinct lengths longest
+    first, sorted values): a full occurrence is one set lookup per length,
+    a cut-short prefix one bisect, whatever the number of values sharing a
+    prefix.
+    """
     long_values = [v for v in values if len(v) >= 5]
-    short_values = [v for v in values if len(v) < 5]
-    by_prefix = {}
-    for value in long_values:
-        by_prefix.setdefault(value[:5], []).append(value)
-    cached[:] = [values, long_values, short_values, by_prefix, len(values)]
-    return long_values, short_values, by_prefix
+    short_values = frozenset(v for v in values if len(v) < 5)
+    matcher = (
+        frozenset(v[:5] for v in long_values),
+        frozenset(long_values),
+        sorted(set(len(v) for v in long_values), reverse=True),
+        sorted(set(long_values)),
+    )
+    return long_values, short_values, matcher
 
 
-def _mask_fragment(text, values):
+def _mask_fragment(text, values, tables=None):
     """Mask raw secret `values` of a line inside another text (message, snippet).
 
     A full occurrence is masked, and so is a prefix of five or more characters
     cut short by the end of the text or by "..." (_short). A value shorter
     than five characters is masked only in URL-password position (":pw@").
+    `tables` (from file_mask_tables) replaces `values` when given.
     """
-    if not values or not text:
+    if not text:
         return text
-    long_values, short_values, by_prefix = _fragment_tables(values)
-    for value in short_values:
-        if ":" + value + "@" in text:
-            text = text.replace(":" + value + "@", ":" + _MASK + "@")
+    if tables is None:
+        if not values:
+            return text
+        tables = _fragment_tables(values)
+    long_values, short_values, matcher = tables
+    if short_values and ":" in text and "@" in text:
+        text = _mask_short_url_passwords(text, short_values)
     if not long_values:
         return text
+    prefixes, value_set, lengths, ordered = matcher
     n = len(text)
-    if len(long_values) <= 16:
-        # Few values: find the candidate positions with str.find.
+    if len(prefixes) <= 16:
+        # Few prefixes: find the candidate positions with str.find.
         starts = set()
-        for value in long_values:
-            i = text.find(value[:5])
+        for prefix in prefixes:
+            i = text.find(prefix)
             while i >= 0:
                 starts.add(i)
-                i = text.find(value[:5], i + 1)
+                i = text.find(prefix, i + 1)
         starts = sorted(starts)
     else:
-        starts = range(n - 4)  # many values: one dict lookup per position
+        starts = (i for i in range(n - 4) if text[i:i + 5] in prefixes)
     pieces = []
     pos = 0
+    dots = -1  # position of the first "..." at or after i + 5
     for i in starts:
-        if i < pos:
+        if i < pos or text[i:i + 5] not in prefixes:
             continue
-        best = None
-        for value in by_prefix.get(text[i:i + 5], ()):
-            k = 5
-            while k < len(value) and i + k < n and text[i + k] == value[k]:
-                k += 1
-            if (k == len(value) or i + k == n or text.startswith("...", i + k)) and (
-                best is None or k > best[0]
-            ):
-                best = (k, value)
-        if best is None:
+        best = 0
+        best_value = None
+        for size in lengths:
+            if i + size <= n and text[i:i + size] in value_set:
+                best, best_value = size, text[i:i + size]
+                break
+        # A prefix cut short by "..." or by the end of the text.
+        if dots < i + 5:
+            dots = text.find("...", i + 5)
+            if dots < 0:
+                dots = n + 1
+        for end in (dots, n):
+            if end <= n and end - i > best:
+                piece = text[i:end]
+                j = bisect.bisect_left(ordered, piece)
+                if j < len(ordered) and ordered[j].startswith(piece):
+                    best, best_value = end - i, ordered[j]
+                    break
+        if best_value is None:
             continue
         pieces.append(text[pos:i])
-        pieces.append(_mask_value(best[1]))
-        pos = i + best[0]
+        pieces.append(_mask_value(best_value))
+        pos = i + best
     pieces.append(text[pos:])
     return "".join(pieces)
 
 
-def mask_line_findings(line, ctx, results, cache=None):
+def _mask_short_url_passwords(text, short_values):
+    """Replace ":pw@" by ":***@" for every value pw (1-4 characters) of
+    `short_values`, longest value first at each ":".
+
+    One pass over the ":" of the text, at most four slices each: linear in
+    the text, whatever the number of values (one `in` test per value was
+    values x text length).
+    """
+    pieces = []
+    pos = 0
+    n = len(text)
+    i = text.find(":")
+    while 0 <= i < n:
+        nxt = i + 1
+        for size in (4, 3, 2, 1):
+            at = i + 1 + size
+            if text[at:at + 1] == "@" and text[i + 1:at] in short_values:
+                pieces.append(text[pos:i + 1])
+                pieces.append(_MASK)
+                pos = nxt = at
+                break
+        i = text.find(":", nxt)
+    if not pieces:
+        return text
+    pieces.append(text[pos:])
+    return "".join(pieces)
+
+
+def line_mask(line, ctx):
+    """(span-masked line, raw secret values longest first) for one line."""
+    return _mask_spans(line, ctx)
+
+
+def _file_mask_value(value):
+    """Is a value found on one line also masked in the findings of the
+    other lines of the file? (The one place to change the cross-line rule.)
+
+    Only values that look like secrets: with a digit, mixed upper and lower
+    case, or a character that is not a letter. A word of letters in one case
+    (required, production, hunterxyz, ADMINPASS), whatever its length, is
+    masked on its own line only: too many ordinary words would go elsewhere.
+    """
+    if not value.isalpha():
+        return True  # a digit or another non-letter character
+    # Letters only: spread when upper and lower case are mixed. Letters
+    # without case (CJK and the like) count as one case.
+    return any(c.isupper() for c in value) and any(c.islower() for c in value)
+
+
+def finding_text_filter(texts):
+    """A test line -> bool: could a value found on `line` be masked in `texts`
+    (the messages and snippets of a file's findings)?
+
+    _mask_fragment masks a value of five or more characters only where its
+    first five characters appear, and a shorter one only as ":pw@": a line
+    sharing no five-character run with the texts, and none of their ":pw@"
+    passwords, has no value worth collecting. Built once per file (linear
+    in the texts), tried on the lines without findings (linear in the line).
+    """
+    grams = set()
+    short = set()
+    for text in set(texts):
+        if not isinstance(text, str):
+            continue
+        grams.update(text[i:i + 5] for i in range(len(text) - 4))
+        if ":" in text and "@" in text:
+            i = text.find(":")
+            while i >= 0:
+                for size in (1, 2, 3, 4):
+                    if text[i + 1 + size:i + 2 + size] == "@":
+                        short.add(text[i + 1:i + 1 + size])
+                i = text.find(":", i + 1)
+    short = sorted(short) if len(short) <= 64 else None
+
+    def may_matter(line):
+        if short is None or any(s in line for s in short):
+            return True
+        return any(line[i:i + 5] in grams for i in range(len(line) - 4))
+
+    return may_matter
+
+
+def file_mask_tables(values):
+    """Tables masking, in the findings of every line of a file, the secret
+    values found on any of its lines (None when there are none).
+
+    `values` is an iterable of raw values (duplicates allowed); the tables
+    hold each distinct value once, longest first.
+    """
+    keep = sorted(
+        (v for v in dict.fromkeys(values) if _file_mask_value(v)), key=len, reverse=True
+    )
+    return _build_fragment_tables(keep) if keep else None
+
+
+def mask_line_findings(line, ctx, results, cache=None, file_tables=None, masked_line=None):
     """Mask secrets in every (message, snippet) found on `line`, any rule.
 
     The values are those _secret_spans() finds on the line: what PG007 reads
     as a secret (whether or not PG007 reports the line), credential-named
-    values, the password of every scheme://user:password@host and secret
-    query parameters. A snippet equal to the line becomes
-    the span-masked line. Any other text (a message, a snippet built from
-    part of the line or from another line) is span-masked on its own and
-    then has the line's raw values replaced (_mask_fragment). `cache` maps
-    a text to its span-masked form (messages repeat from line to line).
+    values, the password of every scheme://user:password@host, secret
+    query parameters, curl -u / docker login -p passwords and cookie values.
+    A snippet equal to the line becomes the span-masked line. Any other text
+    (a message, a snippet built from part of the line or from another line)
+    is span-masked on its own and then has the line's raw values replaced
+    (_mask_fragment). `file_tables` (file_mask_tables) then masks the values
+    found on any other line of the file. `masked_line` is line_mask(line,
+    ctx) when the caller already has it. `cache` maps a text to its
+    span-masked form (messages repeat from line to line).
     """
-    masked, values = _mask_spans(line, ctx)
+    masked, values = masked_line if masked_line is not None else _mask_spans(line, ctx)
     masked = masked.strip()
     stripped = line.strip()
     if cache is None:
         cache = {}
+    if file_tables is not None and values and all(
+            (v in file_tables[2][1]) if len(v) >= 5 else (v in file_tables[1]) for v in values):
+        # The file tables already hold every value of the line: one pass
+        # with them, and the messages (the same on many lines) are cached.
+        values = ()
     out = []
     for message, snippet in results:
         if snippet == stripped or snippet == masked:
             snippet = masked
+            if file_tables is not None:
+                snippet = _mask_fragment(snippet, None, file_tables)
         else:
-            snippet = _mask_other_text(snippet, values, ctx, cache)
-        out.append((_mask_other_text(message, values, ctx, cache), snippet))
+            snippet = _mask_other_text(snippet, values, ctx, cache, file_tables)
+        out.append((_mask_other_text(message, values, ctx, cache, file_tables), snippet))
     return out
 
 
-def _mask_other_text(text, values, ctx, cache):
+def _mask_other_text(text, values, ctx, cache, file_tables=None):
     if not isinstance(text, str) or not text:
         return text
+    if file_tables is not None and not values:
+        # Depends on the text alone: cached (messages repeat line after line).
+        key = (text,)
+        hit = cache.get(key)
+        if hit is None:
+            hit = cache[key] = _mask_fragment(
+                _mask_other_text(text, values, ctx, cache), None, file_tables
+            )
+        return hit
     hit = cache.get(text)
     if hit is None:
         hit = cache[text] = _mask_spans_uncached(text, ctx)[0]
-    return _mask_fragment(hit, values) if values else hit
+    if values:
+        hit = _mask_fragment(hit, values)
+    if file_tables is not None:
+        hit = _mask_fragment(hit, None, file_tables)
+    return hit
 
 
 def _key_segments(key):
@@ -1035,15 +1511,31 @@ def _is_public_key(segments):
     return any(s in _PUBLIC_KEY_SEGMENTS for s in segments)
 
 
+# _is_secret_key() results by key (all but a bare "auth", whose answer
+# depends on the file kind). Masking asks again for the same flag and key
+# names on line after line; the memo is cleared when it grows large.
+_SECRET_KEY_MEMO = {}
+
+
 def _is_secret_key(key, ctx=None):
+    hit = _SECRET_KEY_MEMO.get(key)
+    if hit is not None:
+        return hit
     segments = _key_segments(key)
-    # existingSecret / existing_secret (Helm charts) name a Secret object.
-    if not segments or _is_public_key(segments) or "existing" in segments:
-        return False
     if segments == ["auth"]:
         # npm `_auth=<base64 user:pass>`; elsewhere a bare `auth:` key usually
         # names a scheme (auth: oauth2-device-flow-v2).
         return key.lower() == "_auth" or (ctx is not None and _ctx_kind(ctx) == "npmrc")
+    if len(_SECRET_KEY_MEMO) > 4096:
+        _SECRET_KEY_MEMO.clear()
+    hit = _SECRET_KEY_MEMO[key] = _secret_key_segments(segments)
+    return hit
+
+
+def _secret_key_segments(segments):
+    # existingSecret / existing_secret (Helm charts) name a Secret object.
+    if not segments or _is_public_key(segments) or "existing" in segments:
+        return False
     last = segments[-1]
     return (
         last in _SECRET_KEY_LAST

@@ -9,6 +9,9 @@ from .rules import (
     RULES,
     SEVERITY_ORDER,
     config_file_kind,
+    file_mask_tables,
+    finding_text_filter,
+    line_mask,
     mask_line_findings,
     may_hold_secrets,
 )
@@ -142,11 +145,23 @@ def scan_text(text, path="<text>"):
     file_keys = [rule.detector.cache_key for rule in rules if hasattr(rule.detector, "cache_key")]
     line_rules = [rule for rule in rules if not hasattr(rule.detector, "cache_key")]
     hit_lines = None
-    mask_cache = {}
     maskable = may_hold_secrets(full_lower)
+    # Findings are masked once the whole file is read: a secret found on one
+    # line is also masked in the findings of every other line (before or
+    # after it). `pending` keeps each line with findings and its line_mask();
+    # `file_values` every value found on any line, ignored lines included.
+    # The values of a line without findings are only needed when some line
+    # has findings: such lines are kept in `quiet` and masked after the scan,
+    # only if `pending` is not empty and only when they share text with the
+    # findings (rules.finding_text_filter).
+    pending = []
+    file_values = {}
+    quiet = []
 
     for idx, line in enumerate(lines, start=1):
         if _IGNORE_RE.search(line):
+            if maskable and line:
+                quiet.append(idx)
             continue
         ctx["lineno"] = idx
         if hit_lines is None:
@@ -172,13 +187,43 @@ def scan_text(text, path="<text>"):
             if not results:
                 continue
             line_results.extend((rule, message, snippet) for message, snippet in results)
-        if not line_results:
-            continue
-        # Every finding masks the secrets recognized on its line. A file
-        # without any secret hint (rules.may_hold_secrets) has nothing to mask.
+        # Every finding masks the secrets recognized on its line and in the
+        # rest of the file. A file without any secret hint
+        # (rules.may_hold_secrets) has nothing to mask.
+        if not maskable:
+            if line_results:
+                pending.append((idx, line, line_results, None))
+        elif line_results:
+            masked_line = line_mask(line, ctx)
+            if masked_line[1]:
+                file_values.update(dict.fromkeys(masked_line[1]))
+            pending.append((idx, line, line_results, masked_line))
+        elif line:
+            quiet.append(idx)
+
+    file_tables = None
+    if maskable and pending:
+        may_matter = None
+        if quiet:
+            may_matter = finding_text_filter(
+                text for _idx, _line, results, _m in pending
+                for _rule, message, snippet in results for text in (message, snippet)
+            )
+        for idx in quiet:
+            line = lines[idx - 1]
+            if not may_matter(line):
+                continue
+            ctx["lineno"] = idx
+            values = line_mask(line, ctx)[1]
+            if values:
+                file_values.update(dict.fromkeys(values))
+        file_tables = file_mask_tables(file_values)
+    mask_cache = {}
+    for idx, line, line_results, masked_line in pending:
         pairs = [(message, snippet) for _rule, message, snippet in line_results]
         if maskable:
-            pairs = mask_line_findings(line, ctx, pairs, mask_cache)
+            ctx["lineno"] = idx
+            pairs = mask_line_findings(line, ctx, pairs, mask_cache, file_tables, masked_line)
         for (rule, _message, _snippet), (message, snippet) in zip(line_results, pairs):
             findings.append(
                 Finding(
