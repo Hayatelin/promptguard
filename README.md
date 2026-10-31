@@ -24,7 +24,8 @@
 Agents now read web pages, call shell tools, and connect to MCP servers — which
 means a config file can quietly hand an attacker the keys. **promptguard** is a
 fast, heuristic linter that flags the dangerous patterns before they reach
-production. No network calls, no dependencies, runs in CI in under a second.
+production. No network calls, no dependencies; a typical project scans in well
+under a second (an extreme 400 KB single line takes about 2–3 seconds).
 
 ## Demo
 
@@ -154,11 +155,19 @@ looks for structured tokens (`AKIA…`, `sk-…`, `ghp_…`, `github_pat_…`,
 not for passwords or generic `KEY=value` / `"key": "value"` assignments. A
 local `.env` is scanned even when git ignores it.
 
-Findings never repeat a secret: in the message and snippet of every rule, each
-secret value on the line (what PG007 reads as a secret, and the password of
-any `scheme://user:password@host`) keeps its first four characters followed by
-`***` (values shorter than eight characters become `***`), in the text and the
-`--json` output alike.
+Findings mask the secrets promptguard recognizes (PG007 formats,
+credential-named values, URL passwords and secret query parameters) on the
+same line: in the message and snippet of every rule, each such value keeps its
+first four characters followed by `***` (values shorter than eight characters
+become `***`), in the text and the `--json` output alike. Credential-named
+values include the admin credential names of PG018 (such as
+`SUPABASE_SERVICE_ROLE_KEY`) even when the value is plain hex; secret query
+parameters are `key`, `token`, `access_token`, `api_key`, `apikey`, `secret`,
+`client_secret`, `password`, `pwd`, `sig`, `signature` and `auth` (and other
+credential-named parameters); a URL password runs up to the last `@` before
+the host. Masking is not complete: values in formats promptguard does not
+recognize (such as an HTTP client's `-u user:pass`, `docker login -p`, or a
+cookie) and a value repeated on another line are shown as written.
 
 ## Usage in CI
 
@@ -213,8 +222,10 @@ deliberately string- and context-aware to keep false positives low, and it does
 
 Because it is pattern-based, it will:
 
-- **miss** novel or obfuscated injection wording it has no rule for, and
-- occasionally **flag** a benign string that looks dangerous.
+- **miss** novel or obfuscated injection wording it has no rule for,
+- occasionally **flag** a benign string that looks dangerous, and
+- **show** a secret in a format it does not recognize, or one repeated on
+  another line, in a finding's snippet (see the masking notes above).
 
 Treat it as a fast pre-flight that catches the common, high-impact mistakes —
 pair it with runtime defenses (input/output isolation, tool sandboxing,
