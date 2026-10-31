@@ -2174,7 +2174,9 @@ class TestBatch2ReviewFixes(unittest.TestCase):
     def test_skill_and_docs_pages_are_not_agents(self):
         for path in (
             "plugins/acme/agents/release/SKILL.md",
-            ".claude/agents/helper/skill.md",
+            # 1.1.1: .claude/agents/helper/skill.md is now an agent file
+            # (TestV111RulesPerf.test_skill_md_anywhere_under_claude_agents).
+            ".claude/agents/skills/helper/skill.md",
             "agents/SKILL.MD",
             "docs/agents/overview.md",
             "website/docs/agents/setup.md",

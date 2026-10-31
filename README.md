@@ -71,9 +71,9 @@ promptguard: OK - no issues found
 | Rule  | Severity | What it flags |
 |-------|----------|---------------|
 | **PG001** | 🔴 high   | Prompt-injection seed phrases in prompt text (`ignore previous instructions`, `disregard the above`, `you are now`, `reveal your system prompt`, …). |
-| **PG002** | 🔴 high   | Embedded role overrides (`SYSTEM:` / `ASSISTANT:`) hidden inside tool/user/web content, plus upper-case `DEVELOPER:` and `TOOL:` prefixes, ChatML and Llama role tokens (`<\|im_start\|>system`, `[INST]`, `<<SYS>>`, `<\|start_header_id\|>`), and `<system>` style tags. |
+| **PG002** | 🔴 high   | Embedded role overrides (`SYSTEM:` / `ASSISTANT:`) hidden inside tool/user/web content, plus upper-case `DEVELOPER:` and `TOOL:` prefixes, ChatML and Llama role tokens (`<\|im_start\|>system`, `[INST]`, `<<SYS>>`, `<\|start_header_id\|>`), and `<system>` style tags. In a Markdown (`.md`) list item (`- `, `* `, `+ `, `1. `, `1) `) or block quote (`>`, nested too) the finding is medium: such lines usually quote or list examples. |
 | **PG003** | 🟠 medium | Untrusted-content placeholders (`{{web_content}}`, `{tool_output}`, `${input}`, and memory, history, retrieval or model-output names such as `{{chat_history}}`, `{context}`, `{{retrieved_chunks}}`, `{{llm_response}}`) interpolated into a prompt with no delimiters or guards. |
-| **PG004** | 🔴 high   | Dangerous tool/function capabilities — `shell`, `exec`, `eval`, `run_command`, `subprocess`, arbitrary file-write, `http_request` to any URL. |
+| **PG004** | 🔴 high   | Dangerous tool/function capabilities — `shell`, `exec`, `eval`, `run_command`, `subprocess`, arbitrary file-write, `http_request` to any URL. Claude Code `Bash(...)` permission entries — in the `permissions` lists (`allow`, `ask`, `deny`) and `allowedTools` of a Claude settings file (`.claude/settings*.json`, `settings.local.json`, `managed-settings.json`, `.claude.json`), and in the `allowed-tools` or `tools` front matter of an agent, skill or command `.md` file: bare `Bash` and `Bash(*)` stay high, an entry for a read-only command (`git status`, `git diff`, `git log`, `git show`, `ls`, `cat`, `pwd`, `head`, `tail`, `wc`, without shell metacharacters or quotes) is not reported, and any other entry is medium. Prefix entries such as `Bash(ls:*)` or `Bash(ls *)` stay read-only, except for `git diff`, `git log`, `git show`, `cat`, `head` and `tail` (their prefix also allows writing a file or reading any path), and `cat`, `head` or `tail` with an absolute, home-directory or `..` path is medium. Entries in a `deny` list are never reported. `Bash(...)` anywhere else (MCP tool names and args, workflow steps, TOML, prose) stays high. |
 | **PG005** | 🔴 high   | Destructive actions (`delete`, `drop`, `send_email`, `transfer`, `deploy`, `rm`) marked auto / no human-in-the-loop. |
 | **PG006** | 🔴 high   | Over-broad MCP/server permissions — filesystem root (`/`, `~`, `C:\`), full env passthrough, `--yolo` / `--dangerously-skip-permissions` flags. |
 | **PG007** | 🟠 medium | Secrets committed in prompts/configs — AWS `AKIA…` and secret access keys, OpenAI `sk-…`, GitHub `ghp_…` / `github_pat_…`, Stripe `sk_live_…`, Slack `xoxb-…`, Google `AIza…`, PEM private-key blocks, JWTs, passwords inside connection strings, generic `api_key: "…"`, JSON `"password": "…"`, and unquoted `API_KEY=…` assignments. Placeholder values are skipped, `.env.example`-style templates are checked for structured tokens only, and reported values are masked. |
@@ -83,14 +83,14 @@ promptguard: OK - no issues found
 | **PG011** | 🔴 high   | Workflow expression injection — attacker-controlled fields such as `github.event.issue.title`, `comment.body`, or `head_ref` expanded inside `run`, `script`, or an AI action's prompt input. |
 | **PG012** | 🔴 high   | Blanket tool approvals in agent configs — wildcard allow-list entries (`*`, or a tool name followed by `(*)`), `bypassPermissions` or `yolo` approval modes, MCP servers marked `trust: true`, and `enableAllProjectMcpServers`. |
 | **PG013** | 🟠 medium | Inherited or pre-approved permissions in sub-agents, skills, and plugins — agent definitions in `.claude/agents/` or a plugin `agents/` folder that omit `tools` or grant every tool with a wildcard, wildcard `allowed-tools` entries in skills and plugin commands, `preinstall` and `postinstall` scripts in MCP server packages, and plugin `SessionStart` or `Setup` command hooks. |
-| **PG014** | 🟠 medium | Over-broad tool input schemas — `inputSchema`, `input_schema`, or `parameters` properties named like a path, command, URL, SQL query, or code snippet that accept any string (no `enum`, `const`, `pattern`, or `maxLength`). Optional parameters count too: an `anyOf` or `oneOf` of a string and `null`, as Pydantic and FastMCP write them. |
+| **PG014** | 🟠 medium | Over-broad tool input schemas — `inputSchema`, `input_schema`, or `parameters` properties named like a path, command, URL, SQL query, or code snippet that accept any string (no `enum`, `const`, `pattern`, or `maxLength`). Optional parameters count too: an `anyOf` or `oneOf` of a string and `null`, as Pydantic and FastMCP write them, or `"type": ["string", "null"]`. |
 | **PG015** | 🟠 medium | Over-broad GitHub workflow tokens — `permissions: write-all`, or `contents: write` together with `id-token: write` in a workflow on an untrusted trigger. |
 | **PG016** | 🟠 medium | Output exfiltration channels — a markdown or HTML image, or a markdown link, whose URL query string carries a template placeholder (`{{…}}`, `${…}`) to an external host. |
 | **PG017** | 🟠 medium | Unbounded agent loops — `max_iterations`, `max_turns`, `max_round`, `recursion_limit`, or budget caps set to `0`, a negative number, `unlimited`, or `inf`. |
 | **PG018** | 🔴 high   | Privileged MCP containers — `docker run` with `--privileged`, the host root or the container engine socket mounted, host network or PID namespace, `SYS_ADMIN` or `ALL` capabilities, and admin or service-role tokens passed in server args. |
-| **PG019** | 🟠 medium | Disabled verification — `--insecure` or `-k` on a download command, `--trusted-host`, `strict-ssl=false`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, git `sslVerify` off, and `cosign verify` without `--certificate-identity`. |
+| **PG019** | 🟠 medium | Disabled verification — `--insecure` or `-k` on a download command, `--trusted-host`, `strict-ssl=false`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, git `sslVerify` off, and `cosign verify` without `--certificate-identity`. A download command that only talks to this machine (`localhost`, `127.0.0.1`, `[::1]`) is not reported. |
 | **PG020** | 🟠 medium | Risky dependency sources — `--extra-index-url` (dependency confusion), package indexes or registries over plain `http://`, and `git+` dependencies not pinned to a 40-char commit SHA. |
-| **PG021** | 🟠 medium | Same-origin checksums in CI workflows and Dockerfiles — an artifact and its `.sha256` or `SHA256SUMS` file fetched from the same host, so a tampered release can ship a matching checksum. A signature check in the same file waives it: `gpg --verify`, `gpgv`, `cosign verify-blob`, `minisign -V`, `signify -V`, `openssl dgst -verify`, `sigstore verify`, `gh attestation verify`, or `slsa-verifier`. |
+| **PG021** | 🟠 medium | Same-origin checksums in CI workflows and Dockerfiles — an artifact and its `.sha256` or `SHA256SUMS` file fetched from the same host, so a tampered release can ship a matching checksum. A signature check in the same file waives it: `gpg --verify`, `gpgv`, `cosign verify` / `cosign verify-blob`, `minisign -V` (also merged with other minisign flags, such as `-Vm`, `-Vx`, `-Vqm`), `signify -V`, `openssl dgst -verify` / `-prverify`, `openssl pkeyutl -verify`, `sigstore verify`, `gh attestation verify`, or `slsa-verifier`. |
 
 ## Why now
 
@@ -127,7 +127,8 @@ promptguard ./agents/ --json
 promptguard ./agents/ --quiet
 ```
 
-promptguard recurses directories (skipping `.git`, `node_modules`, `venv`) and
+promptguard recurses directories (skipping `.git`, `node_modules`, `venv`, `.venv`, `env`, `__pycache__`, `.tox`,
+`.mypy_cache`, `dist`, `build` and `.idea`) and
 scans `.json`, `.yaml`, `.yml`, `.toml`, `.md`, `.txt`, `.mcp`, `.cursorrules`,
 and files named `mcp.json` / `.mcp.json` / `*.agent.json`.
 
@@ -157,7 +158,7 @@ local `.env` is scanned even when git ignores it.
 
 Findings mask the secrets promptguard recognizes: PG007 formats,
 credential-named values, URL passwords, secret query parameters, the password
-of `-u` / `--user user:pass` and the cookies of `-b` / `--cookie` in a command
+of `-u` / `--user user:pass` (also grouped, as in `-ku`) and the cookies of `-b` / `--cookie` in a command
 line of the libcurl client (its name on the line itself or on the lines that
 line continues with a trailing `\`), the password of `login ... -p` (and
 `--password`), and cookie values (`Cookie:` / `Set-Cookie:` headers).

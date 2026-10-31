@@ -4,12 +4,14 @@ import json
 import os
 import re
 
+from . import rules as _rules
 from .rules import (
     KIND_SKIP_RULES,
     RULES,
     SEVERITY_ORDER,
     config_file_kind,
     file_mask_tables,
+    finding_severity,
     finding_text_filter,
     line_mask,
     mask_line_findings,
@@ -55,6 +57,9 @@ SKIP_DIRS = {
     "build",
     ".idea",
 }
+
+# Most distinct finding-free lines scan_text() remembers per file.
+_CLEAN_LINES_MAX = 4096
 
 # Suppression directives, linter style.
 _IGNORE_RE = re.compile(
@@ -145,6 +150,14 @@ def scan_text(text, path="<text>"):
     file_keys = [rule.detector.cache_key for rule in rules if hasattr(rule.detector, "cache_key")]
     line_rules = [rule for rule in rules if not hasattr(rule.detector, "cache_key")]
     hit_lines = None
+    # Per-line rules depend only on the line text and file-wide context, so a
+    # line that already gave no finding gives none again (files of 400,000
+    # blank or one-character lines). The one exception is PG007's PEM check,
+    # which reads the lines after a "-----BEGIN" header: such lines are not
+    # remembered. The set is capped to bound its memory. A remembered line
+    # is skipped by the rules only: it still goes to `quiet` below, so its
+    # values are masked across lines exactly as when its rules are run.
+    clean_lines = set()
     maskable = may_hold_secrets(full_lower)
     # Findings are masked once the whole file is read: a secret found on one
     # line is also masked in the findings of every other line (before or
@@ -173,33 +186,42 @@ def scan_text(text, path="<text>"):
                 hit_lines.update(ctx.get(key) or ())
         if idx in hit_lines:
             active = rules
-        elif line:
-            active = line_rules
-        else:
+        elif not line:
             continue
+        elif line in clean_lines:
+            if maskable:
+                quiet.append(idx)
+            continue
+        else:
+            active = line_rules
         line_results = []
         for rule in active:
             try:
                 results = rule.detector(line, ctx)
             except Exception:
-                # A rule must never crash the whole scan.
+                # A rule must never crash the whole scan (tests: rules.RAISE_RULE_ERRORS).
+                if _rules.RAISE_RULE_ERRORS:
+                    raise
                 continue
             if not results:
                 continue
             line_results.extend((rule, message, snippet) for message, snippet in results)
+        if not line_results:
+            if active is line_rules and len(clean_lines) < _CLEAN_LINES_MAX and "-----BEGIN" not in line:
+                clean_lines.add(line)
+            if maskable and line:
+                quiet.append(idx)
+            continue
         # Every finding masks the secrets recognized on its line and in the
         # rest of the file. A file without any secret hint
         # (rules.may_hold_secrets) has nothing to mask.
-        if not maskable:
-            if line_results:
-                pending.append((idx, line, line_results, None))
-        elif line_results:
+        if maskable:
             masked_line = line_mask(line, ctx)
             if masked_line[1]:
                 file_values.update(dict.fromkeys(masked_line[1]))
             pending.append((idx, line, line_results, masked_line))
-        elif line:
-            quiet.append(idx)
+        else:
+            pending.append((idx, line, line_results, None))
 
     file_tables = None
     if maskable and pending:
@@ -230,7 +252,7 @@ def scan_text(text, path="<text>"):
                     path=path,
                     line=idx,
                     rule_id=rule.id,
-                    severity=rule.severity,
+                    severity=finding_severity(rule, _message),
                     message=message,
                     snippet=snippet,
                 )
