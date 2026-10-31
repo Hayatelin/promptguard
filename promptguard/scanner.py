@@ -174,7 +174,7 @@ def scan_text(text, path="<text>"):
             line_results.extend((rule, message, snippet) for message, snippet in results)
         if not line_results:
             continue
-        # No finding repeats a secret of its line, whatever the rule. A file
+        # Every finding masks the secrets recognized on its line. A file
         # without any secret hint (rules.may_hold_secrets) has nothing to mask.
         pairs = [(message, snippet) for _rule, message, snippet in line_results]
         if maskable:

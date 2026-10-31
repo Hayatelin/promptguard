@@ -601,11 +601,14 @@ def _detect_secret(line, ctx):
 
 
 # ---------------------------------------------------------------------------
-# Secret masking: findings never repeat a secret value. Every value on the
-# line that a PG007 pattern would read as a secret, and every URL password,
-# is replaced by its first four characters + "***" ("***" alone when shorter
-# than 8 characters): by PG007 itself, and for every rule by the scanner
-# (mask_line_findings).
+# Secret masking: findings mask the secrets recognized on their line. Every
+# value on the line that a PG007 pattern would read as a secret, every value
+# of a credential-named key (PG007 key names, PG018 admin credential names),
+# every URL password and every secret query parameter is replaced by its
+# first four characters + "***" ("***" alone when shorter than 8
+# characters): by PG007 itself, and for every rule by the scanner
+# (mask_line_findings). Other formats and values repeated on other lines are
+# not masked.
 # ---------------------------------------------------------------------------
 
 _MASK = "***"
@@ -629,11 +632,26 @@ _MASK_DOCKER_RE = re.compile(
     r"(?<![\w.-])(?:ENV|ARG)[ \t]+(?=([A-Za-z_][\w.-]{0,80})[ \t]+([^\s\"'`=]{8,}))",
     re.IGNORECASE,
 )
-# Password of any scheme://user:password@host userinfo (up to the last "@"
-# before the path); user@host without a password is left alone.
-_URL_PASSWORD_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@\"'<>]*:([^\s/\"'<>]*[^\s/\"'<>@])@"
+# Password of any scheme://user:password@host userinfo (_url_password_spans).
+# user@host without a password is left alone.
+_URL_SCHEME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
 )
+_URL_USER_RE = re.compile(r"[^\s:/@\"'<>]*:")
+_URL_RUN_END_RE = re.compile(r"[\s\"'<>]")
+_URL_PORT_RE = re.compile(r"[0-9]+[/?#]|/")  # host:8080/path, not a password
+# Secret query parameters: ?token=..., &api_key=..., &amp;sig=..., \u0026key=...
+_QUERY_PARAM_RE = re.compile(r"(?:[?&]|&amp;|\\u0026)([A-Za-z_][\w.-]{0,63})=")
+_QUERY_VALUE_RE = re.compile(r"[^\s&\"'<>`\\]{8,}")
+_QUERY_SECRET_NAMES = frozenset((
+    "key", "token", "access_token", "api_key", "apikey", "secret", "client_secret",
+    "password", "pwd", "sig", "signature", "auth",
+))
+_TEMPLATE_REF_RE = re.compile(r"\{\{[^{}]*\}\}")
+# Admin credential names (PG018) may hold "pat" without any other key word.
+_PAT_WORD_RE = re.compile(r"(?<![A-Za-z0-9])pat(?![A-Za-z0-9])", re.IGNORECASE)
+_ADMIN_HINT_RE = re.compile(r"admin|root|superuser|service|master|global", re.IGNORECASE)
+
 # Command-line flag values (--token X, --api-key=X, --password X, and in a
 # JSON argument list "--password", "X") and Authorization header credentials
 # (Bearer / Basic, with a digit).
@@ -718,47 +736,139 @@ def _secret_spans(line, ctx):
     # Values recognized by their key, flag or URL position: a bare reference
     # ($TOKEN, ${DB_PASSWORD}, %API_KEY%, <your-key>, %s) is left readable.
     if "://" in line and "@" in line:
-        for rx, group in ((_CONN_STRING_RE, 2), (_URL_PASSWORD_RE, 1)):
-            spans.extend(m.span(group) for m in rx.finditer(line)
-                         if not _REFERENCE_RE.fullmatch(m.group(group)))
+        spans.extend(m.span(2) for m in _CONN_STRING_RE.finditer(line)
+                     if not _REFERENCE_RE.fullmatch(m.group(2)))
+        spans.extend(_url_password_spans(line))
+    if "=" in line and ("?" in line or "&" in line or "\\u0026" in line):
+        spans.extend(_query_secret_spans(line, ctx))
     if "-" in line:
         for m in _FLAG_VALUE_RE.finditer(line):
             name = m.group(1)
-            if _is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]:
+            if (_is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]
+                    or _admin_value_name(name)):
                 spans.append(m.span(2))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
         spans.extend(m.span(1) for m in _AUTH_VALUE_RE.finditer(line))
-    if _SECRET_KEY_HINT_RE.search(line):
+    # Credential-named values: what PG007 reads by key name, and the admin
+    # credential names of PG018 (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT), whatever
+    # the value looks like (PG007 does not report a plain hex value).
+    if _SECRET_KEY_HINT_RE.search(line) or ("pat" in line.lower() and _PAT_WORD_RE.search(line)):
         for rx in (_MASK_DOCKER_RE, _MASK_COLON_RE, _ASSIGN_EQ_RE):
             for m in rx.finditer(line):
                 value = m.group(2)
                 if ("://" not in value and not _REFERENCE_RE.fullmatch(value)
-                        and _is_secret_key(m.group(1), ctx)):
+                        and _mask_key(m.group(1), ctx)):
                     spans.append(m.span(2))
         for m in _QUOTED_ASSIGN_RE.finditer(line):
-            if not _REFERENCE_RE.fullmatch(m.group(3)) and _is_secret_key(m.group(1), ctx):
+            value = m.group(3)
+            if _REFERENCE_RE.fullmatch(value):
+                continue
+            if _is_secret_key(m.group(1), ctx) or (len(value) >= 8 and _admin_value_name(m.group(1))):
                 spans.append(m.span(3))
     return spans
 
 
+def _mask_key(name, ctx):
+    return _is_secret_key(name, ctx) or _admin_value_name(name)
+
+
+def _admin_value_name(name):
+    """A PG018 admin credential name (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT)."""
+    return _ADMIN_HINT_RE.search(name) is not None and _admin_cred_name(name)
+
+
+def _url_password_spans(line):
+    """Password spans of every scheme://user:password@host on the line.
+
+    The password runs to the last "@" of the URL (a password may hold "@",
+    ":", "/" or "#"), not counting an "@" right after "/" (npm /@scope/
+    paths). host:port/path and [IPv6]:port are not a user and a password.
+    """
+    spans = []
+    pos = 0
+    run_end = last_at = -1
+    while True:
+        idx = line.find("://", pos)
+        if idx < 0:
+            return spans
+        pos = idx + 3
+        if not idx or line[idx - 1] not in _URL_SCHEME_CHARS or line.startswith("[", pos):
+            continue
+        m = _URL_USER_RE.match(line, pos)
+        if m is None:
+            continue
+        start = m.end()
+        if start >= run_end:
+            # Every URL of one run (up to whitespace or a quote) ends at the
+            # same last "@": look it up once per run.
+            end = _URL_RUN_END_RE.search(line, start)
+            run_end = end.start() if end else len(line)
+            last_at = line.rfind("@", start, run_end)
+            while last_at > start and line[last_at - 1] == "/":
+                last_at = line.rfind("@", start, last_at)
+        if last_at <= start:
+            pos = max(pos, run_end)  # no password "@" after this point in the run
+            continue
+        if _URL_PORT_RE.match(line, start, last_at):
+            continue
+        value = line[start:last_at]
+        if not _REFERENCE_RE.fullmatch(value):
+            spans.append((start, last_at))
+        pos = max(pos, last_at)
+
+
+def _query_secret_name(name, ctx):
+    low = name.lower().replace("-", "_")
+    return (
+        low in _QUERY_SECRET_NAMES
+        or low.endswith("_signature")  # X-Amz-Signature, X-Goog-Signature
+        or _is_secret_key(name, ctx)
+    )
+
+
+def _query_secret_spans(line, ctx):
+    """Value spans of secret query parameters (?token=, &api_key=, &sig= ...)."""
+    spans = []
+    last = 0
+    for m in _QUERY_PARAM_RE.finditer(line):
+        if m.start() < last:
+            continue  # inside a value already masked
+        if not _query_secret_name(m.group(1), ctx):
+            continue
+        v = _QUERY_VALUE_RE.match(line, m.end())
+        if v is None:
+            continue
+        value = v.group()
+        if _REFERENCE_RE.fullmatch(value) or _TEMPLATE_REF_RE.fullmatch(value):
+            continue
+        spans.append(v.span())
+        last = v.end()
+    return spans
+
+
 # Every _secret_spans() source needs one of these literals: the key words of
-# _SECRET_KEY_HINT_RE (assignments, flags, the quoted api_key pattern) and the
-# token / URL / header hints. A text without any has nothing to mask.
+# _SECRET_KEY_HINT_RE (assignments, flags, the quoted api_key pattern), "pat"
+# (PG018 admin names), the sig / signature query parameters and the token /
+# URL / header hints. A text without any has nothing to mask.
 # Matched against the lower-cased text (several times faster than one
 # case-insensitive alternation when thousands of short messages are masked).
 _MASK_HINT_RE = re.compile(
     r"secret|token|pass|pwd|key|credential|auth|akia|sk-|gh[pousr]_|github_pat_|k_live_|k_test_|"
-    r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws"
+    r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws|sig=|signature="
 )
 
 
 def _has_mask_hint(text):
-    return _MASK_HINT_RE.search(text.lower()) is not None
+    return may_hold_secrets(text.lower())
 
 
 def may_hold_secrets(text_lower):
     """False when a lower-cased file text has nothing masking could find."""
-    return _MASK_HINT_RE.search(text_lower) is not None
+    # "pat" is looked up apart: a lookbehind in _MASK_HINT_RE makes every
+    # search several times slower.
+    return _MASK_HINT_RE.search(text_lower) is not None or (
+        "pat" in text_lower and _PAT_WORD_RE.search(text_lower) is not None
+    )
 # A whole value that only names another value. "$uper$ecret1" is not one.
 _REFERENCE_RE = re.compile(
     r"\$\{[A-Za-z_][\w.:-]*\}|\$[A-Za-z_]\w*|%[A-Za-z_]\w*%|<[^<>]*>|%[sd]|%\([A-Za-z_]\w*\)[sd]"
@@ -885,8 +995,9 @@ def mask_line_findings(line, ctx, results, cache=None):
     """Mask secrets in every (message, snippet) found on `line`, any rule.
 
     The values are those _secret_spans() finds on the line: what PG007 reads
-    as a secret (whether or not PG007 reports the line) and the password of
-    every scheme://user:password@host. A snippet equal to the line becomes
+    as a secret (whether or not PG007 reports the line), credential-named
+    values, the password of every scheme://user:password@host and secret
+    query parameters. A snippet equal to the line becomes
     the span-masked line. Any other text (a message, a snippet built from
     part of the line or from another line) is span-masked on its own and
     then has the line's raw values replaced (_mask_fragment). `cache` maps
