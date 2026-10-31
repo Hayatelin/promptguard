@@ -399,28 +399,71 @@ def _embedded_role_marker(line):
     return min(hits)[1] if hits else None
 
 
-def _detect_system_override(line, ctx):
+class _SeverityMessage(str):
+    """A finding message that carries its own severity (see finding_severity)."""
+
+
+def _with_severity(message, severity):
+    message = _SeverityMessage(message)
+    message.severity = severity
+    return message
+
+
+def finding_severity(rule, message):
+    """Severity of one finding: the rule's, unless the detector overrode it.
+
+    A detector overrides it by yielding _with_severity(message, ...); the
+    scanner reads it from the detector's own message, before masking.
+    """
+    return getattr(message, "severity", rule.severity)
+
+
+# Markdown list item ("- ", "* ", "+ ", "1. ", "1) ") or block quote (">",
+# nested "> >", "> - ") at the start of a line.
+_MD_LIST_QUOTE_RE = re.compile(r"[ \t]*(?:>|(?:[-*+]|[0-9]+[.)])[ \t])")
+# A .md list item opened by "* ", "+ ", "1. " or "1) " (after optional
+# indentation and ">" quotes): a role marker right after it is read as after
+# "- " (decision D6). Group 1: the text before the marker, group 2: the marker.
+_MD_OTHER_LIST_ITEM_RE = re.compile(r"([ \t]*(?:>[ \t]*)*)([*+]|[0-9]+[.)])(?=[ \t])")
+
+
+def _pg002_severity(message, line, ctx):
+    """PG002 in a .md list item or block quote is medium (quoted / listed
+    examples of role markers); everywhere else it stays high."""
+    if _file_ext(ctx) == ".md" and _MD_LIST_QUOTE_RE.match(line):
+        return _with_severity(message, "medium")
+    return message
+
+
+def _system_override_message(line):
+    """PG002 message for line, or None."""
     low = line.lower()
     # Only fire when it looks embedded in content, not a top-level system key.
     stripped = line.lstrip()
     # Skip lines that are clearly a legitimate top-level role key:
     #   "system": "..."   /   system: |   /   - role: system
     if re.match(r"""["']?system["']?\s*[:=]""", stripped, re.IGNORECASE):
-        return
+        return None
     if re.match(r"""-?\s*role\s*[:=]\s*["']?system""", stripped, re.IGNORECASE):
-        return
+        return None
     if ("system:" in low or "assistant:" in low) and _has_role_word_override(line):
-        yield (
-            "Embedded role override ('SYSTEM:'/'ASSISTANT:') inside content",
-            line.strip(),
-        )
-        return
+        return "Embedded role override ('SYSTEM:'/'ASSISTANT:') inside content"
     marker = _embedded_role_marker(line)
     if marker:
-        yield (
-            "Embedded role override %r inside content" % marker,
-            line.strip(),
-        )
+        return "Embedded role override %r inside content" % marker
+    return None
+
+
+def _detect_system_override(line, ctx):
+    message = _system_override_message(line)
+    if message is None and _file_ext(ctx) == ".md":
+        m = _MD_OTHER_LIST_ITEM_RE.match(line)
+        if m:
+            # Same line with the list marker written as "-" (same length).
+            alt = m.group(1) + "-" + " " * (len(m.group(2)) - 1) + line[m.end():]
+            message = _system_override_message(alt)
+    if message is not None:
+        yield (_pg002_severity(message, line, ctx), line.strip())
 
 
 def _name_segments(name):
@@ -489,25 +532,342 @@ def _detect_untrusted_placeholder(line, ctx):
     )
 
 
+# Claude Code permission entries for the Bash tool: Bash(<command>), exact
+# tool name "Bash". They are read only where Claude reads permission
+# entries (_pg004_permission_spans): the permissions allow / ask / deny lists
+# and allowedTools of a Claude settings file, and the allowed-tools / tools
+# front matter of an agent, skill or command Markdown file. Anywhere else a
+# Bash(...) word is plain text and keeps the plain PG004 finding.
+# Read-only commands whose Bash(...) entries PG004 does not report.
+_BASH_READ_ONLY = tuple(
+    tuple(c.split())
+    for c in ("git status", "git diff", "git log", "git show", "ls", "cat", "pwd", "head", "tail", "wc")
+)
+# Shell metacharacters (; | & ` $( > < line breaks); a backslash too, as a
+# line continuation. An entry holding one is never read-only.
+_SHELL_META_RE = re.compile(r"[;|&`<>\n\r\\]|\$\(")
+# git diff / log / show options that write a file or run a program.
+_GIT_WRITE_OPTS = ("--output", "--ext-diff")
+# Level of a Bash(...) entry holding a shell metacharacter (open decision D1).
+_PG004_META_LEVEL = "medium"
+# Level of a concrete Bash entry this code does not read: quotes in the
+# command, or no closing parenthesis.
+_PG004_UNPARSED_LEVEL = "medium"
+# Claude settings files whose permission lists PG004 reads (besides
+# .claude/settings*.json).
+_CLAUDE_SETTINGS_NAMES = ("settings.local.json", "managed-settings.json", ".claude.json")
+_PERMISSION_LIST_KEYS = ("allow", "ask", "deny")
+_FM_TOOL_KEYS = ("allowed-tools", "allowed_tools", "allowedTools", "tools")
+
+
+# D5: ":*" prefix entries of these read-only commands are medium: a git
+# diff / log / show prefix also allows --output / --ext-diff, a cat / head /
+# tail prefix any path. Full-command entries and other prefixes (ls:*, pwd:*,
+# wc:*, git status:*) stay read-only.
+_PREFIX_MEDIUM_CMDS = (("git", "diff"), ("git", "log"), ("git", "show"), ("cat",), ("head",), ("tail",))
+_PREFIX_SUFFIX = ":*"
+_FILE_READ_CMDS = (("cat",), ("head",), ("tail",))
+# D4: a cat / head / tail argument that reads outside the project: absolute
+# path, drive letter, home directory, or a ".." path segment.
+_OUTSIDE_PATH_RE = re.compile(
+    r"""^(?:/|[A-Za-z]:[\\/]|~)|\$HOME\b|\$\{HOME\}|%USERPROFILE%|(?:^|[\\/])\.\.(?:[\\/]|$)""",
+    re.IGNORECASE,
+)
+
+
+def _reads_outside(words):
+    """True when an argument (or an --opt=value value) is a path _OUTSIDE_PATH_RE matches."""
+    for w in words:
+        if _OUTSIDE_PATH_RE.search(w):
+            return True
+        if w.startswith("-") and "=" in w and _OUTSIDE_PATH_RE.search(w.split("=", 1)[1]):
+            return True
+    return False
+
+
+def _bash_entry_level(body):
+    """'high' for a bare wildcard, None for a read-only command, else 'medium'.
+
+    Decisions D4 (cat/head/tail arguments) and D5 (git diff/log/show
+    prefix entries) are made here.
+    """
+    b = body.strip()
+    if b in ("", "*", "**", ":*"):
+        return "high"
+    if _SHELL_META_RE.search(b):
+        return _PG004_META_LEVEL
+    if "\"" in b or "'" in b:
+        return _PG004_UNPARSED_LEVEL
+    # "git diff:*" and "git diff *" both allow any further arguments.
+    prefix = b.endswith(_PREFIX_SUFFIX) or b.endswith(" *")
+    if prefix:
+        b = b[:-2]
+    words = b.split()
+    for cmd in _BASH_READ_ONLY:
+        if tuple(words[:len(cmd)]) == cmd:
+            if cmd[0] == "git" and any(w.startswith(_GIT_WRITE_OPTS) for w in words):
+                return "medium"
+            if prefix and cmd in _PREFIX_MEDIUM_CMDS:
+                return "medium"
+            if cmd in _FILE_READ_CMDS and _reads_outside(words[1:]):
+                return "medium"
+            return None
+    return "medium"
+
+
+def _pg004_list_level(kind, level):
+    """Level of a Bash entry in a permissions `kind` list ("allow", "ask" or
+    "deny"; front matter and allowedTools count as "allow"). D2: a deny list
+    entry only takes a permission away, so it is never reported; ask lists
+    are read like allow lists."""
+    if kind == "deny":
+        return None
+    return level
+
+
+def _pg004_entry_level(entry, kind):
+    """'plain' when entry is not a Bash entry, else 'high', 'medium' or None."""
+    if entry == "Bash":
+        level = "high"
+    elif not entry.startswith("Bash("):
+        return "plain"
+    elif entry.endswith(")"):
+        level = _bash_entry_level(entry[5:-1])
+    else:
+        level = _PG004_UNPARSED_LEVEL
+    return _pg004_list_level(kind, level)
+
+
+def _claude_permission_source(ctx):
+    """"settings", "front-matter" or None: where ctx's file keeps Claude permission entries."""
+    path = ctx.get("path") or "<text>"
+    if path == "<text>":
+        return None
+    parts = [p.lower() for p in re.split(r"[\\/]+", path) if p]
+    if not parts:
+        return None
+    name, dirs = parts[-1], parts[:-1]
+    if name in _CLAUDE_SETTINGS_NAMES or (
+        ".claude" in dirs and name.startswith("settings") and name.endswith(".json")
+    ):
+        return "settings"
+    if name.endswith(".md") and (
+        name == "skill.md" or any(d in ("agents", "skills", "commands") for d in dirs)
+    ):
+        return "front-matter"
+    return None
+
+
+def _settings_permission_strings(text):
+    """[(start, end, entry, kind)]: the strings of permissions.allow / ask / deny
+    and allowedTools arrays (offsets of the string body; entry decoded)."""
+    found = []
+    stack = []  # (opening char, key of the container, list kind or None)
+    last_key = None
+    pending = None
+    n = len(text)
+    pos = 0
+    while True:
+        t = _JSONC_STEP_RE.search(text, pos)
+        if not t:
+            break
+        tok = t.group(0)
+        pos = t.end()
+        if tok in ("\"", "'"):
+            body = (_DQ_BODY_RE if tok == '"' else _SQ_BODY_RE).match(text, pos)
+            end = body.end()
+            if end < n and text[end] == tok:
+                if stack and stack[-1][0] == "[" and stack[-1][2]:
+                    raw = text[pos:end]
+                    entry = raw
+                    if tok == '"' and "\\" in raw:
+                        try:
+                            entry = json.loads(text[pos - 1:end + 1])
+                        except ValueError:
+                            entry = raw
+                    found.append((pos, end, entry, stack[-1][2]))
+                pending = text[pos:end]
+                pos = end + 1
+            else:
+                pending = None
+                pos = end
+            continue
+        if tok == "//":
+            e = _EOL_RE.search(text, pos)
+            pos = e.start() if e else n
+            continue
+        if tok == "/*":
+            e = text.find("*/", pos)
+            pos = e + 2 if e >= 0 else n
+            continue
+        if tok[0] not in "{}[]:":
+            pending = tok
+            continue
+        if tok == ":":
+            if pending is not None:
+                last_key = pending
+        elif tok in "{[":
+            kind = None
+            if tok == "[" and last_key is not None:
+                if (
+                    last_key in _PERMISSION_LIST_KEYS
+                    and stack and stack[-1][0] == "{" and stack[-1][1] == "permissions"
+                ):
+                    kind = last_key
+                elif last_key == "allowedTools":
+                    kind = "allow"
+            stack.append((tok, last_key, kind))
+            last_key = None
+        elif stack:
+            stack.pop()
+            last_key = None
+        pending = None
+    return found
+
+
+def _settings_permission_spans(text):
+    """{line_index: [(start_col, end_col, entry, kind)]} for _settings_permission_strings()."""
+    found = _settings_permission_strings(text)
+    if not found:
+        return {}
+    starts = [0] + [b.end() for b in _SPLITLINES_BREAK_RE.finditer(text)]
+    out = {}
+    for s, e, entry, kind in found:
+        i = bisect.bisect_right(starts, s) - 1
+        if i + 1 < len(starts) and e >= starts[i + 1]:
+            continue  # a string the line splitting breaks: not read
+        out.setdefault(i, []).append((s - starts[i], e - starts[i], entry, kind))
+    return out
+
+
+def _tool_entry_spans(s, start, end):
+    """[(start, end, entry, "allow")] of the tool entries in s[start:end]
+    (split as _split_tool_entries does; '[' and ']' end an entry too)."""
+    out = []
+    depth = 0
+    a = None
+    for k in range(start, end):
+        ch = s[k]
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif depth == 0 and (ch in ",[]" or ch.isspace()):
+            if a is not None:
+                out.append((a, k))
+                a = None
+            continue
+        if a is None:
+            a = k
+    if a is not None:
+        out.append((a, end))
+    return [(x, y, _unquote(s[x:y]), "allow") for x, y in out if _unquote(s[x:y])]
+
+
+def _front_matter_permission_spans(lines):
+    """{line_index: [(start_col, end_col, entry, "allow")]} of the allowed-tools / tools front matter."""
+    fields = _frontmatter_fields(lines)
+    out = {}
+    if not fields:
+        return out
+    for key in _FM_TOOL_KEYS:
+        field = fields.get(key)
+        if field is None:
+            continue
+        i, rest, cont = field
+        rows = [(i, len(lines[i]) - len(rest))] + [(j, 0) for j, _ in cont]
+        for j, start in rows:
+            s = lines[j]
+            spans = _tool_entry_spans(s, start, max(start, len(_strip_yaml_comment(s))))
+            if spans:
+                out[j] = spans
+    return out
+
+
+def _pg004_permission_spans(ctx):
+    """{line text: [(start, end, entry, kind)]} of Claude permission entries (cached in ctx).
+
+    Keyed by the line's text, since the scanner skips a line whose exact
+    text gave no finding before: a text that also occurs outside the
+    permission entries (or with other entries) is left out, so it keeps
+    the plain finding everywhere.
+    """
+    text = ctx.get("text", "")
+    cached = ctx.get("_pg004_spans")
+    if cached is not None and cached[0] is text:
+        return cached[1]
+    source = _claude_permission_source(ctx)
+    lines = _ctx_lines(ctx)
+    if source == "settings":
+        raw = _settings_permission_spans(text)
+    elif source == "front-matter":
+        raw = _front_matter_permission_spans(lines)
+    else:
+        raw = {}
+    table = {}
+    if raw and len(lines) > max(raw):
+        bad = set()
+        for i, spans in raw.items():
+            t = lines[i]
+            prev = table.get(t)
+            if prev is None:
+                table[t] = spans
+            elif prev != spans:
+                bad.add(t)
+        for i, line in enumerate(lines):
+            if i not in raw and line in table:
+                bad.add(line)
+        for t in bad:
+            del table[t]
+    ctx["_pg004_spans"] = (text, table)
+    return table
+
+
+def _bash_permission_level(line, ctx, first):
+    """PG004 level of a line holding "Bash".
+
+    "plain" (the finding is unchanged, high) unless every _DANGEROUS_TOOL_RE
+    match on the line sits in a Claude permission entry; then the highest
+    entry level: "high", "medium", or None (only read-only commands).
+    """
+    spans = _pg004_permission_spans(ctx).get(line)
+    if not spans:
+        return "plain"
+    k = 0
+    used = []
+    for tm in _DANGEROUS_TOOL_RE.finditer(line, first.start()):
+        while k < len(spans) and spans[k][1] <= tm.start():
+            k += 1
+        if k == len(spans) or not (spans[k][0] <= tm.start() and tm.end() <= spans[k][1]):
+            return "plain"
+        if not used or used[-1] != k:
+            used.append(k)
+    level = None
+    for k in used:
+        entry = _pg004_entry_level(spans[k][2], spans[k][3])
+        if entry in ("plain", "high"):
+            return "plain"
+        if entry == "medium":
+            level = "medium"
+    return level
+
+
 def _detect_dangerous_tool(line, ctx):
     tm = _DANGEROUS_TOOL_RE.search(line)
     if not tm:
         return
-    low = ctx.get("full_lower", "")
+    level = _bash_permission_level(line, ctx, tm) if "Bash" in line else "plain"
+    if level is None:
+        return  # Claude permission entries for read-only commands only
     auto = bool(_AUTO_APPROVE_RE.search(line)) or ctx.get("file_auto_approve", False)
     cap = tm.group(0)
     if auto:
-        yield (
-            "Dangerous capability %r exposed with auto-approve / no confirmation"
-            % cap,
-            line.strip(),
-        )
+        message = "Dangerous capability %r exposed with auto-approve / no confirmation" % cap
     else:
-        yield (
-            "Dangerous capability %r exposed to the agent (review confirmation flow)"
-            % cap,
-            line.strip(),
-        )
+        message = "Dangerous capability %r exposed to the agent (review confirmation flow)" % cap
+    if level == "medium":
+        message = _with_severity(message, "medium")
+    yield (message, line.strip())
 
 
 def _detect_destructive(line, ctx):
@@ -641,10 +1001,12 @@ _SHORT_NON_SECRETS = frozenset((
     "|", ">", "|-", ">-", "|+", ">+", "-",
 ))
 # curl -u / --user user:password (the password part; -u alone prompts).
+# -u may close a group of short flags that take no argument (-ku, -sSLu).
 # The raw value runs to whitespace, a quote or an escaped quote (\" \');
 # _value_end() then cuts the punctuation that ends it in text.
 _CURL_USER_RE = re.compile(
-    r"(?<![\w-])(?:-u|--user)(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+    r"(?<![\w-])(?:-[0-9aBfgGhiIjJklLMnNOpqRsSvVZ#]*u|--user)"
+    r"(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
     r"([^\s\"':\\]*):((?:[^\s\"'\\]|\\(?!\\{0,2}[\"']))+)"
 )
 # docker / podman / helm ... login -p X (--password X is a credential flag).
@@ -855,7 +1217,9 @@ def _secret_spans(line, ctx):
         # the command started on the lines before it.
         prev = None
         curl = "curl" in lower and _CURL_WORD_RE.search(line) is not None
-        if not curl and ("-u" in line or "--user" in line or "-b" in line):
+        if not curl and ("-u" in line or "--user" in line or "-b" in line
+                         or (_follows_continuation(line, ctx)
+                             and _CURL_USER_RE.search(line) is not None)):
             prev = _continued_command(line, ctx)
             curl = "curl" in prev.lower() and _CURL_WORD_RE.search(prev) is not None
         if curl:
@@ -953,6 +1317,16 @@ _COMMAND_SEP_RE = re.compile(r"[;|&`()\n]|(?<![\"']),[ \t]")
 # How many lines back a "\" continuation is followed (bounds the cost of a
 # file where every line ends with "\").
 _CONTINUATION_LOOKBACK = 20
+
+
+def _follows_continuation(line, ctx):
+    """Does the line before `line` end with "\\" (a cheap _continued_command test)?"""
+    if ctx is None:
+        return False
+    lines = ctx.get("lines")
+    idx = ctx.get("lineno")
+    return bool(lines) and bool(idx) and 2 <= idx <= len(lines) and lines[idx - 1] is line \
+        and lines[idx - 2].endswith("\\")
 
 
 def _continued_command(line, ctx):
@@ -2030,6 +2404,12 @@ def _is_github_action(ctx):
     )
 
 
+# Analyzer errors are swallowed (a rule bug must not stop the scan; the
+# rule just reports nothing for the file). Tests set this to True so such a
+# bug fails loudly instead of turning into a silent miss.
+RAISE_RULE_ERRORS = False
+
+
 def _file_level(key, analyzer):
     """Wrap a whole-file analyzer as a per-line detector (cached in ctx)."""
 
@@ -2039,6 +2419,8 @@ def _file_level(key, analyzer):
             try:
                 cache = analyzer(ctx)
             except Exception:
+                if RAISE_RULE_ERRORS:
+                    raise
                 cache = {}
             ctx[key] = cache
         return cache.get(ctx.get("lineno"), ())
@@ -2642,17 +3024,22 @@ def _command_argv(cmd, args):
 
 
 def _json_commands(node, out):
-    """Collect argv lists for every dict with a "command"/"cmd" key."""
-    if isinstance(node, dict):
-        for key in ("command", "cmd"):
-            if key in node:
-                out.append(_command_argv(node[key], node.get("args")))
-                break
-        for value in node.values():
-            _json_commands(value, out)
-    elif isinstance(node, list):
-        for value in node:
-            _json_commands(value, out)
+    """Collect argv lists for every dict with a "command"/"cmd" key.
+
+    Depth-first, in document order, without recursion: json.loads accepts
+    nesting deeper than the recursion limit.
+    """
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key in ("command", "cmd"):
+                if key in node:
+                    out.append(_command_argv(node[key], node.get("args")))
+                    break
+            stack.extend(reversed(list(node.values())))
+        elif isinstance(node, list):
+            stack.extend(reversed(node))
 
 
 _JSON_CMD_KEY_RE = re.compile(r"""["'](?:command|cmd)["']\s*:""")
@@ -3032,8 +3419,21 @@ def _launch_hit(hits, lines, line_of):
     return visit
 
 
+# Every PG008 finding needs one of these words in the text (the pipe
+# patterns, the inline launchers, a command/cmd/path key holding a launcher
+# or wrapper); a JSON \u escape can spell them otherwise, so text holding
+# "\u" is never skipped. Files without them (400,000 blank lines) are not
+# walked line by line.
+_PG008_GATE_RE = re.compile(
+    r"curl|wget|iwr|irm|invoke-|npx|uv|pipx|docker|cmd|command|path", re.IGNORECASE
+)
+
+
 def _analyze_unpinned_launch(ctx):
     if _file_ext(ctx) not in _PG008_EXTS:
+        return {}
+    text = ctx.get("text", "")
+    if "\\u" not in text and not _PG008_GATE_RE.search(text):
         return {}
     if _is_github_workflow(ctx) or _is_github_action(ctx):
         return {}
@@ -3055,7 +3455,7 @@ def _analyze_unpinned_launch(ctx):
     if _file_ext(ctx) in (".json", ".mcp", "") and text.lstrip()[:1] in ("{", "["):
         try:
             data = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             data = None
     if data is not None:
         _pg008_json(lines, data, hits)
@@ -3572,6 +3972,35 @@ _TAINTED_EXPR_RE = re.compile(
 )
 
 
+def _expression_bodies(line):
+    """[m.group(1) for m in _EXPRESSION_RE.finditer(line)] in linear time.
+
+    _EXPRESSION_RE's lazy ".*?" rescans the rest of the line from every
+    "${{" that has no "}}" after it ('${{${{${{...' is quadratic). Here each
+    "${{" takes the first "}}" after it on the same line ("." stops at
+    "\\n"); with no "}}" left before the line break, no later "${{" before
+    that break can match either.
+    """
+    out = []
+    pos = 0
+    n = len(line)
+    while pos < n:
+        i = line.find("${{", pos)
+        if i < 0:
+            break
+        nl = line.find("\n", i + 3)
+        stop = n if nl < 0 else nl
+        j = line.find("}}", i + 3, stop + 1)
+        if j < 0 or j + 2 > stop:
+            if nl < 0:
+                break
+            pos = nl + 1
+            continue
+        out.append(line[i + 3:j])
+        pos = j + 2
+    return out
+
+
 def _is_sink_key(key):
     k = key.lower()
     return k in ("run", "script", "custom_instructions") or "prompt" in k
@@ -3600,8 +4029,8 @@ def _analyze_expression_injection(ctx):
         end = _block_end(lines, i, key_col)
         for j in range(i, end):
             found = []
-            for em in _EXPRESSION_RE.finditer(lines[j]):
-                for tm in _TAINTED_EXPR_RE.finditer(em.group(1)):
+            for body in _expression_bodies(lines[j]):
+                for tm in _TAINTED_EXPR_RE.finditer(body):
                     expr = tm.group(0)
                     if expr not in found:
                         found.append(expr)
@@ -3940,14 +4369,34 @@ def _is_agent_definition(ctx, fields):
     if "name" not in fields or "description" not in fields:
         return False
     parent = dirs[-2] if len(dirs) >= 2 else ""
+    claude_agents = [k for k in range(1, len(dirs)) if dirs[k] == "agents" and dirs[k - 1] == ".claude"]
     if name == "skill.md":
-        return dirs[-1] == "agents" and parent == ".claude"
-    for k in range(1, len(dirs)):
-        if dirs[k] == "agents" and dirs[k - 1] == ".claude":
-            return True
-    if dirs[-1] == "agents" and parent not in _DOC_DIRS:
+        # Under .claude/agents/ at any depth, unless a skills/ folder sits
+        # between .claude/agents/ and the file (a skill's entry file).
+        return bool(claude_agents) and "skills" not in dirs[claude_agents[0] + 1:]
+    if claude_agents:
+        return True
+    if dirs[-1] == "agents" and not any(d in _DOC_DIRS for d in _plugin_agents_dirs(dirs)):
         return True
     return any(k in fields for k in _AGENT_ONLY_KEYS)
+
+
+def _plugin_agents_dirs(dirs):
+    """Folders _is_agent_definition checks for docs names, for a file in dirs[-1] == "agents".
+
+    With a plugins/<name>/ segment above agents/, the plugin root is the
+    last such <name>: only the folders between it and agents/ count, so a
+    plugin named site or blog, or a docs folder above the root, does not
+    matter. Without one, the root is unknown and agents/'s own parent is
+    checked, as before.
+    """
+    root = None
+    for k in range(len(dirs) - 2):
+        if dirs[k] == "plugins":
+            root = k + 1
+    if root is None:
+        return dirs[-2:-1]
+    return dirs[root + 1:-1]
 
 
 def _pg013_markdown(ctx, lines, hits):
@@ -4408,7 +4857,10 @@ _SIGNATURE_FILE_RE = re.compile(
     r"\.(?:sig|asc|minisig|pem|crt|cert|sigstore|bundle|intoto\.jsonl)$", re.IGNORECASE
 )
 # A short-option bundle holding -V, built from each tool's getopt string:
-# minisign "CGSVRHhc:flm:oP:p:qQs:t:vWx:", signify "CGSVzc:ehm:np:qs:t:x:".
+# minisign "CGSVRHhc:flm:oP:p:qQs:t:vWx:" (src/minisign.c; flags without an
+# argument C G S V R H h f l o q Q v W, with one c m P p s t x; the
+# VERIFY_ONLY build's "VhHm:oP:p:qQvx:" is a subset), signify
+# "CGSVzc:ehm:np:qs:t:x:".
 # Flags without an argument in any order, then at most one flag that takes
 # an argument (its value is the next word): -V, -Vm, -qVm, -Vp. Words such
 # as -Verbose, or -Vm2 with the value attached, do not count.
@@ -4422,7 +4874,8 @@ _SIGNATURE_VERIFY_RE = re.compile(
     r"\bgpg2?\b[^\n|;&]{0,200}?\s--verify\b|\bgpgv2?\b|\bcosign\s+verify(?:-blob)?\b|"
     r"\bminisign\b[^\n|;&]{0,200}?\s-" + _MINISIGN_V_BUNDLE + r"(?![\w-])|"
     r"\bsignify\b[^\n|;&]{0,200}?\s-" + _SIGNIFY_V_BUNDLE + r"(?![\w-])|"
-    r"\bopenssl\s+dgst\b[^\n|;&]{0,200}?\s-verify\b|\bsigstore\s+verify\b|"
+    r"\bopenssl\s+dgst\b[^\n|;&]{0,200}?\s-(?:pr)?verify\b|"
+    r"\bopenssl\s+pkeyutl\b[^\n|;&]{0,200}?\s-verify\b|\bsigstore\s+verify\b|"
     r"\bgh\s+attestation\s+verify\b|\bslsa-verifier\b"
 )
 
@@ -4469,6 +4922,44 @@ def _is_checksum_file(name):
     return any(rx.search(low) for rx in _CHECKSUM_FILE_RES)
 
 
+_GH_STOP_RE = re.compile(r"[}\n]")
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+def _squeeze_gh_exprs(s):
+    """_GH_EXPR_RE.sub(<"${{" + body without whitespace + "}}">, s), linear time.
+
+    _GH_EXPR_RE retries up to 200 characters from every "${{"; the body
+    can hold neither "}" nor "\\n", so a "${{" at i matches exactly when the
+    first "}" or "\\n" at or after i + 3 is a "}" followed by "}" and lies
+    at most 200 characters past i + 3. That stop position only moves
+    forward, so it is found once per stretch instead of once per "${{".
+    """
+    out = []
+    pos = 0       # next position the substitution search starts from
+    copied = 0    # s[:copied] is already in out
+    stop = -1     # first "}" / "\n" at or after the last probe, or len(s)
+    n = len(s)
+    while True:
+        i = s.find("${{", pos)
+        if i < 0:
+            break
+        b = i + 3
+        if stop < b:
+            m = _GH_STOP_RE.search(s, b)
+            stop = m.start() if m else n
+        if stop - b <= 200 and s.startswith("}}", stop):
+            out.append(s[copied:i])
+            out.append("${{" + _WS_RUN_RE.sub("", s[b:stop]) + "}}")
+            copied = pos = stop + 2
+        else:
+            pos = i + 1
+    if not out:
+        return s
+    out.append(s[copied:])
+    return "".join(out)
+
+
 def _pg021_logical_lines(clean):
     """Yield [(index, text)] pieces joined by trailing '\\' or '`' continuations.
 
@@ -4480,7 +4971,7 @@ def _pg021_logical_lines(clean):
         if _PROSE_KEY_RE.match(s):
             s = ""
         if "${{" in s:
-            s = _GH_EXPR_RE.sub(lambda m: "${{" + re.sub(r"\s+", "", m.group(1)) + "}}", s)
+            s = _squeeze_gh_exprs(s)
         stripped = s.rstrip()
         if stripped.endswith("\\") or stripped.endswith(" `"):
             pieces.append((i, stripped[:-1]))
@@ -4696,6 +5187,8 @@ def _cached_hits(ctx, key, analyzer):
         try:
             cache = analyzer(ctx)
         except Exception:
+            if RAISE_RULE_ERRORS:
+                raise
             cache = {}
         ctx[key] = cache
     return cache
@@ -4710,7 +5203,7 @@ def _json_data(ctx):
         if _file_ext(ctx) in (".json", ".mcp", "") and text.lstrip()[:1] in ("{", "["):
             try:
                 data = json.loads(text)
-            except ValueError:
+            except (ValueError, RecursionError):
                 data = None
         ctx["_json"] = data
     return data
@@ -4833,9 +5326,16 @@ def _command_argvs(ctx):
         try:
             cached = _analyze_command_argvs(ctx)
         except Exception:
+            if RAISE_RULE_ERRORS:
+                raise
             cached = []
         ctx["_argvs"] = cached
     return cached
+
+
+# Each heuristic argv starts at an inline launcher (_LAUNCH_AT_RE) or a
+# command/cmd/path key (_CMD_ONLY_RE); both need one of these words.
+_ARGV_GATE_RE = re.compile(r"npx|uvx|uv|pipx|docker|command|cmd|path", re.IGNORECASE)
 
 
 def _analyze_command_argvs(ctx):
@@ -4859,6 +5359,8 @@ def _analyze_command_argvs(ctx):
                 where.append(ln)
             out.append((argv, where))
         return out
+    if not _ARGV_GATE_RE.search(ctx.get("text", "")):
+        return out  # neither heuristic below can match
     for i, line in enumerate(lines):
         if not line:
             continue  # neither heuristic matches an empty line
@@ -5098,6 +5600,45 @@ def _json_permission_allows(text):
     return out
 
 
+# Strings and comments, for _comment_blanked_lines(). A string ends at its
+# closing quote or the line break; a /* comment at "*/" or the end of text.
+_JSONC_BLANK_RE = re.compile(
+    r'''"(?:[^"\\\n\r]|\\[^\n\r])*"?|'(?:[^'\\\n\r]|\\[^\n\r])*'?|//[^\n\r\x0b\x0c\x1c\x1d\x1e\x85  ]*|/\*.*?(?:\*/|\Z)''',
+    re.DOTALL,
+)
+_HASH_BLANK_RE = re.compile(r'''"(?:[^"\\]|\\.)*"?|'[^']*'?|(?:(?<=\s)|^)#.*''')
+_NOT_BREAK_RE = re.compile("[^\n\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
+
+
+def _blank_comment(m):
+    s = m.group(0)
+    if s[:1] in ("\"", "'"):
+        return s
+    return _NOT_BREAK_RE.sub(" ", s)
+
+
+def _comment_blanked_lines(ctx, lines, json_like):
+    """lines with every comment replaced by spaces (same lengths, same line breaks).
+
+    JSON-like text (see _AllowScope): // and /* */ comments outside strings,
+    a /* */ comment spanning lines included. Anything else: a '#' at the
+    start of a line or after whitespace, outside a quoted string on that
+    line, to the end of the line (YAML / TOML). Cached in ctx.
+    """
+    cached = ctx.get("_blanked")
+    if cached is not None and cached[0] is lines:
+        return cached[1]
+    if json_like:
+        text = ctx.get("text", "")
+        blanked = _JSONC_BLANK_RE.sub(_blank_comment, text).splitlines()
+        if len(blanked) != len(lines):
+            blanked = list(lines)  # not the text the lines came from: keep them
+    else:
+        blanked = [_HASH_BLANK_RE.sub(_blank_comment, l) if "#" in l else l for l in lines]
+    ctx["_blanked"] = (lines, blanked)
+    return blanked
+
+
 def _looks_like_json(text):
     """Does the text (after a BOM, blanks and comments) open a JSON object/array?
 
@@ -5322,20 +5863,40 @@ class _ListCollector(object):
                 yield tok, j + 1
 
 
+# Every PG012 pattern (_BYPASS_HINT_RE, _TRUST_TRUE_RE, _APPROVAL_LIST_KEY_RE,
+# _ALLOWED_TOOLS_FLAG_RE) matches one of these words.
+_PG012_GATE_RE = re.compile(
+    r"allow|approve|bypass|yolo|enableallprojectmcpservers|trust", re.IGNORECASE
+)
+
+
 def _analyze_blanket_approval(ctx):
     if _file_ext(ctx) not in _CONFIG_EXTS and not _kind_enabled(ctx, "PG012"):
+        return {}
+    if not _PG012_GATE_RE.search(ctx.get("text", "")):
         return {}
     lines = _ctx_lines(ctx)
     low = ctx.get("full_lower", "")
     allow_scope = _AllowScope(ctx, lines) if "permissions" in low else None
     mcp_ok = "mcp" in low
-    collector = _ListCollector(lines)
+    text = ctx.get("text", "")
+    json_like = _json_data(ctx) is not None or (
+        _file_ext(ctx) in (".json", ".mcp", "") and _looks_like_json(text)
+    )
+    # Commented-out text never approves anything: in JSON-like text the
+    # lines are read with // and /* */ comments blanked (a key inside a
+    # block comment, items after "//" in an open list); list items on the
+    # lines below a key are read with comments blanked in every format.
+    blanked = None
+    if json_like and ("//" in text or "/*" in text):
+        blanked = _comment_blanked_lines(ctx, lines, True)
+    collector = None
     hits = {}
     skips = _raw_skips(ctx, lines)
     for i, raw in enumerate(lines):
         if not raw or skips[i]:
             continue  # no pattern below matches an empty line
-        line = _code_text(raw, ctx)
+        line = blanked[i] if blanked is not None else _code_text(raw, ctx)
         lineno = i + 1
         for rx, what in (_BYPASS_RES if _BYPASS_HINT_RE.search(line) else ()):
             if rx.search(line):
@@ -5355,6 +5916,8 @@ def _analyze_blanket_approval(ctx):
             # The key pattern ends in \s*, so m.end() is where line[m.end():].strip() starts.
             e = m.end()
             if e == len(line) or line[e] in "[#":
+                if collector is None:
+                    collector = _ListCollector(_comment_blanked_lines(ctx, lines, json_like))
                 items = collector.new_items(i, e, key)
             else:
                 # Scalar value: only the value itself, never the rest of the line.
@@ -6030,7 +6593,65 @@ _HOST_TARGET_RE = re.compile(
 _INSECURE_FLAGS = {"curl": "--insecure", "wget": "--no-check-certificate"}
 
 
-def _curl_local_only(tokens, value_short=_CURL_VALUE_SHORT, value_long=_CURL_VALUE_LONG):
+_SCHEME_END_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\Z")
+_IPV6_BODY_RE = re.compile(r"[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\Z")
+# 'scheme://[addr]' followed by something other than the end of the line,
+# whitespace, a quote, or ':' / '/' / '?' / '#' ('[::1]\@evil.example',
+# '[::1].evil.example', '[::1][::1]'): the tokens no longer show where the
+# URL ends, so such a line is never read as local.
+_IPV6_URL_ODD_END_RE = re.compile(
+    r"""[A-Za-z][A-Za-z0-9+.-]*://\[[0-9A-Fa-f:.]*\](?!$|[\s:/?#"'])"""
+)
+
+
+def _odd_ipv6_url_lines(code):
+    """Line numbers (1-based) of code lines _join_ipv6_urls must not join on."""
+    return frozenset(
+        i + 1 for i, line in enumerate(code)
+        if "://[" in line and _IPV6_URL_ODD_END_RE.search(line)
+    )
+
+
+def _join_ipv6_urls(tokens, no_join=frozenset()):
+    """Rejoin 'https://[::1]:8443/x', which _heuristic_tokens splits at '[' and ']'.
+
+    A token ending in 'scheme://' (or '--opt=scheme://'), followed on the
+    same line by an IPv6 literal token, becomes 'scheme://[addr]' plus the
+    next token when that one continues the URL (starts with ':', '/', '?',
+    '#' or '@'). The host is then read from the brackets as for an argv
+    token; '[::1]@evil.example' still has the host evil.example. Lines in
+    no_join (_odd_ipv6_url_lines) are left split, so their URLs stay
+    host-less and are not local.
+    """
+    if len(tokens) < 2:
+        return tokens
+    out = []
+    k = 0
+    n = len(tokens)
+    while k < n:
+        tok, ln = tokens[k]
+        if (
+            k + 1 < n
+            and ln not in no_join
+            and tok.endswith("://")
+            and _SCHEME_END_RE.search(tok.split("=", 1)[-1])
+            and tokens[k + 1][1] == ln
+            and _IPV6_BODY_RE.match(tokens[k + 1][0])
+        ):
+            url = "%s[%s]" % (tok, tokens[k + 1][0])
+            k += 2
+            if k < n and tokens[k][1] == ln and tokens[k][0][:1] in (":", "/", "?", "#", "@"):
+                url += tokens[k][0]
+                k += 1
+            out.append((url, ln))
+            continue
+        out.append((tok, ln))
+        k += 1
+    return out
+
+
+def _curl_local_only(tokens, value_short=_CURL_VALUE_SHORT, value_long=_CURL_VALUE_LONG,
+                     no_join=frozenset()):
     """True when a curl (or wget) command only talks to this machine.
 
     Every scheme://host token (or --opt=scheme://host), option values
@@ -6040,6 +6661,7 @@ def _curl_local_only(tokens, value_short=_CURL_VALUE_SHORT, value_long=_CURL_VAL
     remote bare host such as 'example.org/x' keeps the finding. Other words
     (JSON/YAML key text the tokenizer picked up) are ignored.
     """
+    tokens = _join_ipv6_urls(tokens, no_join)
     urls = []
     for tok, _ in tokens:
         if tok.startswith("-") and "=" in tok:
@@ -6123,7 +6745,7 @@ def _count_waived(tokens, flag, waived, local):
             waived[key] = waived.get(key, 0) + 1
 
 
-def _wget_waivers(tokens, waived):
+def _wget_waivers(tokens, waived, no_join=frozenset()):
     """Count the --no-check-certificate tokens of wget commands, local-only or not."""
     cur = None
     for tok, ln in _split_semicolons(tokens):
@@ -6131,7 +6753,7 @@ def _wget_waivers(tokens, waived):
         name = _cmd_name(tok) if ("curl" in low or "cosign" in low or "wget" in low) else ""
         if _is_separator_token(tok) or name in ("curl", "cosign", "wget"):
             if cur is not None:
-                local = _curl_local_only(cur, _WGET_VALUE_SHORT, _WGET_VALUE_LONG)
+                local = _curl_local_only(cur, _WGET_VALUE_SHORT, _WGET_VALUE_LONG, no_join)
                 _count_waived(cur, "--no-check-certificate", waived, local)
             cur = [] if name == "wget" else None
             continue
@@ -6166,10 +6788,11 @@ def _drop_waived(hits, code, waived_sets):
                 del hits[ln]
 
 
-def _check_command_tokens(tokens, hits, lines, waived=None):
+def _check_command_tokens(tokens, hits, lines, waived=None, no_join=frozenset()):
     """One pass over a logical command line: curl -k and cosign verify.
 
     With `waived`, also counts the --insecure tokens of each curl command (see _drop_waived).
+    no_join: see _join_ipv6_urls.
     """
     mode = None
     curl = []
@@ -6179,7 +6802,7 @@ def _check_command_tokens(tokens, hits, lines, waived=None):
         name = _cmd_name(tok) if ("curl" in low or "cosign" in low) else ""
         if _is_separator_token(tok) or name in ("curl", "cosign"):
             if mode == "curl":
-                local = _curl_local_only(curl)
+                local = _curl_local_only(curl, no_join=no_join)
                 if not local:
                     for t, l in _curl_k_tokens(curl):
                         _add_hit(hits, lines, l, _curl_message(t))
@@ -6208,8 +6831,21 @@ def _check_command_tokens(tokens, hits, lines, waived=None):
             cosign[2].append((tok, ln))
 
 
+# Every PG019 finding needs one of these words: _VERIFY_OFF_HINT_RE,
+# _TRUSTED_HOST_RE, or a curl / cosign / wget command. Parsed JSON argvs can
+# spell a command with a \u escape, so text holding "\u" is never skipped.
+_PG019_GATE_RE = re.compile(
+    r"insecure|no-check-certificate|strict[-_]?ssl|NODE_TLS_REJECT_UNAUTHORIZED|"
+    r"GIT_SSL_NO_VERIFY|sslverify|trusted|curl|cosign|wget",
+    re.IGNORECASE,
+)
+
+
 def _analyze_verification_disabled(ctx):
     if _file_ext(ctx) not in _CONFIG_TXT_EXTS and not _kind_enabled(ctx, "PG019"):
+        return {}
+    text = ctx.get("text", "")
+    if "\\u" not in text and not _PG019_GATE_RE.search(text):
         return {}
     lines = _ctx_lines(ctx)
     hits = {}
@@ -6238,12 +6874,13 @@ def _analyze_verification_disabled(ctx):
             )
     waived_lines, waived_argvs = {}, {}
     code_skips = [_skip_config_line(c) for c in code]
+    odd = _odd_ipv6_url_lines(code)
     for tokens in _logical_lines(code, code_skips, _CURL_OR_COSIGN_RE):
         if tokens:
-            _check_command_tokens(tokens, hits, lines, waived_lines)
+            _check_command_tokens(tokens, hits, lines, waived_lines, odd)
     for tokens in _logical_lines(code, code_skips, _WGET_RE):
         if tokens:
-            _wget_waivers(tokens, waived_lines)
+            _wget_waivers(tokens, waived_lines, odd)
     if not (_is_github_workflow(ctx) or _is_github_action(ctx)):
         for argv, where in _command_argvs(ctx):
             pairs = list(zip(argv, where))
@@ -6388,8 +7025,15 @@ def _index_message(opt, value):
     return None
 
 
+# Every PG020 pattern (_INDEX_OPT_RE, _PIP_SHORT_INDEX_RE, _REQ_SHORT_INDEX_RE,
+# _GIT_PLUS_RE) matches one of these.
+_PG020_GATE_RE = re.compile(r"index|find[-_]links|registry|pip|git\+|-i", re.IGNORECASE)
+
+
 def _analyze_dependency_source(ctx):
     if _file_ext(ctx) not in _CONFIG_TXT_EXTS and not _kind_enabled(ctx, "PG020"):
+        return {}
+    if not _PG020_GATE_RE.search(ctx.get("text", "")):
         return {}
     lines = _ctx_lines(ctx)
     pg008 = None
