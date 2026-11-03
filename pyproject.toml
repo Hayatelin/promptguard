@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "promptguard"
-version = "1.1.1"
+version = "1.1.2"
 description = "Security pre-flight for AI agents: catch prompt-injection and over-privileged tools before you ship."
 readme = "README.md"
 requires-python = ">=3.8"

@@ -8,7 +8,7 @@ tool exposure. Zero dependencies, standard library only.
 from .scanner import Finding, scan_text, scan_file, scan_path
 from .rules import RULES
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 __all__ = [
     "Finding",
