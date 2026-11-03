@@ -965,7 +965,8 @@ def _detect_secret(line, ctx):
 # value on the line that a PG007 pattern would read as a secret, every value
 # of a credential-named key (PG007 key names, PG018 admin credential names),
 # every URL password, every secret query parameter, the password of
-# `curl -u user:pass` and `docker login -p`, and cookie values are replaced by
+# `curl -u user:pass` and `docker login -p`, the credentials of the clients of
+# _CLIENT_CREDENTIAL_COMMANDS, and cookie values are replaced by
 # their first four characters + "***" ("***" alone when shorter than 8
 # characters): by PG007 itself, and for every rule by the scanner
 # (mask_line_findings). A value found on one line is also masked where it
@@ -1086,8 +1087,25 @@ _URL_PORT_RE = re.compile(r"[0-9]+[/?#]")  # host:8080/path, not a password
 _URL_HOST_AT_RE = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|localhost)(?::[0-9]+)?(?=[/?#]|$)"
 )
+# The host after the last "@" of a URL whose password holds "@x.tld/"
+# (_url_password_end): localhost, an IPv4 address, [IPv6], or a dotted name
+# whose last label is two or more letters (group 1), then an optional port
+# and a path / query / fragment or the end of the URL.
+_URL_LAST_HOST_RE = re.compile(
+    r"(?:\[[0-9A-Fa-f:.]+\]|localhost|[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
+    r"|(?:[A-Za-z0-9-]+\.)+([A-Za-z]{2,}))(?::[0-9]+)?(?=[/?#]|$)"
+)
+# A last label that names a file type, not a top-level domain
+# (logo@2x.png, icon@3x.webp): such an "@" stays in the path.
+_URL_FILE_SUFFIXES = frozenset((
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "bmp", "js", "mjs",
+    "cjs", "css", "map", "json", "html", "htm", "txt", "md", "pdf", "xml", "zip",
+    "gz", "tgz", "tar", "whl", "woff", "woff2", "ttf", "otf", "mp3", "mp4", "webm",
+    "wasm", "py", "sh",
+))
 # Secret query parameters: ?token=..., &api_key=..., &amp;sig=..., \u0026key=...
-_QUERY_PARAM_RE = re.compile(r"(?:[?&]|&amp;|\\u0026)([A-Za-z_][\w.-]{0,63})=")
+# A ";" before the name counts for ;jsessionid= only (_query_secret_spans).
+_QUERY_PARAM_RE = re.compile(r"(?:[?&]|&amp;|\\u0026|;)([A-Za-z_][\w.-]{0,63})=")
 # Query value length rule (the one place to change it): a secret query
 # parameter value needs _QUERY_VALUE_MIN characters (?key=, ?sig=, ?auth= ...),
 # except for the password / token names of _QUERY_SHORT_NAMES, whose shorter
@@ -1109,6 +1127,26 @@ _QUERY_SECRET_NAMES = frozenset((
     "key", "token", "access_token", "api_key", "apikey", "secret", "client_secret",
     "password", "passwd", "pass", "pwd", "pw", "sig", "signature", "auth",
 ))
+# Query parameter names that hold a session id, ticket or app key
+# (compared lower-cased, "-" read as "_"). Unlike _QUERY_SECRET_NAMES their
+# values must look like one (_query_extra_value): 8+ characters with a digit
+# or mixed case; for "k" 16+ characters of [A-Za-z0-9_-] with a digit and a
+# letter (?k=usb+c+cable is a search).
+_QUERY_EXTRA_NAMES = frozenset((
+    "k", "appkey", "app_key", "sid", "sessionid", "session_id", "jsessionid",
+    "phpsessid", "ticket", "subscription_key", "jwt",
+))
+_QUERY_K_VALUE_RE = re.compile(r"[A-Za-z0-9_-]{16,}")
+
+
+def _query_extra_value(low, value):
+    """Is `value` of the _QUERY_EXTRA_NAMES parameter `low` a value to mask?"""
+    has_digit = any(c.isdigit() for c in value)
+    if low == "k":
+        return (_QUERY_K_VALUE_RE.fullmatch(value) is not None and has_digit
+                and any(c.isalpha() for c in value))
+    return len(value) >= 8 and (
+        has_digit or (any(c.isupper() for c in value) and any(c.islower() for c in value)))
 _TEMPLATE_REF_RE = re.compile(r"\{\{[^{}]*\}\}")
 # Admin credential names (PG018) may hold "pat" without any other key word.
 _PAT_WORD_RE = re.compile(r"(?<![A-Za-z0-9])pat(?![A-Za-z0-9])", re.IGNORECASE)
@@ -1123,14 +1161,21 @@ _FLAG_VALUE_RE = re.compile(
 )
 # The credential starts with a token68 character and may hold the symbols
 # ! # $ % * ? @ ^ = outside RFC 6750 (Ab3!xYz9, Tk8%Zq*Lm4), which are masked
-# with it; it stops at whitespace, quotes, the punctuation of prose and URLs
-# (: , ; ( ) [ ] { } < >) and the command operators & and |, so "basic
-# https://x/v1", "a basic example(v2)" and "Bearer tok|base64" keep the text
-# after the value. _value_end() then cuts a trailing "." or "`". A reference
-# (${TOKEN}, <token>) does not start with a token68 character.
+# with it, and ":" "," ";" right before a part of eight or more of these
+# characters that starts with a letter or digit (admin:S3cr3tPw9,
+# v1:abc123def456, abc123,def456ghi); it stops at whitespace, quotes, the
+# other punctuation of prose and URLs (( ) [ ] { } < >, and : , ; before
+# anything else) and the command operators & and |, so "basic https://x/v1",
+# "a basic example(v2)", "Bearer abc123, then", "bearer token:abc1",
+# "Bearer abcd1234;rm -rf x" and "Bearer tok|base64" keep the text after the
+# value. _secret_spans() then asks for a digit and 8+ characters in the whole
+# value, and _value_end() cuts a trailing "." or "`". A reference (${TOKEN},
+# <token>) does not start with a token68 character. The value sits in a
+# lookahead, so a value that is no credential (x:Bearer) does not hide the
+# next "Bearer <value>" (a value ends at whitespace: the scans are linear).
 _AUTH_VALUE_RE = re.compile(
-    r"\b(?:Bearer|Basic)[ \t]+((?=[A-Za-z0-9._~+/=!#$%*?@^-]*[0-9])"
-    r"[A-Za-z0-9._~+/-][A-Za-z0-9._~+/=!#$%*?@^-]{7,})",
+    r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/-]"
+    r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
     re.IGNORECASE,
 )
 # HTTPie (http / https) and xh (xh / xhs): -a / --auth user:password, also at
@@ -1158,10 +1203,18 @@ _MYSQL_WORD_RE = re.compile(
 )
 # A docker / podman port mapping (-p3306:3306, -p127.0.0.1:3306:3306/tcp).
 _PORT_MAP_RE = re.compile(r"(?:[0-9.]+:)?[0-9]{1,5}(?:-[0-9]{1,5})?:[0-9]{1,5}(?:-[0-9]{1,5})?(?:/[a-z]+)?")
-# Group 2: a quoted password (-p'pw', -p"pw"); group 3: an unquoted one.
+# Group 2: a quoted password (-p'pw', -p"pw"); group 3: the raw run of an
+# unquoted one. Its first character is not an operator (-p;, -p|, -p< prompt
+# for the password); the run then goes on through & ; | ( ) < > up to
+# whitespace, a quote or a backtick, and _mysql_value_end() finds where the
+# password ends in it.
 _MYSQL_P_RE = re.compile(
-    r"(?<![\w-])-p(?:([\"'])([^\"'\n]+)\1|((?:[^\s\"'`|&;<>()\\]|\\(?!\\{0,2}[\"']))+))"
+    r"(?<![\w-])-p(?:([\"'])([^\"'\n]+)\1|((?:[^\s\"'`|&;<>()\\]|\\(?!\\{0,2}[\"']))"
+    r"(?:[^\s\"'`\\]|\\(?!\\{0,2}[\"']))*))"
 )
+_MYSQL_OPERATOR_RE = re.compile(r"[&;|()<>]")
+# Two-character operators that end an unquoted mysql password (-pPw&&echo).
+_MYSQL_END_PAIRS = frozenset(("&&", "||", ";;", ">>", "<<", "|&", ">&", "<&"))
 # One string of a JSON array on its own line ("value",) and a flag string
 # ("--token",) on the line before it.
 _JSON_ITEM_RE = re.compile(r"[ \t]*\"([^\s\"\\]+)\"[ \t]*,?[ \t]*\Z")
@@ -1245,7 +1298,8 @@ def _secret_spans(line, ctx):
                      if not _REFERENCE_RE.fullmatch(m.group(2))
                      and not _URL_PORT_RE.match(m.group(2)))
         spans.extend(_url_password_spans(line))
-    if "=" in line and ("?" in line or "&" in line or "\\u0026" in line):
+    if "=" in line and ("?" in line or "&" in line or "\\u0026" in line
+                        or (";" in line and "jsessionid=" in line.lower())):
         spans.extend(_query_secret_spans(line, ctx))
     if "-" in line:
         for m in _FLAG_VALUE_RE.finditer(line):
@@ -1289,6 +1343,11 @@ def _secret_spans(line, ctx):
             if prev is None:
                 prev = _continued_command(line, ctx)
             spans.extend(_httpie_auth_spans(line, prev or "", ctx))
+        if ("-u" in line or "-a" in line or "-A" in line or "-U" in line
+                or "-p" in line or "-P" in line):
+            if prev is None:
+                prev = _continued_command(line, ctx)
+            spans.extend(_client_credential_spans(line, prev))
     if line[:1] in " \t\"" and ctx is not None:
         spans.extend(_json_flag_value_spans(line, ctx))
     if "ookie" in line or "OOKIE" in line:
@@ -1298,7 +1357,7 @@ def _secret_spans(line, ctx):
         for m in _AUTH_VALUE_RE.finditer(line):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
-            if end - start >= 8:
+            if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
                 spans.append((start, end))
     # Credential-named values: what PG007 reads by key name, and the admin
     # credential names of PG018 (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT), whatever
@@ -1461,20 +1520,162 @@ def _names_command(text, word_re):
     (`sudo -E mysql`, `sh -c "mysql ..."`) the name is the command.
     """
     for m in word_re.finditer(text):
-        before = text[max(0, m.start() - _FLAG_LOOKBACK):m.start()].rstrip(" \t\"',[\\")
-        cut = max(before.rfind(" "), before.rfind("\t"), before.rfind("\""),
-                  before.rfind("'"), before.rfind(","), before.rfind("["))
-        word = before[cut + 1:]
-        if word in _NAME_VALUE_FLAGS:
+        if _is_name_flag_value(text, m.start()):
             continue
         return True
     return False
+
+
+def _is_name_flag_value(text, pos):
+    """Is the word at text[pos] the value of a _NAME_VALUE_FLAGS flag?"""
+    before = text[max(0, pos - _FLAG_LOOKBACK):pos].rstrip(" \t\"',[\\")
+    cut = max(before.rfind(" "), before.rfind("\t"), before.rfind("\""),
+              before.rfind("'"), before.rfind(","), before.rfind("["))
+    return before[cut + 1:] in _NAME_VALUE_FLAGS
+
+
+# Credentials of other command-line clients (_client_credential_spans):
+# client name -> (credential flags, separator between user and password, or
+# None when the whole value is the password, "=" accepted after the flag).
+# Other flags of these clients (redis-cli -p 6379, mosquitto_pub -p 1883 are
+# ports) and other clients are left alone; curl, HTTPie / xh, mysql and the
+# login commands have their own rules.
+_CLIENT_CREDENTIAL_COMMANDS = {
+    "curlie": (("-u", "--user"), ":", True),
+    "ab": (("-A",), ":", False),
+    "hey": (("-a",), ":", False),
+    "lftp": (("-u", "--user"), ",", False),
+    "smbclient": (("-U", "--user"), "%", True),
+    "mongosh": (("-p",), None, True),
+    "mongo": (("-p",), None, True),
+    "redis-cli": (("-a",), None, False),
+    "sqlcmd": (("-P",), None, False),
+    "mosquitto_pub": (("-P",), None, False),
+    "mosquitto_sub": (("-P",), None, False),
+    "mosquitto_rr": (("-P",), None, False),
+    "rabbitmqadmin": (("-p",), None, False),
+}
+_CLIENT_WORD_RE = re.compile(
+    r"(?:(?<![\w./-])|(?<=bin/))(?:curlie|ab|hey|lftp|smbclient|mongosh|mongo|redis-cli|sqlcmd"
+    r"|mosquitto_(?:pub|sub|rr)|rabbitmqadmin)(?![\w:-]|\.(?!exe\b))",
+    re.IGNORECASE,
+)
+# A credential flag of _CLIENT_CREDENTIAL_COMMANDS (group 1), "=" (group 2)
+# and its value's raw run (group 3; _value_end() cuts it), which does not
+# start with "-" (the next flag).
+_CLIENT_FLAG_RE = re.compile(
+    r"(?<![\w-])(-[uAaUpP]|--user)(?:(=)|[ \t]+)(?:\\{0,3}[\"'])?"
+    r"((?:[^\s\"'\\-]|\\(?!\\{0,2}[\"']))(?:[^\s\"'\\]|\\(?!\\{0,2}[\"']))*)"
+)
+
+
+def _client_state(text, state):
+    """The client of _CLIENT_CREDENTIAL_COMMANDS running at the end of `text`
+    (lower-cased name, or None); `state` is the answer for the text before."""
+    last = None
+    for last in _COMMAND_SEP_RE.finditer(text):
+        pass
+    if last is not None:
+        text = text[last.end():]
+        state = None
+    for m in _CLIENT_WORD_RE.finditer(text):
+        if not _is_name_flag_value(text, m.start()):
+            state = m.group().lower()
+    return state
+
+
+def _client_credential_spans(line, prev):
+    """Password spans of the clients of _CLIENT_CREDENTIAL_COMMANDS
+    (curlie -u user:pw, ab -A user:pw, hey -a user:pw, lftp -u user,pw,
+    smbclient -U user%pw, mongosh -p pw, redis-cli -a pw, sqlcmd -P pw,
+    mosquitto_pub -P pw, rabbitmqadmin -p pw).
+
+    The flag counts only when the client name comes before it in the same
+    command (on this line, or on the lines it continues), as the command and
+    not as a flag value. A user without a password (prompts), uid:gid shapes,
+    references ($PW, {{ x }}) and, for a whole-value password, a word of
+    fewer than 8 letters (`mongosh -p` then prose) are left as written.
+    """
+    spans = []
+    if _CLIENT_WORD_RE.search(line) is None and (not prev or _CLIENT_WORD_RE.search(prev) is None):
+        return spans
+    state = _client_state(prev, None) if prev else None
+    pos = 0
+    for m in _CLIENT_FLAG_RE.finditer(line):
+        state = _client_state(line[pos:m.start()], state)
+        pos = m.start()
+        if state is None:
+            continue
+        flags, sep, eq = _CLIENT_CREDENTIAL_COMMANDS[state]
+        if m.group(1) not in flags or (m.group(2) and not eq):
+            continue
+        start = m.start(3)
+        end = _value_end(line, start, m.end(3))
+        if end <= start or _reference_head(line[start:end]):
+            continue
+        if sep is not None:
+            cut = line.find(sep, start, end)
+            if cut < 0:
+                continue  # a user name alone: the client prompts
+            user = line[start:cut]
+            start = cut + 1
+            if end <= start or _reference_head(line[start:end]):
+                continue
+            if user.isdigit() and line[start:end].isdigit():
+                continue  # uid:gid
+        elif end - start < 8 and line[start:end].isalpha():
+            # A flag whose whole value is the password prompts when nothing
+            # follows it (`mongosh -p`): a short word of letters after it is
+            # the text that goes on, not a password.
+            continue
+        if _maskable_value(line, start, end):
+            spans.append((start, end))
+    return spans
 
 
 def _reference_head(value):
     """Does a credential value start like a reference or template ($X, $$X,
     ${X}, ${{ x }}, $(cmd), {{ x }})? Such a value is left as written."""
     return value[:1] == "$" or value[:2] == "{{"
+
+
+def _mysql_value_end(line, start, end):
+    """End of the unquoted mysql password in the raw run line[start:end].
+
+    & ; | ( ) < > belong to the password (-pAb3&xY9z, -pab<cd>ef) unless
+    the run ends right after one of them or it starts && || ;; >> << |& >&
+    <&: the password then ends before it (-pPw; ls, -pPw&&echo ok). A ")"
+    closing a "(" of the password belongs to it (-pab(cd) db). Trailing
+    punctuation is then cut as for other values ((mysql -pPw), -pPw.), but
+    not such a closing ")".
+    """
+    depth = 0
+    closed = -1
+    stop = end
+    for m in _MYSQL_OPERATOR_RE.finditer(line, start, end):
+        i = m.start()
+        c = line[i]
+        if c == ")" and depth:
+            depth -= 1
+            closed = i
+            continue
+        if i + 1 >= end or line[i:i + 2] in _MYSQL_END_PAIRS:
+            stop = i
+            break
+        if c == "(":
+            depth += 1
+    cut = _value_end(line, start, stop)
+    return max(cut, closed + 1) if closed >= 0 else cut
+
+
+def _mysql_maskable(line, start, end):
+    """_maskable_value() for a mysql password: ( and < after a short value
+    belong to the command (-pab(x) is the password ab(x)), not a template."""
+    if _maskable_value(line, start, end):
+        return True
+    value = line[start:end]
+    return (line[end:end + 1] in ("(", "<") and not _REFERENCE_RE.fullmatch(value)
+            and value.lower() not in _SHORT_NON_SECRETS)
 
 
 def _mysql_password_spans(line, prev):
@@ -1485,7 +1686,8 @@ def _mysql_password_spans(line, prev):
     (on this line, or on the lines it continues), as the command and not as a
     flag value: `gcc -pthread` after `mysql -e x;` and `sudo -u mysql mkdir
     -pv` are not passwords. A value starting with "$" (a reference, also the
-    compose escape $$VAR) is left as written.
+    compose escape $$VAR) is left as written. The ; & | inside a password
+    (-pAb3;xY9z) do not end its command.
     """
     spans = []
     lower = line.lower()
@@ -1502,13 +1704,15 @@ def _mysql_password_spans(line, prev):
             continue
         if m.group(2) is not None:
             start, end = m.span(2)
+            maskable = _maskable_value(line, start, end)
         else:
             start = m.start(3)
-            end = _value_end(line, start, m.end(3))
+            end = _mysql_value_end(line, start, m.end(3))
+            maskable = _mysql_maskable(line, start, end)
         if (end > start and not _reference_head(line[start:end])
-                and not _PORT_MAP_RE.fullmatch(line, start, end)
-                and _maskable_value(line, start, end)):
+                and not _PORT_MAP_RE.fullmatch(line, start, end) and maskable):
             spans.append((start, end))
+            pos = end  # the next command starts after the password
     return spans
 
 
@@ -1703,7 +1907,9 @@ def _url_password_spans(line):
     "/" or "#"), not counting an "@" right after "/" (npm /@scope/ and
     /home/u/@x/ paths), unless an earlier "@" is followed by a host and a
     path, query or fragment holding that last "@" (?email=x@y.com,
-    /pkg@1.0). host:port/path and [IPv6]:port are not a user and a password.
+    /pkg@1.0) and the last "@" is not itself followed by a host
+    (_url_password_end). host:port/path and [IPv6]:port are not a user and a
+    password.
     Each URL is looked at once and the URLs of a run do not overlap: linear.
     """
     spans = []
@@ -1748,15 +1954,25 @@ def _url_password_end(line, start, end):
     if last_at <= start:
         return -1
     # An earlier "@" followed by a host and then "/", "?" or "#" ends the
-    # userinfo: the later "@" sits in the path, query or fragment.
+    # userinfo: the later "@" sits in the path, query or fragment ...
     at = line.find("@", start, last_at)
     while at >= 0:
         if at > start and line[at - 1] != "/":
             h = _URL_HOST_AT_RE.match(line, at + 1, end)
             if h is not None and h.end() < last_at:
-                return at
+                break
         at = line.find("@", at + 1, last_at)
-    return last_at
+    else:
+        return last_at
+    # ... unless no "?" or "#" comes before the last "@" and a host follows
+    # it (u:ab@cd.ef/gh@db.example.com:5432/app): then the password holds
+    # "@cd.ef/". /pkg@1.0.2, /react@18.2.0/ and /logo@2x.png are no hosts.
+    if line.find("?", at, last_at) >= 0 or line.find("#", at, last_at) >= 0:
+        return at
+    h = _URL_LAST_HOST_RE.match(line, last_at + 1, end)
+    if h is not None and (h.group(1) is None or h.group(1).lower() not in _URL_FILE_SUFFIXES):
+        return last_at
+    return at
 
 
 def _query_secret_name(name, ctx):
@@ -1775,9 +1991,27 @@ def _query_secret_spans(line, ctx):
     for m in _QUERY_PARAM_RE.finditer(line):
         if m.start() < last:
             continue  # inside a value already masked
-        if not _query_secret_name(m.group(1), ctx):
+        low = m.group(1).lower().replace("-", "_")
+        if line[m.start()] == ";":
+            # /path;jsessionid=... (other names after ";" are not queries)
+            if low != "jsessionid":
+                continue
+            extra = True
+        elif _query_secret_name(m.group(1), ctx):
+            extra = False
+        elif low in _QUERY_EXTRA_NAMES:
+            extra = True
+        else:
             continue
         v = _QUERY_VALUE_RE.match(line, m.end())
+        if extra:
+            if (v is not None and _query_extra_value(low, v.group())
+                    and not _REFERENCE_RE.fullmatch(v.group())
+                    and not _TEMPLATE_REF_RE.fullmatch(v.group())
+                    and not _reference_head(v.group())):
+                spans.append(v.span())
+                last = v.end()
+            continue
         if v is None or v.end() - v.start() < _query_value_min(m.group(1)):
             continue
         value = v.group()
@@ -1797,13 +2031,17 @@ def _query_secret_spans(line, ctx):
 # _SECRET_KEY_HINT_RE (assignments, flags, the quoted api_key pattern), "pat"
 # (PG018 admin names), the sig / signature query parameters and the token /
 # URL / header hints, "pw=" (query parameter), "cookie", and "curl" / "login"
-# (curl -u / -b, docker login -p). A text without any has nothing to mask.
+# (curl -u / -b, docker login -p), the clients of _CLIENT_CREDENTIAL_COMMANDS
+# (curlie is found by "curl") and the _QUERY_EXTRA_NAMES parameters. A text
+# without any has nothing to mask.
 # Matched against the lower-cased text (several times faster than one
 # case-insensitive alternation when thousands of short messages are masked).
 _MASK_HINT_RE = re.compile(
     r"secret|token|pass|pwd|key|credential|auth|akia|sk-|gh[pousr]_|github_pat_|k_live_|k_test_|"
     r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws|sig=|signature=|pw=|"
-    r"cookie|curl|login|mysql|mariadb|http|xhs? "
+    r"cookie|curl|login|mysql|mariadb|http|xhs? |"
+    r"sid=|ticket=|jwt=|session_id=|sessionid=|\?k=|&k=|"
+    r"hey -a|ab -a|lftp|smbclient|mongo|redis-cli|sqlcmd|mosquitto_|rabbitmqadmin"
 )
 
 

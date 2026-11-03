@@ -162,16 +162,29 @@ of `-u` / `--user user:pass` (also grouped, as in `-ku`) and the cookies of `-b`
 line of the libcurl client (its name on the line itself or on the lines that
 line continues with a trailing `\`), the password of `login ... -p` (and
 `--password`), the password of HTTPie / xh `-a` / `--auth user:pass` (the
-whole value when the command also has `-A bearer`), the password written right
+whole value when the command also has `-A bearer`), the password of other
+command-line clients (`curlie -u user:pass`, `ab -A user:pass`,
+`hey -a user:pass`, `lftp -u user,pass`, `smbclient -U user%pass`, and the
+whole value of `mongosh` / `mongo -p`, `redis-cli -a`, `sqlcmd -P`,
+`mosquitto_pub` / `mosquitto_sub` / `mosquitto_rr -P` and `rabbitmqadmin -p`;
+their other flags, such as the port in `redis-cli -p 6379`, are left alone, and
+so is a whole value of fewer than eight letters), the password written right
 after `-p` in a `mysql` / `mariadb` client command (`-pPASSWORD`, `-p'PASSWORD'`;
-`-p` followed by a space prompts and is left alone), the value on the line
+`-p` followed by a space or by `;` `|` `<` prompts and is left alone; an
+unquoted password may hold `&` `;` `|` `(` `)` `<` `>` and ends before one of
+them that is followed by whitespace, a quote or the end of the line, or that
+starts `&&` `||` `;;` `>>` `<<` `|&` `>&` `<&`, while a `)` closing a `(` of the
+password belongs to it), the value on the line
 after a credential flag in a multi-line JSON array (`"--token",` then
 `"value",`), the credential of an `Authorization: Bearer` / `Basic` value
 (eight or more characters holding a digit; besides the RFC 6750 characters it
-may hold `!` `#` `$` `%` `*` `?` `@` `^` `=`, and it ends at
-whitespace, a quote or other punctuation such as `:` `,` `;` `(` `<` `&` `|`), and
-cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie and mysql
-client name counts as the command, not as the value of a user, host or
+may hold `!` `#` `$` `%` `*` `?` `@` `^` `=`, and `:` `,` `;` right before a
+part of eight or more such characters that starts with a letter or digit, as
+in `user:password1`; it ends at whitespace, a quote, other punctuation such as
+`(` `<` `&` `|`, or `:` `,` `;` before anything else: `bearer token:abc1` and
+`Bearer <token>;rm -rf x` keep the text after `:` and `;`), and
+cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie, mysql
+and other client names count as the command, not as the value of a user, host or
 container name flag (`-u`, `--user`, `--name` ...) nor as a folder of a path
 (`/var/lib/mysql`; `/usr/bin/mysql` counts): `sudo -u mysql mkdir -pv` and
 `find /var/lib/mysql -perm 600` are left alone. Their values starting with
@@ -212,19 +225,30 @@ the name alone decides, so `?key=mainkeyfile` shows `?key=main***`. Values of
 `password`, `pw`, `pwd`, `pass`, `passwd`, `token`, `access_token`, `secret`,
 `client_secret`, `api_key` and `apikey` (in any case) are masked at any length
 (`?pw=abc` shows `?pw=***`); the other names need eight or more characters.
+Session, ticket and app key parameters (`k`, `appkey`, `app_key`, `sid`,
+`sessionid`, `session_id`, `jsessionid`, also after `;` as in
+`/path;jsessionid=...`, `phpsessid`, `ticket`, `subscription_key` and `jwt`)
+are masked when the value looks like one: eight or more characters with a
+digit or both upper- and lower-case letters; `k` needs sixteen or more
+letters, digits, `_` or `-` with both a digit and a letter (`?k=usb+c+cable`
+is a search). Other names (`q`, `id`, `code`, `state`, `keyword` ...) are not
+masked.
 Empty values, references (`?token=$TOKEN`), templates
 (`?token={{ secrets.T }}`) and the short literals above (`?secret=none`) are
 left as written. A URL password runs up to the `@` before the host:
 comma-separated URLs are taken one by one, an `@` in a path (`/@scope/pkg`) or
-after the host (`?email=x@y.com`) is not part of it, and a password may start
-with `/`. Cookie attributes (`Path`, `Domain`, `Expires` ...) are not masked.
+after the host (`?email=x@y.com`, `/pkg@1.0.2`, `/img/logo@2x.png`) is not
+part of it, and a password may start with `/`. A password may itself hold
+`@name.tld/`: when no `?` or `#` comes before the last `@` of the URL and a
+host follows that `@` (a dotted name whose last label is two or more letters
+and not a file type such as `png`, `js` or `webp`, an IPv4 address, `[IPv6]`
+or `localhost`), the password runs to that last `@`. Cookie attributes (`Path`, `Domain`, `Expires` ...) are not masked.
 
 Masking is not complete: values in formats promptguard does not recognize
-(such as `-u user:pass` outside a libcurl command line, or query parameters
-outside the secret names, `?k=...`) are shown as written, and so is a password
+(such as `-u user:pass` outside the clients listed above, or query parameters
+outside the names listed above) are shown as written, and so is a password
 that holds whitespace, an escaped quote, or spliced quotes
-(`'ab'\''cd'`). An unquoted `mysql -p` password ends at a command separator
-(`&` `;` `|` `(`) and a Bearer / Basic value at the punctuation listed above,
+(`'ab'\''cd'`). A Bearer / Basic value ends at the punctuation listed above,
 so the rest of such a value is shown; a multi-line JSON value holding an
 escape (`\\`) is not paired with its flag line; and a password starting
 with `$` is taken for a reference. A password made only of letters in one case (`hunterxyz`,
@@ -233,8 +257,17 @@ lines; on other lines a value is also looked for only when it is five or more
 characters long, or in URL-password position (`:pw@`). A URL password that
 starts with `/` is not looked for without that `/`. Masking can also cover text that
 is not a secret: a `mysql` or `http` word given as an argument of another
-command (`service mysql restart -pv`, `grep mysql -pv`) is taken for the
-client.
+command (`service mysql restart -pv`, `grep mysql -pv`,
+`find /usr/bin/mysql -perm 600`) is taken for the client; an unquoted `mysql`
+password followed without a space by a redirection, a pipe or another command
+(`-pPASS>file`, `-pPASS|cmd`, `-pPASS&cmd`, `-pPASS;echo done`) is masked
+together with that file name or command; prose such as `Basic auth:RFC-7617`
+is read as a Basic value; a URL whose path holds an e-mail address
+(`u:pw@x.com/users/bob@corp.com/profile`) is masked up to that address's `@`;
+one bare word between `docker login` and `-p` is taken for a registry
+(`docker login cp -p notes.txt` masks `notes.txt`); short values of
+`--key`-style flags are masked in prose too (`--key id` shows `--key ***`); and
+the name of a secret query parameter decides alone (`?key=mainkeyfile`).
 
 ## Usage in CI
 
