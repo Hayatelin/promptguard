@@ -1121,10 +1121,51 @@ _FLAG_VALUE_RE = re.compile(
     r"(?<![\w-])--?([A-Za-z][\w-]{0,40})(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
     r"([^\s\"'`,;|&<>()\[\]{}$/~.\\-](?:[^\s\"'`,;|&<>()\[\]{}\\]|\\(?!\\{0,2}[\"']))*)"
 )
+# The credential starts with a token68 character and may hold the symbols
+# ! # $ % * ? @ ^ = outside RFC 6750 (Ab3!xYz9, Tk8%Zq*Lm4), which are masked
+# with it; it stops at whitespace, quotes, the punctuation of prose and URLs
+# (: , ; ( ) [ ] { } < >) and the command operators & and |, so "basic
+# https://x/v1", "a basic example(v2)" and "Bearer tok|base64" keep the text
+# after the value. _value_end() then cuts a trailing "." or "`". A reference
+# (${TOKEN}, <token>) does not start with a token68 character.
 _AUTH_VALUE_RE = re.compile(
-    r"\b(?:Bearer|Basic)[ \t]+((?=[A-Za-z0-9._~+/-]*[0-9])[A-Za-z0-9._~+/-]{8,}=*)",
+    r"\b(?:Bearer|Basic)[ \t]+((?=[A-Za-z0-9._~+/=!#$%*?@^-]*[0-9])"
+    r"[A-Za-z0-9._~+/-][A-Za-z0-9._~+/=!#$%*?@^-]{7,})",
     re.IGNORECASE,
 )
+# HTTPie (http / https) and xh (xh / xhs): -a / --auth user:password, also at
+# the end of a group of short flags that take no argument (-va). With
+# -A bearer / --auth-type=bearer the whole -a value is the token.
+# The client name is a word followed by a space, or a JSON argv item ("http", ...).
+_HTTPIE_WORD_RE = re.compile(
+    r"(?<![\w./:-])(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
+)
+_HTTPIE_AUTH_RE = re.compile(
+    r"(?<![\w-])(?:-[vhbdcfFjSIxq]*a|--auth)"
+    r"(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?"
+    r"(([^\s\"':\\]*):(?:\\{0,3}[\"'])?)?((?:[^\s\"'\\]|\\(?!\\{0,2}[\"']))+)"
+)
+_HTTPIE_BEARER_RE = re.compile(
+    r"(?<![\w-])(?:-A|--auth-type)(?:=|[ \t]+|\\{0,3}[\"'][ \t]*,[ \t]*)(?:\\{0,3}[\"'])?bearer\b",
+    re.IGNORECASE,
+)
+# MySQL / MariaDB clients: -pPASSWORD (the password written right after -p;
+# "-p" followed by a space prompts for it).
+_MYSQL_WORD_RE = re.compile(
+    r"(?:(?<![\w./-])|(?<=bin/))(?:mysql(?:dump|admin|import|show|check|pump|slap|binlog|sh)?"
+    r"|mariadb(?:-(?:dump|admin|import|show|check|slap|binlog))?)(?![\w:-]|\.(?!exe\b))",
+    re.IGNORECASE,
+)
+# A docker / podman port mapping (-p3306:3306, -p127.0.0.1:3306:3306/tcp).
+_PORT_MAP_RE = re.compile(r"(?:[0-9.]+:)?[0-9]{1,5}(?:-[0-9]{1,5})?:[0-9]{1,5}(?:-[0-9]{1,5})?(?:/[a-z]+)?")
+# Group 2: a quoted password (-p'pw', -p"pw"); group 3: an unquoted one.
+_MYSQL_P_RE = re.compile(
+    r"(?<![\w-])-p(?:([\"'])([^\"'\n]+)\1|((?:[^\s\"'`|&;<>()\\]|\\(?!\\{0,2}[\"']))+))"
+)
+# One string of a JSON array on its own line ("value",) and a flag string
+# ("--token",) on the line before it.
+_JSON_ITEM_RE = re.compile(r"[ \t]*\"([^\s\"\\]+)\"[ \t]*,?[ \t]*\Z")
+_JSON_FLAG_ITEM_RE = re.compile(r"[ \t]*\"--?([A-Za-z][\w-]{0,40})\"[ \t]*,[ \t]*\Z")
 # Token shapes masked wherever they appear (a superset of what is reported).
 _MASK_TOKEN_RES = (
     (re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"), "github_pat_"),
@@ -1241,11 +1282,24 @@ def _secret_spans(line, ctx):
             if prev is None and not ("login" in lower and _LOGIN_WORD_RE.search(line)):
                 prev = _continued_command(line, ctx)
             spans.extend(_login_password_spans(line, prev or ""))
+            if prev is None:
+                prev = _continued_command(line, ctx)
+            spans.extend(_mysql_password_spans(line, prev))
+        if "a" in line:  # -a, -va, --auth (_httpie_auth_spans exits early without http / xh)
+            if prev is None:
+                prev = _continued_command(line, ctx)
+            spans.extend(_httpie_auth_spans(line, prev or "", ctx))
+    if line[:1] in " \t\"" and ctx is not None:
+        spans.extend(_json_flag_value_spans(line, ctx))
     if "ookie" in line or "OOKIE" in line:
         for m in _COOKIE_HEADER_RE.finditer(line):
             spans.extend(_cookie_value_spans(line, m.end()))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
-        spans.extend(m.span(1) for m in _AUTH_VALUE_RE.finditer(line))
+        for m in _AUTH_VALUE_RE.finditer(line):
+            start = m.start(1)
+            end = _value_end(line, start, m.end(1))
+            if end - start >= 8:
+                spans.append((start, end))
     # Credential-named values: what PG007 reads by key name, and the admin
     # credential names of PG018 (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT), whatever
     # the value looks like (PG007 does not report a plain hex value) and
@@ -1374,6 +1428,222 @@ def _login_password_spans(line, prev):
         if end > start and _maskable_value(line, start, end):
             spans.append((start, end))
     return spans
+
+
+def _command_has(text, word_re, in_command):
+    """Is the command running at the end of `text` (after its last ; | & ` ( )
+    newline or ", ") one named by word_re? `in_command` is the answer for
+    the text before it."""
+    last = None
+    for last in _COMMAND_SEP_RE.finditer(text):
+        pass
+    if last is not None:
+        text = text[last.end():]
+        in_command = False
+    return in_command or _names_command(text, word_re)
+
+
+# How far back _names_command looks for the word before a client name.
+_FLAG_LOOKBACK = 120
+# Flags whose value is a user, group, host, container or network name: the
+# client name right after one of them is that value, not the command.
+_NAME_VALUE_FLAGS = frozenset((
+    "-u", "--user", "-g", "--group", "-U", "--username", "--name", "--hostname",
+    "-h", "--host", "--network", "--net", "--link", "--container",
+))
+
+
+def _names_command(text, word_re):
+    """Does word_re find a client name in `text` that is not a flag's value?
+
+    `sudo -u mysql mkdir -pv` and `docker run --name mysql -p3306:3306`
+    name a user and a container, not the mysql client; after other flags
+    (`sudo -E mysql`, `sh -c "mysql ..."`) the name is the command.
+    """
+    for m in word_re.finditer(text):
+        before = text[max(0, m.start() - _FLAG_LOOKBACK):m.start()].rstrip(" \t\"',[\\")
+        cut = max(before.rfind(" "), before.rfind("\t"), before.rfind("\""),
+                  before.rfind("'"), before.rfind(","), before.rfind("["))
+        word = before[cut + 1:]
+        if word in _NAME_VALUE_FLAGS:
+            continue
+        return True
+    return False
+
+
+def _reference_head(value):
+    """Does a credential value start like a reference or template ($X, $$X,
+    ${X}, ${{ x }}, $(cmd), {{ x }})? Such a value is left as written."""
+    return value[:1] == "$" or value[:2] == "{{"
+
+
+def _mysql_password_spans(line, prev):
+    """Value spans of -pPASSWORD / -p'PASSWORD' in a mysql / mariadb client
+    command.
+
+    The -p counts only when a client name comes before it in the same command
+    (on this line, or on the lines it continues), as the command and not as a
+    flag value: `gcc -pthread` after `mysql -e x;` and `sudo -u mysql mkdir
+    -pv` are not passwords. A value starting with "$" (a reference, also the
+    compose escape $$VAR) is left as written.
+    """
+    spans = []
+    lower = line.lower()
+    if "mysql" not in lower and "mariadb" not in lower:
+        plower = prev.lower()
+        if "mysql" not in plower and "mariadb" not in plower:
+            return spans
+    state = _command_has(prev, _MYSQL_WORD_RE, False) if prev else False
+    pos = 0
+    for m in _MYSQL_P_RE.finditer(line):
+        state = _command_has(line[pos:m.start()], _MYSQL_WORD_RE, state)
+        pos = m.start()
+        if not state:
+            continue
+        if m.group(2) is not None:
+            start, end = m.span(2)
+        else:
+            start = m.start(3)
+            end = _value_end(line, start, m.end(3))
+        if (end > start and not _reference_head(line[start:end])
+                and not _PORT_MAP_RE.fullmatch(line, start, end)
+                and _maskable_value(line, start, end)):
+            spans.append((start, end))
+    return spans
+
+
+def _httpie_auth_spans(line, prev, ctx=None):
+    """Value spans of HTTPie / xh -a / --auth credentials.
+
+    user:password masks the password; with -A bearer (--auth-type=bearer)
+    in the same command (this line, the lines it continues, or the "\\"
+    continuation lines after it) the whole value is the token. -a user alone
+    prompts and is left as written. The client name must come before the
+    flag in the same command, as the command and not as a flag value. A
+    value starting like a reference ($X, ${{ x }}) is left as written.
+    """
+    spans = []
+    lower = line.lower()
+    if "http" not in lower and "xh" not in lower:
+        plower = prev.lower()
+        if "http" not in plower and "xh" not in plower:
+            return spans
+    state = _command_has(prev, _HTTPIE_WORD_RE, False) if prev else False
+    # A value without "user:" is a token only when its command selects
+    # bearer auth; otherwise it is a user name (prompts).
+    seps = None
+    bearer_cache = {}
+    pos = 0
+    for m in _HTTPIE_AUTH_RE.finditer(line):
+        state = _command_has(line[pos:m.start()], _HTTPIE_WORD_RE, state)
+        pos = m.start()
+        if not state:
+            continue
+        if seps is None:
+            seps = [(x.start(), x.end()) for x in _COMMAND_SEP_RE.finditer(line)]
+        bearer = _command_bearer(line, prev, ctx, seps, m.start(), bearer_cache)
+        if bearer:
+            # The whole value is the token, ":" included.
+            start = m.start(1) if m.group(1) is not None else m.start(3)
+        elif m.group(1) is None:
+            continue
+        else:
+            start = m.start(3)
+        end = _value_end(line, start, m.end(3))
+        if end <= start or _reference_head(line[start:end]):
+            continue
+        # -a 1000:1000 shapes (uid:gid) are not credentials.
+        if not bearer and m.group(2) and m.group(2).isdigit() and line[start:end].isdigit():
+            continue
+        if _maskable_value(line, start, end):
+            spans.append((start, end))
+    return spans
+
+
+def _command_bearer(line, prev, ctx, seps, pos, cache):
+    """Does the command around line[pos] select bearer auth (-A bearer)?
+
+    The command runs from the last separator before `pos` (or, without one,
+    from the start of the lines this line continues) to the next separator
+    after it (or, without one, through the continuation lines after it).
+    `seps` lists the separator spans of `line`; `cache` keeps one answer per
+    command.
+    """
+    i = bisect.bisect_right(seps, (pos, pos))
+    if i in cache:
+        return cache[i]
+    start = seps[i - 1][1] if i > 0 else 0
+    end = seps[i][0] if i < len(seps) else len(line)
+    found = _HTTPIE_BEARER_RE.search(line, start, end) is not None
+    if not found and i == 0 and prev:
+        tail = prev[_last_separator_end(prev):]
+        found = _HTTPIE_BEARER_RE.search(tail) is not None
+    if not found and i == len(seps):
+        after = _continuation_after(line, ctx)
+        if after:
+            m = _COMMAND_SEP_RE.search(after)
+            found = _HTTPIE_BEARER_RE.search(after, 0, m.start() if m else len(after)) is not None
+    cache[i] = found
+    return found
+
+
+def _last_separator_end(text):
+    last = None
+    for last in _COMMAND_SEP_RE.finditer(text):
+        pass
+    return last.end() if last is not None else 0
+
+
+def _continuation_after(line, ctx):
+    """The text of the lines that continue `line` (it and each of them end
+    with "\\"), or "". Only the scanned line itself has such lines."""
+    if ctx is None or not line.endswith("\\"):
+        return ""
+    lines = ctx.get("lines")
+    idx = ctx.get("lineno")
+    if not lines or not idx or idx > len(lines) or lines[idx - 1] is not line:
+        return ""
+    parts = []
+    i = idx
+    while i < len(lines) and len(parts) < _CONTINUATION_LOOKBACK:
+        parts.append(lines[i])
+        if not lines[i].endswith("\\"):
+            break
+        i += 1
+    return " ".join(parts)
+
+
+def _json_flag_value_spans(line, ctx):
+    """The value of a JSON array string on its own line ("value",) when the
+    line before it is a credential flag string ("--token",)."""
+    m = _JSON_ITEM_RE.match(line)
+    if m is None:
+        return ()
+    prev = _previous_line(line, ctx)
+    if not prev or "-" not in prev:
+        return ()
+    f = _JSON_FLAG_ITEM_RE.match(prev)
+    if f is None:
+        return ()
+    name = f.group(1)
+    if not (_is_secret_key(name, ctx) or _key_segments(name)[-1:] == ["key"]
+            or _admin_value_name(name)):
+        return ()
+    start, end = m.span(1)
+    # Same first-character rule as _FLAG_VALUE_RE: not a next flag, a path
+    # or a reference.
+    if line[start] in "$/~.-" or not _maskable_value(line, start, end):
+        return ()
+    return ((start, end),)
+
+
+def _previous_line(line, ctx):
+    """The line before the scanned line `line`, or ""."""
+    lines = ctx.get("lines")
+    idx = ctx.get("lineno")
+    if not lines or not idx or idx < 2 or idx > len(lines) or lines[idx - 1] is not line:
+        return ""
+    return lines[idx - 2]
 
 
 # (inside a login command, next word is a flag value, a bare registry name
@@ -1533,7 +1803,7 @@ def _query_secret_spans(line, ctx):
 _MASK_HINT_RE = re.compile(
     r"secret|token|pass|pwd|key|credential|auth|akia|sk-|gh[pousr]_|github_pat_|k_live_|k_test_|"
     r"npm_|mii|xox|aiza|eyj|-----begin |://|bearer|basic|aws|sig=|signature=|pw=|"
-    r"cookie|curl|login"
+    r"cookie|curl|login|mysql|mariadb|http|xhs? "
 )
 
 
@@ -1577,8 +1847,11 @@ def _mask_spans(line, ctx):
 
 def _mask_spans_uncached(line, ctx):
     if not _has_mask_hint(line) and not (
-            "-" in line and _has_mask_hint(_continued_command(line, ctx))):
-        # (A "\" continuation line `  -u admin:pw \` holds no hint itself.)
+            "-" in line and _has_mask_hint(_continued_command(line, ctx))) and not (
+            line[:1] in " \t\"" and ctx is not None and _JSON_ITEM_RE.match(line) is not None
+            and _has_mask_hint(_previous_line(line, ctx))):
+        # (A "\" continuation line `  -u admin:pw \` holds no hint itself,
+        # nor does the "value", line after a "--token", line.)
         return line, []
     merged = []
     for start, end in sorted(_secret_spans(line, ctx)):

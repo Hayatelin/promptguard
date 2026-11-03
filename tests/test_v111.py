@@ -503,13 +503,13 @@ class TestRulesNeverRaise(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestVersion(unittest.TestCase):
-    def test_version_is_1_1_1(self):
-        self.assertEqual(promptguard.__version__, "1.1.1")
+    def test_version_is_1_1_2(self):
+        self.assertEqual(promptguard.__version__, "1.1.2")
         out = io.StringIO()
         with redirect_stdout(out):
             with self.assertRaises(SystemExit):
                 main(["--version"])
-        self.assertEqual(out.getvalue().strip(), "promptguard 1.1.1")
+        self.assertEqual(out.getvalue().strip(), "promptguard 1.1.2")
 
 
 # ---------------------------------------------------------------------------

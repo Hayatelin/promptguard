@@ -161,7 +161,22 @@ credential-named values, URL passwords, secret query parameters, the password
 of `-u` / `--user user:pass` (also grouped, as in `-ku`) and the cookies of `-b` / `--cookie` in a command
 line of the libcurl client (its name on the line itself or on the lines that
 line continues with a trailing `\`), the password of `login ... -p` (and
-`--password`), and cookie values (`Cookie:` / `Set-Cookie:` headers).
+`--password`), the password of HTTPie / xh `-a` / `--auth user:pass` (the
+whole value when the command also has `-A bearer`), the password written right
+after `-p` in a `mysql` / `mariadb` client command (`-pPASSWORD`, `-p'PASSWORD'`;
+`-p` followed by a space prompts and is left alone), the value on the line
+after a credential flag in a multi-line JSON array (`"--token",` then
+`"value",`), the credential of an `Authorization: Bearer` / `Basic` value
+(eight or more characters holding a digit; besides the RFC 6750 characters it
+may hold `!` `#` `$` `%` `*` `?` `@` `^` `=`, and it ends at
+whitespace, a quote or other punctuation such as `:` `,` `;` `(` `<` `&` `|`), and
+cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie and mysql
+client name counts as the command, not as the value of a user, host or
+container name flag (`-u`, `--user`, `--name` ...) nor as a folder of a path
+(`/var/lib/mysql`; `/usr/bin/mysql` counts): `sudo -u mysql mkdir -pv` and
+`find /var/lib/mysql -perm 600` are left alone. Their values starting with
+`$` or `{{` (`-p$$MYSQL_ROOT_PASSWORD`, `-a ${{ secrets.T }}`) and port
+mappings (`-p3306:3306`) are left as written.
 In the message and snippet of every rule, each such value keeps its first four
 characters followed by `***`, and a value shorter than eight characters
 becomes `***`, in the text and the `--json` output alike. A value found on one
@@ -205,14 +220,21 @@ after the host (`?email=x@y.com`) is not part of it, and a password may start
 with `/`. Cookie attributes (`Path`, `Domain`, `Expires` ...) are not masked.
 
 Masking is not complete: values in formats promptguard does not recognize
-(such as HTTPie's `-a user:pass`, `mysql -pPASSWORD`, or `-u user:pass`
-outside a libcurl command line) are shown as written, and so is a password
+(such as `-u user:pass` outside a libcurl command line, or query parameters
+outside the secret names, `?k=...`) are shown as written, and so is a password
 that holds whitespace, an escaped quote, or spliced quotes
-(`'ab'\''cd'`). A password made only of letters in one case (`hunterxyz`,
+(`'ab'\''cd'`). An unquoted `mysql -p` password ends at a command separator
+(`&` `;` `|` `(`) and a Bearer / Basic value at the punctuation listed above,
+so the rest of such a value is shown; a multi-line JSON value holding an
+escape (`\\`) is not paired with its flag line; and a password starting
+with `$` is taken for a reference. A password made only of letters in one case (`hunterxyz`,
 `ADMINPASS`) is masked on its own line but not where it is repeated on other
 lines; on other lines a value is also looked for only when it is five or more
 characters long, or in URL-password position (`:pw@`). A URL password that
-starts with `/` is not looked for without that `/`.
+starts with `/` is not looked for without that `/`. Masking can also cover text that
+is not a secret: a `mysql` or `http` word given as an argument of another
+command (`service mysql restart -pv`, `grep mysql -pv`) is taken for the
+client.
 
 ## Usage in CI
 
