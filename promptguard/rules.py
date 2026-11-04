@@ -2489,10 +2489,16 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None, whole=())
             k = bisect.bisect_right(starts_w, end - 1) - 1
             return k >= 0 and runs_w[k][1] > start
 
-        line_values = [line[s:e] for s, e in plain_runs] + [line[s:e] for s, e in new]
+        # The values of the other spans (a whole span's own value sits at its
+        # own place; looking for every whole value at every start was k x k
+        # on a line of many /bin/ http values sharing a long prefix), left to
+        # right as _mask_fragment finds them.
+        whole_set = set(whole)
+        line_values = [line[s:e] for s, e in plain_runs] + [
+            line[s:e] for s, e in new if (s, e) not in whole_set]
         long_w, short_w, matcher_w = _build_fragment_tables(line_values)
         if long_w:
-            for i, size, _value in _long_value_hits(line, matcher_w, True):
+            for i, size, _value in _long_value_hits(line, matcher_w):
                 if meets_whole(i, i + size):
                     spans.append((i, i + size))
                     hidden.append((i, i + size))
