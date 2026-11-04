@@ -1233,7 +1233,7 @@ _HTTPIE_WORD_RE = re.compile(
     r"(?<![\w./:-])(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
 )
 # Since 1.1.4 also at the end of a /bin/ path (/usr/local/bin/http), as for
-# mysql; a value found only through such a path is a _NEW_SPAN.
+# mysql; a value found only through such a path is hidden whole (_NEW_WHOLE).
 _HTTPIE_ANY_WORD_RE = re.compile(
     r"(?:(?<![\w./:-])|(?<=/bin/))(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
 )
@@ -1920,7 +1920,8 @@ def _httpie_auth_spans(line, prev, ctx=None):
         if not bearer and m.group(2) and m.group(2).isdigit() and line[start:end].isdigit():
             continue
         if _maskable_value(line, start, end):
-            spans.append((start, end) if state else (start, end, _NEW_SPAN))
+            # Found only through a /bin/ path (1.1.4): hidden whole (_NEW_WHOLE).
+            spans.append((start, end) if state else (start, end, _NEW_WHOLE))
     return spans
 
 

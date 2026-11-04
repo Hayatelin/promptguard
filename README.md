@@ -192,7 +192,9 @@ in `user:password1`; it ends at whitespace, a quote, other punctuation such as
 cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie, mysql
 and other client names count as the command, not as the value of a user, host or
 container name flag (`-u`, `--user`, `--name` ...) nor as a folder of a path
-(`/var/lib/mysql`; `/usr/bin/mysql` and `/usr/local/bin/http` count): `sudo -u mysql mkdir -pv` and
+(`/var/lib/mysql`; `/usr/bin/mysql` and `/usr/local/bin/http` count, and the HTTPie / xh
+value of such a `/bin/` path is hidden whole: `/usr/local/bin/http -a u:Passw0rd123` shows
+`/usr/local/bin/http -a u:***`): `sudo -u mysql mkdir -pv` and
 `find /var/lib/mysql -perm 600` are left alone. Their values starting with
 `$` or `{{` (`-p$$MYSQL_ROOT_PASSWORD`, `-a ${{ secrets.T }}`) and port
 mappings (`-p3306:3306`) are left as written.

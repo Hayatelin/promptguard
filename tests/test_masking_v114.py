@@ -41,15 +41,15 @@ CASES = [
     ("b1-G5", "Authorization: Bearer !abc1", None),
     ("b1-G6", "Authorization: Bearer !important", None),
     ("b1-G7", "Authorization: Bearer Ab3xYz9Qw7k", "Authorization: Bearer Ab3x***"),
-    # 2: HTTPie / xh called by a bin/ path
+    # 2: HTTPie / xh called by a /bin/ path: its value is hidden whole
     ("h2-F1", "/usr/local/bin/http -a alice:Passw0rd123 example.com",
-     "/usr/local/bin/http -a alice:Pass*** example.com"),
+     "/usr/local/bin/http -a alice:*** example.com"),
     ("h2-F2", "/usr/bin/https -a alice:Passw0rd123 example.com",
-     "/usr/bin/https -a alice:Pass*** example.com"),
+     "/usr/bin/https -a alice:*** example.com"),
     ("h2-F3", "~/.local/bin/xh -a alice:Passw0rd123 example.com",
-     "~/.local/bin/xh -a alice:Pass*** example.com"),
+     "~/.local/bin/xh -a alice:*** example.com"),
     ("h2-F4", "/opt/homebrew/bin/http -A bearer -a Tok3nValue123 example.com",
-     "/opt/homebrew/bin/http -A bearer -a Tok3*** example.com"),
+     "/opt/homebrew/bin/http -A bearer -a *** example.com"),
     # Review A: a value found only through a /bin/ path does not show a
     # prefix that a shorter value of the line hides (v1.1.3: u:***xyz).
     # (The new value merges with that value and is hidden whole.)
