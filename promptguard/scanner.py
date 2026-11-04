@@ -13,9 +13,11 @@ from .rules import (
     file_mask_tables,
     finding_severity,
     finding_text_filter,
+    has_new_values,
     line_mask,
     mask_line_findings,
     may_hold_secrets,
+    merge_mask_values,
 )
 
 # File suffixes we scan.
@@ -218,7 +220,7 @@ def scan_text(text, path="<text>"):
         if maskable:
             masked_line = line_mask(line, ctx)
             if masked_line[1]:
-                file_values.update(dict.fromkeys(masked_line[1]))
+                merge_mask_values(file_values, masked_line[1])
             pending.append((idx, line, line_results, masked_line))
         else:
             pending.append((idx, line, line_results, None))
@@ -228,8 +230,12 @@ def scan_text(text, path="<text>"):
         may_matter = None
         if quiet:
             may_matter = finding_text_filter(
-                text for _idx, _line, results, _m in pending
-                for _rule, message, snippet in results for text in (message, snippet)
+                [text for _idx, _line, results, _m in pending
+                 for _rule, message, snippet in results for text in (message, snippet)]
+                # A line masked with a 1.1.3 value is masked again from its
+                # raw text with the values of the other lines
+                # (rules.mask_line_findings): what it hides counts too.
+                + [line for _idx, line, _results, m in pending if m and has_new_values(m[1])]
             )
         for idx in quiet:
             line = lines[idx - 1]
@@ -238,8 +244,8 @@ def scan_text(text, path="<text>"):
             ctx["lineno"] = idx
             values = line_mask(line, ctx)[1]
             if values:
-                file_values.update(dict.fromkeys(values))
-        file_tables = file_mask_tables(file_values)
+                merge_mask_values(file_values, values)
+        file_tables = file_mask_tables(file_values.values())
     mask_cache = {}
     for idx, line, line_results, masked_line in pending:
         pairs = [(message, snippet) for _rule, message, snippet in line_results]
