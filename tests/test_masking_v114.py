@@ -72,9 +72,13 @@ CASES = [
     ("w3-G4", "Authorization: Bearer realm=Ab3xYz9Qw7kRealToken", "Authorization: Bearer real***"),
     ("w3-G5", "Authorization: Bearer scope=read,Ab3xYz9Qw7kRealToken",
      "Authorization: Bearer scop***"),
-    ("w3-G6", "WWW-Authenticate: Bearer realm=api1, Basic Ab3xYz9Qw7kReal",
+    ("w3-F5", "WWW-Authenticate: Bearer realm=api1, Basic Ab3xYz9Qw7kReal",
      "WWW-Authenticate: Bearer realm=api1, Basic Ab3x***"),
     ("w3-G2", "Authorization: Bearer charsetAb3xYz9Qw7k", "Authorization: Bearer char***"),
+    # Review B round 2: the nearest header before the value decides.
+    ("w3-G7", "WWW-Authenticate: Bearer realm=abc12345 Authorization: Bearer scope=zzz12345",
+     "WWW-Authenticate: Bearer realm=abc12345 Authorization: Bearer scop***"),
+    ("w3-G8", "X-WWW-Authenticate: Bearer realm=abc12345", "X-WWW-Authenticate: Bearer real***"),
     ("w3-G3", "Authorization: Bearer chars=Ab3xYz9Qw7k", "Authorization: Bearer char***"),
     # 5: README wording of a "(" left at the end of a mysql password
     ("m5-G1", "mysql -u root -p67e(( db", "mysql -u root -p***(( db"),

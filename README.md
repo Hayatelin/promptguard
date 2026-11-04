@@ -186,7 +186,8 @@ part of eight or more such characters that starts with a letter or digit, as
 in `user:password1`; it ends at whitespace, a quote, other punctuation such as
 `(` `<` `&` `|`, or `:` `,` `;` before anything else: `bearer token:abc1` and
 `Bearer <token>;rm -rf x` keep the text after `:` and `;`; after a `WWW-Authenticate:` or
-`Proxy-Authenticate:` header, a value starting with a parameter `charset=` `realm=`
+`Proxy-Authenticate:` header (with no `Authorization:` header in between), a value
+starting with a parameter `charset=` `realm=`
 `scope=` `error=` `error_description=` or `error_uri=`, as in
 `WWW-Authenticate: Basic charset=UTF-8`, is left alone), and
 cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie, mysql

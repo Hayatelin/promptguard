@@ -1219,7 +1219,10 @@ _AUTH_CUT_RE = re.compile(r"[:,;]")
 _TOKEN68_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/-")
 _AUTH_PARAM_RE = re.compile(r"(?:charset|realm|scope|error|error_description|error_uri)=",
                             re.IGNORECASE)
-_AUTHENTICATE_RE = re.compile(r"\b(?:WWW|Proxy)-Authenticate[ \t]*:", re.IGNORECASE)
+# The header names an auth value may belong to: a parameter is left alone
+# only when the nearest one before it is WWW-/Proxy-Authenticate (group 1).
+_AUTH_HEADER_RE = re.compile(
+    r"(?<![\w-])(?:((?:WWW|Proxy)-Authenticate)|(?:Proxy-)?Authorization)[ \t]*:", re.IGNORECASE)
 _AUTH_VALUE_RE = re.compile(
     r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/!#%*?@^-]"
     r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
@@ -1474,15 +1477,17 @@ def _secret_spans(line, ctx):
         for m in _COOKIE_HEADER_RE.finditer(line):
             spans.extend(_cookie_value_spans(line, m.end()))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
-        auth_hdr = False  # the WWW-Authenticate / Proxy-Authenticate match, looked up once
+        auth_hdr = None  # (starts, is-Authenticate) of the auth headers, found once
         for m in _AUTH_VALUE_RE.finditer(line):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
             if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
-                if auth_hdr is False:
-                    auth_hdr = _AUTHENTICATE_RE.search(line)  # once per line
-                if (auth_hdr is not None and auth_hdr.end() <= start
-                        and _AUTH_PARAM_RE.match(line, start)):
+                if auth_hdr is None and _AUTH_PARAM_RE.match(line, start):
+                    found = [(h.end(), h.group(1) is not None)
+                             for h in _AUTH_HEADER_RE.finditer(line)]
+                    auth_hdr = ([f[0] for f in found], [f[1] for f in found])
+                k = (bisect.bisect_right(auth_hdr[0], start) - 1) if auth_hdr else -1
+                if k >= 0 and auth_hdr[1][k] and _AUTH_PARAM_RE.match(line, start):
                     continue  # WWW-Authenticate: Basic charset=UTF-8, a parameter
                 if line[start] not in _TOKEN68_FIRST:
                     # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one
@@ -2489,16 +2494,13 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None, whole=())
             k = bisect.bisect_right(starts_w, end - 1) - 1
             return k >= 0 and runs_w[k][1] > start
 
-        # The values of the other spans (a whole span's own value sits at its
-        # own place; looking for every whole value at every start was k x k
-        # on a line of many /bin/ http values sharing a long prefix), left to
-        # right as _mask_fragment finds them.
-        whole_set = set(whole)
-        line_values = [line[s:e] for s, e in plain_runs] + [
-            line[s:e] for s, e in new if (s, e) not in whole_set]
+        # Every value of the line, overlapping occurrences included (one
+        # may start inside a whole span); linear thanks to the long index of
+        # _build_fragment_tables.
+        line_values = [line[s:e] for s, e in plain_runs] + [line[s:e] for s, e in new]
         long_w, short_w, matcher_w = _build_fragment_tables(line_values)
         if long_w:
-            for i, size, _value in _long_value_hits(line, matcher_w):
+            for i, size, _value in _long_value_hits(line, matcher_w, True):
                 if meets_whole(i, i + size):
                     spans.append((i, i + size))
                     hidden.append((i, i + size))
@@ -2577,17 +2579,26 @@ def _build_fragment_tables(values):
     """(long values, short values, matcher) for _mask_fragment.
 
     matcher = (5-character prefixes, value set, distinct lengths longest
-    first, sorted values): a full occurrence is one set lookup per length,
-    a cut-short prefix one bisect, whatever the number of values sharing a
-    prefix.
+    first, sorted values, long index): a full occurrence is one set lookup
+    per length, a cut-short prefix one bisect, whatever the number of values
+    sharing a prefix. The long index maps the first _LONG_KEY characters of
+    a longer value to {length: {last five characters: [values]}} (1.1.4:
+    walking every value sharing the key at every start was k x k on a line
+    of many such values).
     """
     long_values = _distinct_values(v for v in values if len(v) >= 5)
     short_values = frozenset(v for v in values if len(v) < 5)
+    long_index = {}
+    for v in long_values:
+        if len(v) > _LONG_KEY:
+            long_index.setdefault(v[:_LONG_KEY], {}).setdefault(
+                len(v), {}).setdefault(v[-5:], []).append(v)
     matcher = (
         frozenset(v[:5] for v in long_values),
         dict((v, v) for v in long_values),
         sorted(set(len(v) for v in long_values), reverse=True),
         sorted(long_values),
+        long_index,
     )
     return long_values, short_values, matcher
 
@@ -2642,7 +2653,7 @@ def _long_value_hits(text, matcher, overlapping=False):
     value of five or more characters (matcher from _build_fragment_tables),
     left to right, not overlapping (`overlapping`: also the occurrences that
     start inside an earlier one)."""
-    prefixes, value_set, lengths, ordered = matcher
+    prefixes, value_set, lengths, ordered, long_index = matcher
     n = len(text)
     if len(prefixes) <= 16:
         # Few prefixes: find the candidate positions with str.find.
@@ -2692,16 +2703,17 @@ def _long_value_hits(text, matcher, overlapping=False):
             # (slicing text[i:i + size] for each of them at each start was
             # k x n on a long value whose prefix recurs inside it).
             long_key = text[i:i + _LONG_KEY]
-            j = bisect.bisect_left(ordered, long_key)
-            while j < len(ordered) and ordered[j].startswith(long_key):
-                value = ordered[j]
-                size = len(value)
-                j += 1
-                if (size > _LONG_KEY and i + size <= n and text[i + size - 5:i + size] == value[-5:]
-                        and text.startswith(value, i)):
-                    if size > best:
-                        best, best_value = size, value
-                    show = min(show, _value_show(value))
+            # One lookup per length of the values starting with the key
+            # (the same values as walking them all: key, length, last five
+            # characters, then a compare in place).
+            for size, by_end in long_index.get(long_key, {}).items():
+                if i + size > n:
+                    continue
+                for value in by_end.get(text[i + size - 5:i + size], ()):
+                    if text.startswith(value, i):
+                        if size > best:
+                            best, best_value = size, value
+                        show = min(show, _value_show(value))
         # A prefix cut short by "..." or by the end of the text.
         if dots < i + 5:
             dots = text.find("...", i + 5)
