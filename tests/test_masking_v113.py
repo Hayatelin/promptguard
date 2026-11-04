@@ -597,6 +597,10 @@ class TestPositionRuleShorterValueOtherLine(_PositionRule):
          {"PG001": "RUN redis-cli -a ***xyz" + XT}, None, "pw12"),
         ("config.yaml", ["password: pw12345", "cmd: redis-cli -a pw12345xyz" + XT], 2,
          {"PG001": "cmd: redis-cli -a ***xyz" + XT}, None, "pw12"),
+        # The shorter value is also a 1.1.3 value of the same line (sqlcmd -P).
+        ("Dockerfile", ["PGPASSWORD=S3cr%40 psql",
+                        "sqlcmd -P S3cr%40; redis-cli -a S3cr%40S3crcd34" + XT], 2,
+         {"PG001": "sqlcmd -P ***; redis-cli -a ***S3crcd34" + XT}, None, "S3cr%40"),
     ]
 
     def test_shorter_value_of_another_line(self):
