@@ -2761,6 +2761,16 @@ _LONG_KEY = 64
 _BUCKET_WALK = 16
 
 
+def _prefix_end(ordered, prefix, lo):
+    """Index after the last value of the sorted `ordered` (from `lo`) that
+    starts with `prefix`: bisect at the smallest string above all of them
+    (the prefix without its trailing U+10FFFF, its last character + 1)."""
+    stem = prefix.rstrip("\U0010ffff")
+    if not stem:
+        return len(ordered)
+    return bisect.bisect_left(ordered, stem[:-1] + chr(ord(stem[-1]) + 1), lo)
+
+
 def _prefix_value(text, i, end, ordered, long_key=None):
     """The first value of the sorted `ordered` that starts with
     text[i:end], or None."""
@@ -2776,7 +2786,7 @@ def _prefix_value(text, i, end, ordered, long_key=None):
     # bisect would give), checked on five characters before a full compare.
     tail = text[end - 5:end]
     j = bisect.bisect_left(ordered, long_key)
-    count = bisect.bisect_left(ordered, long_key + "\U0010ffff", j) - j
+    count = _prefix_end(ordered, long_key, j) - j
     if count > _BUCKET_WALK and count * _LONG_KEY > size:
         # Many values share the key (1.1.4: walking them at every start was
         # k x k): one slice and one bisect give the same first value. Not
