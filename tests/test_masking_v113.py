@@ -684,5 +684,117 @@ class TestLongLineLinear(_RaiseRuleErrors):
                 self.assertLessEqual(big, 8 * small + 0.5, (small, big))
 
 
+class TestPositionRuleMysqlParen(_PositionRule):
+    """A mysql -p password followed by "(" (-p67e$((): v1.1.2 reads no mysql
+    value there (the URL password of the line, or the file tables, hide
+    it); 1.1.3 reads the shorter 67e$, which must not mask the line before
+    the longer value 67e$(( is masked (dcd4653 showed -p***(( )."""
+
+    # (line, v1.1.2 line mask, characters dcd4653 showed)
+    SINGLE = [
+        ("mysql -uroot -p67e$((; https://user:67e$((@db.example.com/app",
+         "mysql -uroot -p***; https://user:***@db.example.com/app", "(("),
+        ("mysql -uroot -p2a:$(; https://user:2a:$(@db.example.com/app",
+         "mysql -uroot -p***; https://user:***@db.example.com/app", "***("),
+        # "(" alone, "(;" and "(&"
+        ("mysql -uroot -p67e$( db; https://user:67e$(@db.example.com/app",
+         "mysql -uroot -p*** db; https://user:***@db.example.com/app", "***("),
+        ("mysql -uroot -p67e$(; https://user:67e$(;@db.example.com/app",
+         "mysql -uroot -p*** https://user:***@db.example.com/app", "***("),
+        ("mysql -uroot -p67e$(& https://user:67e$(&@db.example.com/app",
+         "mysql -uroot -p*** https://user:***@db.example.com/app", "***("),
+    ]
+
+    # (path, lines, line number, {rule id: v1.1.2 snippet}, characters
+    # dcd4653 showed)
+    CROSS = [
+        (".env", ["mysql -uroot -p67e$(( db" + XT, "DB_URL=postgres://u:67e$((@10.0.0.1/db"], 1,
+         {"PG001": "mysql -uroot -p*** db" + XT}, "(("),
+        (".env", ["mysql -uroot -p67e$( db" + XT, "DB_URL=postgres://u:67e$(@10.0.0.1/db"], 1,
+         {"PG001": "mysql -uroot -p*** db" + XT}, "***("),
+        ("config.yaml", ["password: '67e$(('", "  cmd: mysql -uroot -p67e$(( db" + XT], 2,
+         {"PG001": "cmd: mysql -uroot -p*** db" + XT}, "(("),
+        ("config.yaml", ["password: '67e$('", "  cmd: mysql -uroot -p67e$( db" + XT], 2,
+         {"PG001": "cmd: mysql -uroot -p*** db" + XT}, "***("),
+        ("config.yaml", ["password: '67e$(;'", "  cmd: mysql -uroot -p67e$(; db" + XT], 2,
+         {"PG001": "cmd: mysql -uroot -p*** db" + XT}, "***("),
+        ("config.yaml", ["password: '67e$(&'", "  cmd: mysql -uroot -p67e$(& db" + XT], 2,
+         {"PG001": "cmd: mysql -uroot -p*** db" + XT}, "***("),
+        # "<(": only this cross-line form (v1.1.2 does not mask the one-line
+        # form mysql -p67e$<( db; https://user:67e$<(@...).
+        ("config.yaml", ["password: '67e$<('", "  cmd: mysql -uroot -p67e$<( db" + XT], 2,
+         {"PG001": "cmd: mysql -uroot -p*** db" + XT}, "***<("),
+    ]
+
+    def test_one_line(self):
+        for line, v112, leak in self.SINGLE:
+            with self.subTest(line=line):
+                got = self.check(line, v112)
+                self.assertNotIn(leak, got)
+                for f in scan_text(line + TAIL + "\n", "a.md"):
+                    self.assertNotIn(leak, f.snippet)
+
+    def test_other_line(self):
+        for path, lines, lineno, v112, leak in self.CROSS:
+            with self.subTest(path=path, lines=lines):
+                line = lines[lineno - 1].strip()
+                findings = [f for f in scan_text("\n".join(lines) + "\n", path)
+                            if f.line == lineno]
+                self.assertEqual(sorted(f.rule_id for f in findings), sorted(v112))
+                for f in findings:
+                    want = v112[f.rule_id]
+                    hidden = hidden_positions(line, want)
+                    self.assertTrue(hidden, want)
+                    self.assertHidesAll(line, want, f.snippet)
+                    self.assertNotIn(leak, f.snippet)
+                    self.assertNoHiddenText(f.message, line, hidden)
+
+
+class TestQueryRepeatLinear(_RaiseRuleErrors):
+    """?sid= / ?k= repeated with no space or "&" (?sid=123456?sid=123457...):
+    _query_secret_spans read every value to the end of the run again, which
+    was quadratic in the line length. The output is unchanged: the first
+    ?sid= value hides the rest of the run (?sid=1234***), and the ?k=
+    values (they hold "?") stay as written."""
+
+    PATTERNS = ["?sid=%06d", "?k=v%06d"]
+
+    @staticmethod
+    def build(pattern, start, n):
+        size = len(pattern % 0)
+        return "".join(pattern % (start + i) for i in range(n // size + 1))[:n]
+
+    def run_once(self, pattern, start, n):
+        line = self.build(pattern, start, n)
+        ctx = {"path": "a.md", "lines": [line], "lineno": 1}  # a new ctx each call
+        t = time.perf_counter()
+        out = rules.line_mask(line, ctx)[0]
+        elapsed = time.perf_counter() - t
+        if pattern.startswith("?sid="):
+            self.assertEqual(out, "?sid=" + ("%06d" % start)[:4] + "***")
+        else:
+            self.assertEqual(out, line)
+        return elapsed
+
+    def test_linear(self):
+        for k, pattern in enumerate(self.PATTERNS):
+            with self.subTest(pattern=pattern):
+                # Each call masks a line of its own (numbering offset).
+                base = 123456 + 400000 * k
+                small = min(self.run_once(pattern, base, 40000),
+                            self.run_once(pattern, base + 100000, 40000))
+                big = min(self.run_once(pattern, base + 200000, 160000),
+                          self.run_once(pattern, base + 300000, 160000))
+                self.assertLessEqual(big, 6 * small + 0.2, (small, big))
+
+    def test_output_from_123456(self):
+        self.assertEqual(self.build("?sid=%06d", 123456, 40)[:22], "?sid=123456?sid=123457")
+        for n in (40000, 160000):
+            line = self.build("?sid=%06d", 123456, n)
+            self.assertEqual(line_mask(line), "?sid=1234***")
+            line = self.build("?k=v%06d", 123456, n)
+            self.assertEqual(line_mask(line), line)
+
+
 if __name__ == "__main__":
     unittest.main()

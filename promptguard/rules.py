@@ -1141,14 +1141,50 @@ _QUERY_EXTRA_NAMES = frozenset((
 _QUERY_K_VALUE_RE = re.compile(r"[A-Za-z0-9_-]{16,}")
 
 
-def _query_extra_value(low, value):
-    """Is `value` of the _QUERY_EXTRA_NAMES parameter `low` a value to mask?"""
-    has_digit = any(c.isdigit() for c in value)
+def _query_value_run(line, start, end):
+    """[start, end, last digit, last upper, last lower, last letter, last
+    character outside [A-Za-z0-9_-]] of the _QUERY_VALUE_RE run
+    line[start:end] (-1 for none).
+
+    Every value starting inside the run ends where it ends, so one pass over
+    the run answers _query_extra_value for all of them: a value
+    line[s:end] holds a digit when the last digit is at s or after.
+    """
+    run = [start, end, -1, -1, -1, -1, -1]
+    missing = 5
+    for i in range(end - 1, start - 1, -1):
+        c = line[i]
+        if run[2] < 0 and c.isdigit():
+            run[2] = i
+            missing -= 1
+        if run[3] < 0 and c.isupper():
+            run[3] = i
+            missing -= 1
+        if run[4] < 0 and c.islower():
+            run[4] = i
+            missing -= 1
+        if run[5] < 0 and c.isalpha():
+            run[5] = i
+            missing -= 1
+        if run[6] < 0 and not ("a" <= c <= "z" or "A" <= c <= "Z" or "0" <= c <= "9"
+                               or c == "_" or c == "-"):
+            run[6] = i
+            missing -= 1
+        if not missing:
+            break
+    return run
+
+
+def _query_extra_value(low, run, start):
+    """Is line[start:run end] (a value inside the _query_value_run `run`)
+    of the _QUERY_EXTRA_NAMES parameter `low` a value to mask? 8+
+    characters with a digit or mixed case; for "k" 16+ characters of
+    [A-Za-z0-9_-] with a digit and a letter."""
+    size = run[1] - start
+    has_digit = run[2] >= start
     if low == "k":
-        return (_QUERY_K_VALUE_RE.fullmatch(value) is not None and has_digit
-                and any(c.isalpha() for c in value))
-    return len(value) >= 8 and (
-        has_digit or (any(c.isupper() for c in value) and any(c.islower() for c in value)))
+        return size >= 16 and run[6] < start and has_digit and run[5] >= start
+    return size >= 8 and (has_digit or (run[3] >= start and run[4] >= start))
 _TEMPLATE_REF_RE = re.compile(r"\{\{[^{}]*\}\}")
 # Admin credential names (PG018) may hold "pat" without any other key word.
 _PAT_WORD_RE = re.compile(r"(?<![A-Za-z0-9])pat(?![A-Za-z0-9])", re.IGNORECASE)
@@ -1793,9 +1829,8 @@ def _mysql_password_spans(line, prev):
             op = _MYSQL_OPERATOR_RE.search(line, start, m.end(3))
             if op is not None:
                 short_end = _value_end(line, start, op.start())
-                if short_end != end:
-                    kind = _NEW_SPAN
-                if (start < short_end < end and not _reference_head(line[start:short_end])
+                kind = _NEW_SPAN
+                if (start < short_end <= end and not _reference_head(line[start:short_end])
                         and not _PORT_MAP_RE.fullmatch(line, start, short_end)
                         and _maskable_value(line, start, short_end)):
                     spans.append((start, short_end))
@@ -2093,6 +2128,11 @@ def _query_secret_spans(line, ctx):
     # of that value, but the extra names (1.1.3) do not hide the parameters
     # the other names find inside their values (?sid=?pw=x masks both).
     last = last_extra = 0
+    # The _QUERY_VALUE_RE run the last value was read in (_query_value_run):
+    # a value starting inside it ends where it ends, so parameters repeated
+    # without a space or "&" (?sid=?sid=...) are not each read to the end of
+    # the run again (that was quadratic in the line length).
+    run = None
     for m in _QUERY_PARAM_RE.finditer(line):
         if m.start() < last:
             continue  # inside a value already masked
@@ -2108,29 +2148,37 @@ def _query_secret_spans(line, ctx):
             extra = True
         else:
             continue
-        v = _QUERY_VALUE_RE.match(line, m.end())
+        if extra and m.start() < last_extra:
+            continue
+        start = m.end()
+        if run is None or not run[0] <= start < run[1]:
+            v = _QUERY_VALUE_RE.match(line, start)
+            if v is None:
+                continue  # no value (both kinds skip it)
+            run = _query_value_run(line, start, v.end()) if extra else [start, v.end()]
+        elif extra and len(run) == 2:
+            run = _query_value_run(line, run[0], run[1])
+        end = run[1]
         if extra:
-            if m.start() < last_extra:
-                continue
-            if (v is not None and _query_extra_value(low, v.group())
-                    and not _REFERENCE_RE.fullmatch(v.group())
-                    and not _TEMPLATE_REF_RE.fullmatch(v.group())
-                    and not _reference_head(v.group())):
-                spans.append((v.start(), v.end(), _NEW_SPAN))
-                last_extra = v.end()
+            if (_query_extra_value(low, run, start)
+                    and not _REFERENCE_RE.fullmatch(line, start, end)
+                    and not _TEMPLATE_REF_RE.fullmatch(line, start, end)
+                    and not _reference_head(line[start:start + 2])):
+                spans.append((start, end, _NEW_SPAN))
+                last_extra = end
             continue
-        if v is None or v.end() - v.start() < _query_value_min(m.group(1)):
+        if end - start < _query_value_min(m.group(1)):
             continue
-        value = v.group()
-        if _REFERENCE_RE.fullmatch(value) or _TEMPLATE_REF_RE.fullmatch(value):
+        if _REFERENCE_RE.fullmatch(line, start, end) or _TEMPLATE_REF_RE.fullmatch(line, start, end):
             continue
-        if len(value) < _QUERY_VALUE_MIN and (
-                value.startswith(("{", "$", "<")) or not _maskable_value(line, *v.span())):
+        if end - start < _QUERY_VALUE_MIN and (
+                line.startswith(("{", "$", "<"), start, end)
+                or not _maskable_value(line, start, end)):
             # A short value: a template head (?token={{ secrets.T }}), a
             # literal (?secret=none) or a reference, as in other formats.
             continue
-        spans.append(v.span())
-        last = v.end()
+        spans.append((start, end))
+        last = end
     return spans
 
 
