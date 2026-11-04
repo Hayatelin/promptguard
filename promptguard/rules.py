@@ -1211,18 +1211,26 @@ _FLAG_VALUE_RE = re.compile(
 # <token>) does not start with a token68 character. The value sits in a
 # lookahead, so a value that is no credential (x:Bearer) does not hide the
 # next "Bearer <value>" (a value ends at whitespace: the scans are linear).
+# Since 1.1.4 the credential may also start with one of ! # % * ? @ ^
+# (Bearer !Ab3xYz9Qw7k); such a value is a _NEW_SPAN. A value starting with
+# a WWW-Authenticate parameter name and "=" (Basic charset=UTF-8) is no
+# credential.
 _AUTH_CUT_RE = re.compile(r"[:,;]")
+_TOKEN68_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/-")
+_AUTH_PARAM_RE = re.compile(r"(?:charset|realm|scope|error|error_description|error_uri)=",
+                            re.IGNORECASE)
 _AUTH_VALUE_RE = re.compile(
-    r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/-]"
+    r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/!#%*?@^-]"
     r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
     re.IGNORECASE,
 )
 # HTTPie (http / https) and xh (xh / xhs): -a / --auth user:password, also at
 # the end of a group of short flags that take no argument (-va). With
 # -A bearer / --auth-type=bearer the whole -a value is the token.
-# The client name is a word followed by a space, or a JSON argv item ("http", ...).
+# The client name is a word followed by a space, or a JSON argv item ("http", ...);
+# since 1.1.4 also at the end of a bin/ path (/usr/local/bin/http), as for mysql.
 _HTTPIE_WORD_RE = re.compile(
-    r"(?<![\w./:-])(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
+    r"(?:(?<![\w./:-])|(?<=bin/))(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
 )
 _HTTPIE_AUTH_RE = re.compile(
     r"(?<![\w-])(?:-[vhbdcfFjSIxq]*a|--auth)"
@@ -1460,6 +1468,12 @@ def _secret_spans(line, ctx):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
             if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
+                if _AUTH_PARAM_RE.match(line, start):
+                    continue  # Basic charset=UTF-8: a header parameter
+                if line[start] not in _TOKEN68_FIRST:
+                    # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one value.
+                    spans.append((start, end, _NEW_SPAN))
+                    continue
                 # The value as read up to the first ":" "," ";" (1.1.2): a
                 # span of its own when it qualifies, and a longer value a
                 # _NEW_SPAN (Bearer abc123,def456ghi).
