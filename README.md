@@ -174,8 +174,8 @@ after `-p` in a `mysql` / `mariadb` client command (`-pPASSWORD`, `-p'PASSWORD'`
 unquoted password may hold `&` `;` `|` `(` `)` `<` `>` and ends before one of
 them that is followed by whitespace, a quote or the end of the line, or that
 starts `&&` `||` `;;` `>>` `<<` `|&` `>&` `<&`, while a `)` closing a `(` of the
-password belongs to it; a `(` `<` `>` `&` `|` or other punctuation left at its end is not
-part of it, so `-p67e(( db` shows `-p***(( db`), the value on the line
+password belongs to it; a `(` `<` `>` `&` `|` `.` or `,` left at its end is not part
+of it, so `-p67e(( db` shows `-p***(( db`), the value on the line
 after a credential flag in a multi-line JSON array (`"--token",` then
 `"value",`), the credential of an `Authorization: Bearer` / `Basic` value
 (eight or more characters holding a digit; besides the RFC 6750 characters it
@@ -185,9 +185,10 @@ may hold `!` `#` `$` `%` `*` `?` `@` `^` `=`, may start with one of `!` `#` `%`
 part of eight or more such characters that starts with a letter or digit, as
 in `user:password1`; it ends at whitespace, a quote, other punctuation such as
 `(` `<` `&` `|`, or `:` `,` `;` before anything else: `bearer token:abc1` and
-`Bearer <token>;rm -rf x` keep the text after `:` and `;`; a value starting with
-a header parameter `charset=` `realm=` `scope=` `error=` `error_description=` or
-`error_uri=`, as in `WWW-Authenticate: Basic charset=UTF-8`, is left alone), and
+`Bearer <token>;rm -rf x` keep the text after `:` and `;`; after a `WWW-Authenticate:` or
+`Proxy-Authenticate:` header, a value starting with a parameter `charset=` `realm=`
+`scope=` `error=` `error_description=` or `error_uri=`, as in
+`WWW-Authenticate: Basic charset=UTF-8`, is left alone), and
 cookie values (`Cookie:` / `Set-Cookie:` headers). The HTTPie, mysql
 and other client names count as the command, not as the value of a user, host or
 container name flag (`-u`, `--user`, `--name` ...) nor as a folder of a path

@@ -1213,12 +1213,13 @@ _FLAG_VALUE_RE = re.compile(
 # next "Bearer <value>" (a value ends at whitespace: the scans are linear).
 # Since 1.1.4 the credential may also start with one of ! # % * ? @ ^
 # (Bearer !Ab3xYz9Qw7k); such a value is hidden whole (_NEW_WHOLE). A value starting with
-# a WWW-Authenticate parameter name and "=" (Basic charset=UTF-8) is no
-# credential.
+# a parameter name and "=" after a WWW-Authenticate / Proxy-Authenticate
+# header (WWW-Authenticate: Basic charset=UTF-8) is no credential.
 _AUTH_CUT_RE = re.compile(r"[:,;]")
 _TOKEN68_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/-")
 _AUTH_PARAM_RE = re.compile(r"(?:charset|realm|scope|error|error_description|error_uri)=",
                             re.IGNORECASE)
+_AUTHENTICATE_RE = re.compile(r"\b(?:WWW|Proxy)-Authenticate[ \t]*:", re.IGNORECASE)
 _AUTH_VALUE_RE = re.compile(
     r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/!#%*?@^-]"
     r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
@@ -1227,10 +1228,14 @@ _AUTH_VALUE_RE = re.compile(
 # HTTPie (http / https) and xh (xh / xhs): -a / --auth user:password, also at
 # the end of a group of short flags that take no argument (-va). With
 # -A bearer / --auth-type=bearer the whole -a value is the token.
-# The client name is a word followed by a space, or a JSON argv item ("http", ...);
-# since 1.1.4 also at the end of a bin/ path (/usr/local/bin/http), as for mysql.
+# The client name is a word followed by a space, or a JSON argv item ("http", ...).
 _HTTPIE_WORD_RE = re.compile(
-    r"(?:(?<![\w./:-])|(?<=bin/))(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
+    r"(?<![\w./:-])(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
+)
+# Since 1.1.4 also at the end of a /bin/ path (/usr/local/bin/http), as for
+# mysql; a value found only through such a path is a _NEW_SPAN.
+_HTTPIE_ANY_WORD_RE = re.compile(
+    r"(?:(?<![\w./:-])|(?<=/bin/))(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
 )
 _HTTPIE_AUTH_RE = re.compile(
     r"(?<![\w-])(?:-[vhbdcfFjSIxq]*a|--auth)"
@@ -1469,12 +1474,16 @@ def _secret_spans(line, ctx):
         for m in _COOKIE_HEADER_RE.finditer(line):
             spans.extend(_cookie_value_spans(line, m.end()))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
+        auth_hdr = False  # the WWW-Authenticate / Proxy-Authenticate match, looked up once
         for m in _AUTH_VALUE_RE.finditer(line):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
             if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
-                if _AUTH_PARAM_RE.match(line, start):
-                    continue  # Basic charset=UTF-8: a header parameter
+                if auth_hdr is False:
+                    auth_hdr = _AUTHENTICATE_RE.search(line)  # once per line
+                if (auth_hdr is not None and auth_hdr.end() <= start
+                        and _AUTH_PARAM_RE.match(line, start)):
+                    continue  # WWW-Authenticate: Basic charset=UTF-8, a parameter
                 if line[start] not in _TOKEN68_FIRST:
                     # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one
                     # value, and hidden whole (_NEW_WHOLE).
@@ -1878,15 +1887,21 @@ def _httpie_auth_spans(line, prev, ctx=None):
         if "http" not in plower and "xh" not in plower:
             return spans
     state = _command_has(prev, _HTTPIE_WORD_RE, False) if prev else False
+    # state_any: the client also counts at the end of a /bin/ path (1.1.4).
+    any_path = "/bin/" in line or (prev is not None and "/bin/" in prev)
+    state_any = (_command_has(prev, _HTTPIE_ANY_WORD_RE, False) if prev else False
+                 ) if any_path else state
     # A value without "user:" is a token only when its command selects
     # bearer auth; otherwise it is a user name (prompts).
     seps = None
     bearer_cache = {}
     pos = 0
     for m in _HTTPIE_AUTH_RE.finditer(line):
-        state = _command_has(line[pos:m.start()], _HTTPIE_WORD_RE, state)
+        segment = line[pos:m.start()]
+        state = _command_has(segment, _HTTPIE_WORD_RE, state)
+        state_any = _command_has(segment, _HTTPIE_ANY_WORD_RE, state_any) if any_path else state
         pos = m.start()
-        if not state:
+        if not state_any:
             continue
         if seps is None:
             seps = [(x.start(), x.end()) for x in _COMMAND_SEP_RE.finditer(line)]
@@ -1905,7 +1920,7 @@ def _httpie_auth_spans(line, prev, ctx=None):
         if not bearer and m.group(2) and m.group(2).isdigit() and line[start:end].isdigit():
             continue
         if _maskable_value(line, start, end):
-            spans.append((start, end))
+            spans.append((start, end) if state else (start, end, _NEW_SPAN))
     return spans
 
 
@@ -2459,7 +2474,32 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None, whole=())
         hidden.append((hide, end))
     new = sorted(set(new))
     hidden.extend(_hidden_run(start, end) for start, end in new)
-    hidden.extend(whole)
+    if whole:
+        # A whole span hides its first characters, so the masked line no
+        # longer holds a value of this line that reappears across it, and
+        # masking the reappearances afterwards would miss its tail
+        # (redis-cli -a '@pw12345(TAIL)' ... Bearer @pw12345(TAIL)): such
+        # occurrences are hidden whole with it.
+        hidden.extend(whole)
+        runs_w = _merge_spans(sorted(whole))
+        starts_w = [r[0] for r in runs_w]
+
+        def meets_whole(start, end):
+            k = bisect.bisect_right(starts_w, end - 1) - 1
+            return k >= 0 and runs_w[k][1] > start
+
+        line_values = [line[s:e] for s, e in plain_runs] + [line[s:e] for s, e in new]
+        long_w, short_w, matcher_w = _build_fragment_tables(line_values)
+        if long_w:
+            for i, size, _value in _long_value_hits(line, matcher_w, True):
+                if meets_whole(i, i + size):
+                    spans.append((i, i + size))
+                    hidden.append((i, i + size))
+        if short_w and ":" in line and "@" in line:
+            for start, end in _short_url_password_hits(line, short_w):
+                if meets_whole(start, end):
+                    spans.append((start, end))
+                    hidden.append((start, end))
     spans.extend(new)
     hidden = _merge_spans(sorted(h for h in hidden if h[0] < h[1]))
     starts = [h[0] for h in hidden]
