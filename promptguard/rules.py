@@ -2710,9 +2710,11 @@ def _long_value_hits(text, matcher, overlapping=False):
                 if i + size > n:
                     continue
                 bucket = by_end.get(text[i + size - 5:i + size], ())
-                if len(bucket) > _BUCKET_WALK:
-                    # Many values share key, length and end: one slice and
-                    # one lookup (the same value, if any, as the walk).
+                if len(bucket) > _BUCKET_WALK and len(bucket) * _LONG_KEY > size:
+                    # Many short values share key, length and end: one slice
+                    # and one lookup (the same value, if any, as the walk);
+                    # a few long ones are walked (slicing a long value at
+                    # every start costs its length).
                     found = value_set.get(text[i:i + size])
                     bucket = (found,) if found is not None else ()
                 for value in bucket:
@@ -2752,8 +2754,10 @@ def _long_value_hits(text, matcher, overlapping=False):
 # _long_value_hits: values longer than this are looked up by their first
 # _LONG_KEY characters and compared in place.
 _LONG_KEY = 64
-# Above this many values sharing a key (and length and end), a long-value
-# lookup slices the text once instead of walking them (1.1.4).
+# Above this many values sharing a key (and length and end), and when they
+# outnumber the piece length / _LONG_KEY, a long-value lookup slices the
+# text once instead of walking them (1.1.4): each start costs at most about
+# min(values x _LONG_KEY, piece length) beyond the walk's early exits.
 _BUCKET_WALK = 16
 
 
@@ -2772,9 +2776,11 @@ def _prefix_value(text, i, end, ordered, long_key=None):
     # bisect would give), checked on five characters before a full compare.
     tail = text[end - 5:end]
     j = bisect.bisect_left(ordered, long_key)
-    if bisect.bisect_left(ordered, long_key + "\U0010ffff", j) - j > _BUCKET_WALK:
+    count = bisect.bisect_left(ordered, long_key + "\U0010ffff", j) - j
+    if count > _BUCKET_WALK and count * _LONG_KEY > size:
         # Many values share the key (1.1.4: walking them at every start was
-        # k x k): one slice and one bisect give the same first value.
+        # k x k): one slice and one bisect give the same first value. Not
+        # for a long piece and few values (the slice costs its length).
         piece = text[i:end]
         j = bisect.bisect_left(ordered, piece, j)
         if j < len(ordered) and ordered[j].startswith(piece):
