@@ -180,7 +180,8 @@ after a credential flag in a multi-line JSON array (`"--token",` then
 `"value",`), the credential of an `Authorization: Bearer` / `Basic` value
 (eight or more characters holding a digit; besides the RFC 6750 characters it
 may hold `!` `#` `$` `%` `*` `?` `@` `^` `=`, may start with one of `!` `#` `%`
-`*` `?` `@` `^` (`Bearer !Ab3xYz9Qw7k` shows `Bearer !Ab3***`), and `:` `,` `;` right before a
+`*` `?` `@` `^` (such a value is hidden whole: `Bearer !Ab3xYz9Qw7k` shows
+`Bearer ***`), and `:` `,` `;` right before a
 part of eight or more such characters that starts with a letter or digit, as
 in `user:password1`; it ends at whitespace, a quote, other punctuation such as
 `(` `<` `&` `|`, or `:` `,` `;` before anything else: `bearer token:abc1` and

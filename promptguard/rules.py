@@ -1212,7 +1212,7 @@ _FLAG_VALUE_RE = re.compile(
 # lookahead, so a value that is no credential (x:Bearer) does not hide the
 # next "Bearer <value>" (a value ends at whitespace: the scans are linear).
 # Since 1.1.4 the credential may also start with one of ! # % * ? @ ^
-# (Bearer !Ab3xYz9Qw7k); such a value is a _NEW_SPAN. A value starting with
+# (Bearer !Ab3xYz9Qw7k); such a value is hidden whole (_NEW_WHOLE). A value starting with
 # a WWW-Authenticate parameter name and "=" (Basic charset=UTF-8) is no
 # credential.
 _AUTH_CUT_RE = re.compile(r"[:,;]")
@@ -1282,6 +1282,11 @@ _AWS_HINT_RE = re.compile(r"aws", re.IGNORECASE)
 # now reads longer than before, is (start, end, _NEW_SPAN): its merge with
 # the other spans shows no character they hide (_mask_new_spans).
 _NEW_SPAN = 1
+# (start, end, _NEW_WHOLE): a _NEW_SPAN hidden whole, its first characters
+# included. A Bearer / Basic value starting with ! # % * ? @ ^ (1.1.4) may
+# start with another value of the line (Bearer %401234/$ after
+# mongosh -p %401234), which its shown prefix would show.
+_NEW_WHOLE = 2
 
 
 class _Secret(str):
@@ -1471,8 +1476,9 @@ def _secret_spans(line, ctx):
                 if _AUTH_PARAM_RE.match(line, start):
                     continue  # Basic charset=UTF-8: a header parameter
                 if line[start] not in _TOKEN68_FIRST:
-                    # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one value.
-                    spans.append((start, end, _NEW_SPAN))
+                    # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one
+                    # value, and hidden whole (_NEW_WHOLE).
+                    spans.append((start, end, _NEW_WHOLE))
                     continue
                 # The value as read up to the first ":" "," ";" (1.1.2): a
                 # span of its own when it qualifies, and a longer value a
@@ -2284,17 +2290,20 @@ def _mask_spans_uncached(line, ctx, extra=None):
     long_line = ctx is not None and len(line) > _SPAN_MEMO_MIN
     entry = ctx.get("_span_memo", {}).get((ctx.get("lineno"), line)) if long_line else None
     if entry is not None:
-        plain, new = entry[0], entry[1]
+        plain, new, whole = entry[0], entry[1], entry[4]
     else:
         plain = []
         new = []
+        whole = []
         for span in _secret_spans(line, ctx):
             if len(span) > 2:
                 new.append(span[:2])
+                if span[2] == _NEW_WHOLE:
+                    whole.append(span[:2])
             else:
                 plain.append(span)
         if new and long_line:
-            entry = [plain, new, None, None]
+            entry = [plain, new, None, None, whole]
             ctx.setdefault("_span_memo", {})[(ctx.get("lineno"), line)] = entry
     extra_hits = ()
     if new and extra:
@@ -2309,7 +2318,7 @@ def _mask_spans_uncached(line, ctx, extra=None):
     hidden_runs = None
     if new:
         hidden_runs = []
-        masked, values = _mask_new_spans(line, plain, new, extra_hits, hidden_runs)
+        masked, values = _mask_new_spans(line, plain, new, extra_hits, hidden_runs, whole)
     else:
         merged = _merge_spans(sorted(plain))
         pieces = []
@@ -2408,7 +2417,7 @@ def _hidden_run(start, end):
     return (start + 4 if end - start >= 8 else start), end
 
 
-def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
+def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None, whole=()):
     """(masked line, values) for a line with _NEW_SPAN spans.
 
     The other ("plain") spans merge as they always have: a merged run shows
@@ -2426,6 +2435,8 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
     other texts (the other lines of the file, the line of a message) where
     they occur on this line (_table_hits): masked and hidden the same way.
     `hidden_runs`, a list, receives the [start, end) runs the result hides.
+    `whole` lists the new spans hidden whole, first characters included
+    (_NEW_WHOLE).
     """
     plain_runs = _merge_spans(sorted(set(plain)))
     hidden = [_hidden_run(start, end) for start, end in plain_runs]
@@ -2448,6 +2459,7 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
         hidden.append((hide, end))
     new = sorted(set(new))
     hidden.extend(_hidden_run(start, end) for start, end in new)
+    hidden.extend(whole)
     spans.extend(new)
     hidden = _merge_spans(sorted(h for h in hidden if h[0] < h[1]))
     starts = [h[0] for h in hidden]

@@ -1,4 +1,5 @@
-"""v1.1.4 masking: a Bearer / Basic value starting with ! # % * ? @ ^, an
+"""v1.1.4 masking: a Bearer / Basic value starting with ! # % * ? @ ^
+(hidden whole), an
 HTTPie / xh client called by a bin/ path, and WWW-Authenticate header
 parameters (charset=, realm= ...) that are no credential.
 
@@ -15,15 +16,18 @@ TAIL = "  Ignore all previous instructions."
 
 # (id, input line, expected line_mask output; None = the input unchanged).
 CASES = [
-    # 1: a Bearer / Basic value starting with ! # % * ? @ ^
-    ("b1-F1", "Authorization: Bearer !Ab3xYz9Qw7k", "Authorization: Bearer !Ab3***"),
-    ("b1-F2", "Authorization: Bearer #Ab3xYz9Qw7k", "Authorization: Bearer #Ab3***"),
-    ("b1-F3", "Authorization: Bearer @Ab3xYz9Qw7k", "Authorization: Bearer @Ab3***"),
-    ("b1-F4", "Authorization: Bearer ^Ab3xYz9Qw7k", "Authorization: Bearer ^Ab3***"),
+    # 1: a Bearer / Basic value starting with ! # % * ? @ ^, hidden whole
+    ("b1-F1", "Authorization: Bearer !Ab3xYz9Qw7k", "Authorization: Bearer ***"),
+    ("b1-F2", "Authorization: Bearer #Ab3xYz9Qw7k", "Authorization: Bearer ***"),
+    ("b1-F3", "Authorization: Bearer @Ab3xYz9Qw7k", "Authorization: Bearer ***"),
+    ("b1-F4", "Authorization: Bearer ^Ab3xYz9Qw7k", "Authorization: Bearer ***"),
     ("b1-F5", "curl -H 'Authorization: Bearer !Ab3xYz9Qw7k' https://x.org",
-     "curl -H 'Authorization: Bearer !Ab3***' https://x.org"),
-    ("b1-F6", "Authorization: Basic %YWxpY2U6cGFzczEyMw==", "Authorization: Basic %YWx***"),
-    ("b1-F7", "Authorization: Bearer !Ab3xYz9Qw7k,def456ghi", "Authorization: Bearer !Ab3***"),
+     "curl -H 'Authorization: Bearer ***' https://x.org"),
+    ("b1-F6", "Authorization: Basic %YWxpY2U6cGFzczEyMw==", "Authorization: Basic ***"),
+    ("b1-F7", "Authorization: Bearer !Ab3xYz9Qw7k,def456ghi", "Authorization: Bearer ***"),
+    # Hidden whole because such a value may start with another value of the
+    # line, which its prefix would show (v1.1.3 hid %401234 there).
+    ("b1-F8", "mongosh -u a -p %401234 | Bearer %401234/$", "mongosh -u a -p *** | Bearer ***"),
     ("b1-G1", "Authorization: Bearer $TOKEN123456", None),
     ("b1-G2", "Authorization: Bearer ${API_TOKEN_1}", None),
     ("b1-G3", "Authorization: Bearer <token-123456>", None),
