@@ -76,7 +76,7 @@ CASES = [
      "WWW-Authenticate: Bearer realm=api1, Basic Ab3x***"),
     ("w3-G2", "Authorization: Bearer charsetAb3xYz9Qw7k", "Authorization: Bearer char***"),
     # Review B round 2: the nearest header before the value decides.
-    ("w3-G7", "WWW-Authenticate: Bearer realm=abc12345 Authorization: Bearer scope=zzz12345",
+    ("w3-F6", "WWW-Authenticate: Bearer realm=abc12345 Authorization: Bearer scope=zzz12345",
      "WWW-Authenticate: Bearer realm=abc12345 Authorization: Bearer scop***"),
     ("w3-G8", "X-WWW-Authenticate: Bearer realm=abc12345", "X-WWW-Authenticate: Bearer real***"),
     ("w3-G3", "Authorization: Bearer chars=Ab3xYz9Qw7k", "Authorization: Bearer char***"),
