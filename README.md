@@ -206,7 +206,11 @@ line is also masked where it appears in the findings of any other line of the
 same file, before or after it, when it looks like a secret: it holds a digit,
 both upper- and lower-case letters, or a character other than a letter. It
 keeps the shortest prefix any of its places allows there and in the messages
-(`pass;echo` repeated on another line shows `***`).
+(`pass;echo` repeated on another line shows `***`). Where such a value lies
+inside a longer value read on another line, or overlaps another value, they
+are masked as one, and the kept prefix holds nothing the shorter value hides:
+with `DB_PASSWORD=pass1` on one line, `redis-cli -a pass1word` on another
+shows `redis-cli -a ***`.
 
 `-p` counts only when a `login` word of the same command comes before it, with
 nothing but flags, flag values and registry hosts in between (`docker login -u
@@ -257,9 +261,17 @@ or `localhost`), the password runs to that last `@`. Cookie attributes (`Path`, 
 
 Masking is not complete: values in formats promptguard does not recognize
 (such as `-u user:pass` outside the clients listed above, or query parameters
-outside the names listed above) are shown as written, and so is a password
-that holds whitespace, an escaped quote, or spliced quotes
-(`'ab'\''cd'`) from that character on. A Bearer / Basic value ends at the
+outside the names listed above) are shown as written. A password holding
+whitespace, an escaped quote or spliced quotes is not masked whole, and part
+or all of it is shown: `API_TOKEN="PASS WORD"` is shown as written
+and `curlie -u "user:PASS WORD" https://x.org` shows
+`curlie -u "user:*** WORD" https://x.org`; `API_TOKEN="pw\"PASSWORD"` shows
+`API_TOKEN="pw\"***"`; of spliced quotes only the first part is masked
+(`API_TOKEN='pass'\''word'` shows `API_TOKEN='***'\''word'`); and a `-u`
+password in quotes of its own after the user name is not recognized, for the
+libcurl client as for `curlie` (`curlie -u user:'PASSWORD' https://x.org` is
+shown as written, while `curlie -u 'user:PASSWORD' https://x.org` shows
+`curlie -u 'user:PASS***' https://x.org`). A Bearer / Basic value ends at the
 punctuation listed above, so the rest of such a value is shown
 (`Bearer abc12345(x)tail` shows `Bearer abc1***(x)tail`); a multi-line JSON value holding an
 escape (`\\`) is not paired with its flag line; and a password starting
@@ -273,9 +285,10 @@ command (`service mysql restart -pv`, `grep mysql -pv`,
 `find /usr/bin/mysql -perm 600`) is taken for the client (`grep mysql -p***`,
 `find /usr/bin/mysql -p*** 600`); an unquoted `mysql` password followed
 without a space by a redirection, a pipe or another command is masked
-together with that file name or command (`-pPASSWORD>file`, `-pPASSWORD|cmd`
-and `-pPASSWORD&cmd` show `-pPASS***`, `-ppass;echo done` shows
-`-p*** done`); prose such as `Basic auth:RFC-7617` is read as a Basic value
+together with that file name or command (`mysql -uroot -pPASSWORD>file`,
+`mysql -uroot -pPASSWORD|cmd` and `mysql -uroot -pPASSWORD&cmd` show
+`mysql -uroot -pPASS***`, `mysql -uroot -ppass;echo done` shows
+`mysql -uroot -p*** done`); prose such as `Basic auth:RFC-7617` is read as a Basic value
 (`Basic auth***`); a URL whose path holds an e-mail address
 (`https://user:pass@x.org/users/bob@corp.com/profile`) is masked up to that
 address's `@` (`https://user:***@corp.com/profile`); one bare word between
@@ -288,7 +301,8 @@ holding a digit is masked even when it is a product search
 (`?k=usb-c-to-hdmi-adapter-4k` shows `?k=usb-***`); ticket and app key
 parameters are masked when they hold no secret (`?ticket=JIRA-12345` shows
 `?ticket=JIRA***`, `?appkey=MyAppName` shows `?appkey=MyAp***`); a plain word
-after `mosquitto_sub -P` is masked (`-P secretive` shows `-P secr***`); and
+after `mosquitto_sub -P` is masked (`mosquitto_sub -t t -P secretive` shows
+`mosquitto_sub -t t -P secr***`); and
 `-p` after `mongosh` is read as its password whatever comes between them
 (`mongosh http -p u:pw` shows `mongosh http -p ***`).
 

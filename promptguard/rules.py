@@ -2190,7 +2190,19 @@ def _mask_spans(line, ctx):
     return result
 
 
-def _mask_spans_uncached(line, ctx):
+def _mask_spans_uncached(line, ctx, extra=None):
+    """_mask_spans() without the memo.
+
+    `extra` is a list of fragment tables (_build_fragment_tables,
+    file_mask_tables) whose values are masked in this text afterwards
+    (_mask_fragment): the values of the other lines of the file, or of the
+    line a message belongs to. When a _NEW_SPAN value of this text overlaps
+    one of their occurrences, masking the text first would show a prefix
+    that the occurrence hides on its own (pw12345 from another line inside
+    pw12345xyz here shows pw12***, where 1.1.2 showed ***xyz): the
+    occurrences are then masked together with the spans of the text
+    (_mask_new_spans), so no position either of them hides is shown.
+    """
     if not _has_mask_hint(line) and not (
             "-" in line and _has_mask_hint(_continued_command(line, ctx))) and not (
             line[:1] in " \t\"" and ctx is not None and _JSON_ITEM_RE.match(line) is not None
@@ -2205,8 +2217,11 @@ def _mask_spans_uncached(line, ctx):
             new.append(span[:2])
         else:
             plain.append(span)
+    extra_hits = ()
+    if new and extra:
+        extra_hits = _table_hits(line, extra, plain + new)
     if new:
-        masked, values = _mask_new_spans(line, plain, new)
+        masked, values = _mask_new_spans(line, plain, new, extra_hits)
     else:
         merged = _merge_spans(sorted(plain))
         pieces = []
@@ -2232,6 +2247,41 @@ def _mask_spans_uncached(line, ctx):
     return _mask_fragment(masked, values), values
 
 
+def _table_hits(text, tables_list, spans):
+    """(start, end, first hidden position) of every occurrence in `text` of
+    a value of the fragment tables in `tables_list` (None entries skipped),
+    as _mask_fragment masks it (a prefix cut short, ":pw@" for a short
+    value), overlapping occurrences included; () when none of them overlaps
+    one of `spans` (then masking the spans first and the values after hides
+    the same positions)."""
+    hits = []
+    for tables in tables_list:
+        if tables is None:
+            continue
+        long_values, short_values, matcher = tables
+        if short_values and ":" in text and "@" in text:
+            hits.extend((start, end, start)
+                        for start, end in _short_url_password_hits(text, short_values))
+        if long_values:
+            hits.extend((i, i + size, i + _value_show(value))
+                        for i, size, value in _long_value_hits(text, matcher, True))
+    if not hits:
+        return ()
+    runs = _merge_spans(sorted((span[0], span[1]) for span in spans))
+    starts = [r[0] for r in runs]
+    for start, end, _hide in hits:
+        k = bisect.bisect_right(starts, end - 1) - 1
+        if k >= 0 and runs[k][1] > start:
+            return hits
+    return ()
+
+
+def has_new_values(values):
+    """Did _mask_spans() mask the text with a _NEW_SPAN (_mask_new_spans
+    returns _Secret values only)?"""
+    return any(isinstance(v, _Secret) for v in values)
+
+
 def _merge_spans(spans):
     """Sorted (start, end) spans -> [start, end] runs; touching spans merge."""
     merged = []
@@ -2249,7 +2299,7 @@ def _hidden_run(start, end):
     return (start + 4 if end - start >= 8 else start), end
 
 
-def _mask_new_spans(line, plain, new):
+def _mask_new_spans(line, plain, new, extra_hits=()):
     """(masked line, values) for a line with _NEW_SPAN spans.
 
     The other ("plain") spans merge as they always have: a merged run shows
@@ -2262,6 +2312,10 @@ def _mask_new_spans(line, plain, new):
     runs' values), shows at most the characters before the first hidden
     position at its start (_Secret.show), here and wherever the value is
     masked again (finding messages, the other lines of the file).
+
+    `extra_hits` are (start, end, first hidden position) of the values of
+    other texts (the other lines of the file, the line of a message) where
+    they occur on this line (_table_hits): masked and hidden the same way.
     """
     plain_runs = _merge_spans(sorted(set(plain)))
     hidden = [_hidden_run(start, end) for start, end in plain_runs]
@@ -2279,6 +2333,9 @@ def _mask_new_spans(line, plain, new):
             for start, end in _short_url_password_hits(line, short_values):
                 spans.append((start, end))
                 hidden.append((start, end))
+    for start, end, hide in extra_hits:
+        spans.append((start, end))
+        hidden.append((hide, end))
     new = sorted(set(new))
     hidden.extend(_hidden_run(start, end) for start, end in new)
     spans.extend(new)
@@ -2384,22 +2441,36 @@ def _mask_fragment(text, values, tables=None):
         text = _mask_short_url_passwords(text, short_values)
     if not long_values:
         return text
+    hits = list(_long_value_hits(text, matcher, True))
+    if not hits:
+        return text
+    # Occurrences may overlap (xy,PwS3cr of one line, PwS3cr: of another):
+    # each run of overlapping occurrences is masked as one, and shows no
+    # character that one of them hides on its own.
     pieces = []
     pos = 0
-    for i, size, value in _long_value_hits(text, matcher):
-        pieces.append(text[pos:i])
-        pieces.append(_mask_value(value))
-        pos = i + size
-    if not pieces:
-        return text
-    pieces.append(text[pos:])
+    run_start = run_end = hide = -1
+    for i, size, value in hits:
+        if i < run_end:
+            run_end = max(run_end, i + size)
+            hide = min(hide, i + _value_show(value))
+            continue
+        if run_end >= 0:
+            pieces.append(text[pos:run_start])
+            pieces.append(text[run_start:hide] + _MASK)
+            pos = run_end
+        run_start, run_end, hide = i, i + size, i + _value_show(value)
+    pieces.append(text[pos:run_start])
+    pieces.append(text[run_start:hide] + _MASK)
+    pieces.append(text[run_end:])
     return "".join(pieces)
 
 
-def _long_value_hits(text, matcher):
+def _long_value_hits(text, matcher, overlapping=False):
     """(start, length, value) of every occurrence _mask_fragment masks of a
     value of five or more characters (matcher from _build_fragment_tables),
-    left to right, not overlapping."""
+    left to right, not overlapping (`overlapping`: also the occurrences that
+    start inside an earlier one)."""
     prefixes, value_set, lengths, ordered = matcher
     n = len(text)
     if len(prefixes) <= 16:
@@ -2416,28 +2487,40 @@ def _long_value_hits(text, matcher):
     pos = 0
     dots = -1  # position of the first "..." at or after i + 5
     for i in starts:
-        if i < pos or text[i:i + 5] not in prefixes:
+        if (i < pos and not overlapping) or text[i:i + 5] not in prefixes:
             continue
         best = 0
         best_value = None
+        # Every value found at i counts: the masked occurrence shows no more
+        # than any of them shows on its own (pw12345 hides all of its
+        # characters, so pw12345xyz at the same place shows none either).
+        show = 4
         for size in lengths:
             if i + size <= n and text[i:i + size] in value_set:
-                best, best_value = size, value_set[text[i:i + size]]
-                break
+                value = value_set[text[i:i + size]]
+                if best_value is None:
+                    best, best_value = size, value
+                show = min(show, _value_show(value))
         # A prefix cut short by "..." or by the end of the text.
         if dots < i + 5:
             dots = text.find("...", i + 5)
             if dots < 0:
                 dots = n + 1
         for end in (dots, n):
-            if end <= n and end - i > best:
+            # A piece longer than the longest value is no value's prefix:
+            # without this bound every hit copied text[i:n] (k values on a
+            # line of n characters cost k x n).
+            if end <= n and end - i > best and end - i <= lengths[0]:
                 piece = text[i:end]
                 j = bisect.bisect_left(ordered, piece)
                 if j < len(ordered) and ordered[j].startswith(piece):
                     best, best_value = end - i, ordered[j]
+                    show = min(show, _value_show(best_value))
                     break
         if best_value is None:
             continue
+        if show < _value_show(best_value):
+            best_value = _Secret(best_value, show)
         yield i, best, best_value
         pos = i + best
 
@@ -2560,7 +2643,12 @@ def mask_line_findings(line, ctx, results, cache=None, file_tables=None, masked_
     span-masked form (messages repeat from line to line).
     """
     masked, values = masked_line if masked_line is not None else _mask_spans(line, ctx)
-    masked = masked.strip()
+    masked = line_masked = masked.strip()
+    if (file_tables is not None and has_new_values(values)
+            and not _own_values_only(file_tables, values)):
+        # A value of another line inside a _NEW_SPAN value of this one is
+        # masked with it (_mask_spans_uncached `extra`).
+        masked = _mask_spans_uncached(line, ctx, [file_tables])[0].strip()
     stripped = line.strip()
     if cache is None:
         cache = {}
@@ -2571,7 +2659,7 @@ def mask_line_findings(line, ctx, results, cache=None, file_tables=None, masked_
         values = ()
     out = []
     for message, snippet in results:
-        if snippet == stripped or snippet == masked:
+        if snippet == stripped or snippet == line_masked:
             snippet = masked
             if file_tables is not None:
                 snippet = _mask_fragment(snippet, None, file_tables)
@@ -2581,7 +2669,17 @@ def mask_line_findings(line, ctx, results, cache=None, file_tables=None, masked_
     return out
 
 
-def _mask_other_text(text, values, ctx, cache, file_tables=None):
+def _own_values_only(file_tables, values):
+    """Do the file tables hold no value but the line's own `values` (a file
+    with one line of values: masking the line again changes nothing)?"""
+    long_values, short_values, _matcher = file_tables
+    if len(long_values) + len(short_values) > len(values):
+        return False
+    own = set(values)
+    return all(v in own for v in long_values) and all(v in own for v in short_values)
+
+
+def _mask_other_text(text, values, ctx, cache, file_tables=None, extra=None):
     if not isinstance(text, str) or not text:
         return text
     if file_tables is not None and not values:
@@ -2590,12 +2688,20 @@ def _mask_other_text(text, values, ctx, cache, file_tables=None):
         hit = cache.get(key)
         if hit is None:
             hit = cache[key] = _mask_fragment(
-                _mask_other_text(text, values, ctx, cache), None, file_tables
+                _mask_other_text(text, values, ctx, cache, None, file_tables), None, file_tables
             )
         return hit
-    hit = cache.get(text)
-    if hit is None:
-        hit = cache[text] = _mask_spans_uncached(text, ctx)[0]
+    own = cache.get(text)
+    if own is None:
+        own = cache[text] = _mask_spans_uncached(text, ctx)
+    hit = own[0]
+    if has_new_values(own[1]) and (values or file_tables is not None or extra is not None):
+        # The values masked in the text below, and the file's, are masked
+        # together with its _NEW_SPAN values (_mask_spans_uncached `extra`).
+        tables = [extra, file_tables]
+        if values:
+            tables.append(_fragment_tables(values))
+        hit = _mask_spans_uncached(text, ctx, tables)[0]
     if values:
         hit = _mask_fragment(hit, values)
     if file_tables is not None:
