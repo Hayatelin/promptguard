@@ -16,6 +16,7 @@ from .rules import (
     line_mask,
     mask_line_findings,
     may_hold_secrets,
+    merge_mask_values,
 )
 
 # File suffixes we scan.
@@ -218,7 +219,7 @@ def scan_text(text, path="<text>"):
         if maskable:
             masked_line = line_mask(line, ctx)
             if masked_line[1]:
-                file_values.update(dict.fromkeys(masked_line[1]))
+                merge_mask_values(file_values, masked_line[1])
             pending.append((idx, line, line_results, masked_line))
         else:
             pending.append((idx, line, line_results, None))
@@ -238,8 +239,8 @@ def scan_text(text, path="<text>"):
             ctx["lineno"] = idx
             values = line_mask(line, ctx)[1]
             if values:
-                file_values.update(dict.fromkeys(values))
-        file_tables = file_mask_tables(file_values)
+                merge_mask_values(file_values, values)
+        file_tables = file_mask_tables(file_values.values())
     mask_cache = {}
     for idx, line, line_results, masked_line in pending:
         pairs = [(message, snippet) for _rule, message, snippet in line_results]

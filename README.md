@@ -192,15 +192,26 @@ container name flag (`-u`, `--user`, `--name` ...) nor as a folder of a path
 mappings (`-p3306:3306`) are left as written.
 In the message and snippet of every rule, each such value keeps its first four
 characters followed by `***`, and a value shorter than eight characters
-becomes `***`, in the text and the `--json` output alike. A value found on one
+becomes `***`, in the text and the `--json` output alike. The kept prefix is
+shorter, or empty, when it would show a character that another value found at
+the same place hides on its own: values that overlap or touch are masked as
+one, and a value read past a character that once ended it (an unquoted `mysql`
+password holding `;` or `&`, a URL password holding `@name.tld/`, a Bearer /
+Basic value holding `:` `,` `;`) shows nothing that its shorter reading hides.
+So `mysql -uroot -ppass;echo done` shows `mysql -uroot -p*** done`,
+`redis-cli -h db http -a user:pass` shows `redis-cli -h db http -a user***`
+and `https://user:pass@word.io/x@db.example.com/app` shows
+`https://user:***@db.example.com/app`. A value found on one
 line is also masked where it appears in the findings of any other line of the
 same file, before or after it, when it looks like a secret: it holds a digit,
-both upper- and lower-case letters, or a character other than a letter.
+both upper- and lower-case letters, or a character other than a letter. It
+keeps the shortest prefix any of its places allows there and in the messages
+(`pass;echo` repeated on another line shows `***`).
 
 `-p` counts only when a `login` word of the same command comes before it, with
 nothing but flags, flag values and registry hosts in between (`docker login -u
 me -p X` and `["login", "-p", "X"]` are masked; `ssh -p 2222` and `cp -p file`
-on a line that also says login are not). A value ends at whitespace, a quote or
+after another word, as in `docker login then ssh -p 2222 host`, are not). A value ends at whitespace, a quote or
 an escaped quote (`\"`, `\'`, `\\\"`, as inside a JSON string): `"pw"`,
 `\"pw\"` and `API_TOKEN=\"pw\"` mask `pw` and keep the quotes and
 backslashes. A run of `` ` `` `,` `.` `;` `)` `]` or `\` at the end of a value
@@ -248,8 +259,9 @@ Masking is not complete: values in formats promptguard does not recognize
 (such as `-u user:pass` outside the clients listed above, or query parameters
 outside the names listed above) are shown as written, and so is a password
 that holds whitespace, an escaped quote, or spliced quotes
-(`'ab'\''cd'`). A Bearer / Basic value ends at the punctuation listed above,
-so the rest of such a value is shown; a multi-line JSON value holding an
+(`'ab'\''cd'`) from that character on. A Bearer / Basic value ends at the
+punctuation listed above, so the rest of such a value is shown
+(`Bearer abc12345(x)tail` shows `Bearer abc1***(x)tail`); a multi-line JSON value holding an
 escape (`\\`) is not paired with its flag line; and a password starting
 with `$` is taken for a reference. A password made only of letters in one case (`hunterxyz`,
 `ADMINPASS`) is masked on its own line but not where it is repeated on other
@@ -258,16 +270,27 @@ characters long, or in URL-password position (`:pw@`). A URL password that
 starts with `/` is not looked for without that `/`. Masking can also cover text that
 is not a secret: a `mysql` or `http` word given as an argument of another
 command (`service mysql restart -pv`, `grep mysql -pv`,
-`find /usr/bin/mysql -perm 600`) is taken for the client; an unquoted `mysql`
-password followed without a space by a redirection, a pipe or another command
-(`-pPASS>file`, `-pPASS|cmd`, `-pPASS&cmd`, `-pPASS;echo done`) is masked
-together with that file name or command; prose such as `Basic auth:RFC-7617`
-is read as a Basic value; a URL whose path holds an e-mail address
-(`u:pw@x.com/users/bob@corp.com/profile`) is masked up to that address's `@`;
-one bare word between `docker login` and `-p` is taken for a registry
-(`docker login cp -p notes.txt` masks `notes.txt`); short values of
-`--key`-style flags are masked in prose too (`--key id` shows `--key ***`); and
-the name of a secret query parameter decides alone (`?key=mainkeyfile`).
+`find /usr/bin/mysql -perm 600`) is taken for the client (`grep mysql -p***`,
+`find /usr/bin/mysql -p*** 600`); an unquoted `mysql` password followed
+without a space by a redirection, a pipe or another command is masked
+together with that file name or command (`-pPASSWORD>file`, `-pPASSWORD|cmd`
+and `-pPASSWORD&cmd` show `-pPASS***`, `-ppass;echo done` shows
+`-p*** done`); prose such as `Basic auth:RFC-7617` is read as a Basic value
+(`Basic auth***`); a URL whose path holds an e-mail address
+(`https://user:pass@x.org/users/bob@corp.com/profile`) is masked up to that
+address's `@` (`https://user:***@corp.com/profile`); one bare word between
+`docker login` and `-p` is taken for a registry (`docker login cp -p
+notes.txt /tmp` shows `docker login cp -p note*** /tmp`); short values of
+`--key`-style flags are masked in prose too (`--key id` shows `--key ***`);
+the name of a secret query parameter decides alone (`?key=mainkeyfile` shows
+`?key=main***`); a `?k=` value of sixteen or more letters, digits and `-`
+holding a digit is masked even when it is a product search
+(`?k=usb-c-to-hdmi-adapter-4k` shows `?k=usb-***`); ticket and app key
+parameters are masked when they hold no secret (`?ticket=JIRA-12345` shows
+`?ticket=JIRA***`, `?appkey=MyAppName` shows `?appkey=MyAp***`); a plain word
+after `mosquitto_sub -P` is masked (`-P secretive` shows `-P secr***`); and
+`-p` after `mongosh` is read as its password whatever comes between them
+(`mongosh http -p u:pw` shows `mongosh http -p ***`).
 
 ## Usage in CI
 

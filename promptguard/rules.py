@@ -968,7 +968,9 @@ def _detect_secret(line, ctx):
 # `curl -u user:pass` and `docker login -p`, the credentials of the clients of
 # _CLIENT_CREDENTIAL_COMMANDS, and cookie values are replaced by
 # their first four characters + "***" ("***" alone when shorter than 8
-# characters): by PG007 itself, and for every rule by the scanner
+# characters; fewer, or none, when they would show a character that an
+# overlapping value hides on its own, _mask_new_spans / _Secret): by PG007
+# itself, and for every rule by the scanner
 # (mask_line_findings). A value found on one line is also masked where it
 # appears in the findings of any other line of the same file
 # (file_mask_values / file_mask_tables).
@@ -1173,6 +1175,7 @@ _FLAG_VALUE_RE = re.compile(
 # <token>) does not start with a token68 character. The value sits in a
 # lookahead, so a value that is no credential (x:Bearer) does not hide the
 # next "Bearer <value>" (a value ends at whitespace: the scans are linear).
+_AUTH_CUT_RE = re.compile(r"[:,;]")
 _AUTH_VALUE_RE = re.compile(
     r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/-]"
     r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
@@ -1231,8 +1234,69 @@ _MASK_TOKEN_RES = (
 _AWS_HINT_RE = re.compile(r"aws", re.IGNORECASE)
 
 
+# A span of _secret_spans() found by a rule added in 1.1.3, or a value a rule
+# now reads longer than before, is (start, end, _NEW_SPAN): its merge with
+# the other spans shows no character they hide (_mask_new_spans).
+_NEW_SPAN = 1
+
+
+class _Secret(str):
+    """A raw secret value that remembers how many of its first characters
+    may be shown when it is masked (`show`, 0 to 4).
+
+    A value of eight or more characters normally shows its first four
+    (_mask_value). When a span is merged with others, or a rule extends a
+    value past the end the earlier rule gave it, the shown prefix must not
+    hold a character that one of the spans hides on its own: `show` keeps
+    that limit with the value, so the masked line, the finding messages and
+    the other lines of the file (_mask_fragment) all show the same prefix.
+    A plain str value shows four characters.
+    """
+
+    __slots__ = ("show",)
+
+    def __new__(cls, value, show):
+        obj = str.__new__(cls, value)
+        obj.show = show
+        return obj
+
+
+def _value_show(value):
+    """How many leading characters of `value` _mask_value() may show."""
+    if len(value) < 8:
+        return 0
+    show = getattr(value, "show", 4)
+    return show if show < 4 else 4
+
+
 def _mask_value(value):
-    return value[:4] + _MASK if len(value) >= 8 else _MASK
+    show = _value_show(value)
+    return value[:show] + _MASK if show else _MASK
+
+
+def _distinct_values(values):
+    """Distinct values of `values` in first-seen order, each with the
+    smallest `show` any of its copies has (a value hidden whole on one line
+    stays hidden whole everywhere)."""
+    seen = {}
+    for v in values:
+        old = seen.get(v)
+        if old is None:
+            seen[v] = v
+        elif _value_show(v) < _value_show(old):
+            seen[v] = _Secret(v, _value_show(v))
+    return list(seen.values())
+
+
+def merge_mask_values(store, values):
+    """Add `values` to the dict `store` (value -> value), keeping for each
+    value the copy with the smallest `show` (_distinct_values)."""
+    for v in values:
+        old = store.get(v)
+        if old is None:
+            store[v] = v
+        elif _value_show(v) < _value_show(old):
+            store[v] = _Secret(v, _value_show(v))
 
 
 def _mask_text(text, values):
@@ -1271,7 +1335,9 @@ def _aws_secret_check(line, ctx):
 
 
 def _secret_spans(line, ctx):
-    """(start, end) of every secret-looking value on the line."""
+    """(start, end) of every secret-looking value on the line;
+    (start, end, _NEW_SPAN) for a value found by a 1.1.3 rule or read longer
+    than 1.1.2 read it (_mask_new_spans)."""
     spans = []
     for _label, rx, _high in _SECRET_RES:
         for m in rx.finditer(line):
@@ -1358,7 +1424,17 @@ def _secret_spans(line, ctx):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
             if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
-                spans.append((start, end))
+                # The value as read up to the first ":" "," ";" (1.1.2): a
+                # span of its own when it qualifies, and a longer value a
+                # _NEW_SPAN (Bearer abc123,def456ghi).
+                cut = _AUTH_CUT_RE.search(line, start, end)
+                if cut is None:
+                    spans.append((start, end))
+                    continue
+                spans.append((start, end, _NEW_SPAN))
+                short_end = _value_end(line, start, cut.start())
+                if short_end - start >= 8 and any(c.isdigit() for c in line[start:cut.start()]):
+                    spans.append((start, short_end))
     # Credential-named values: what PG007 reads by key name, and the admin
     # credential names of PG018 (SUPABASE_SERVICE_ROLE_KEY, ROOT_PAT), whatever
     # the value looks like (PG007 does not report a plain hex value) and
@@ -1629,7 +1705,7 @@ def _client_credential_spans(line, prev):
             # the text that goes on, not a password.
             continue
         if _maskable_value(line, start, end):
-            spans.append((start, end))
+            spans.append((start, end, _NEW_SPAN))
     return spans
 
 
@@ -1702,6 +1778,7 @@ def _mysql_password_spans(line, prev):
         pos = m.start()
         if not state:
             continue
+        kind = None
         if m.group(2) is not None:
             start, end = m.span(2)
             maskable = _maskable_value(line, start, end)
@@ -1709,9 +1786,22 @@ def _mysql_password_spans(line, prev):
             start = m.start(3)
             end = _mysql_value_end(line, start, m.end(3))
             maskable = _mysql_maskable(line, start, end)
+            # The password as read up to the first & ; | ( ) < > (1.1.2):
+            # a span of its own, and a longer value is a _NEW_SPAN, so it
+            # shows no prefix that the shorter one hides (-pabc;echo stays
+            # -p***).
+            op = _MYSQL_OPERATOR_RE.search(line, start, m.end(3))
+            if op is not None:
+                short_end = _value_end(line, start, op.start())
+                if short_end != end:
+                    kind = _NEW_SPAN
+                if (start < short_end < end and not _reference_head(line[start:short_end])
+                        and not _PORT_MAP_RE.fullmatch(line, start, short_end)
+                        and _maskable_value(line, start, short_end)):
+                    spans.append((start, short_end))
         if (end > start and not _reference_head(line[start:end])
                 and not _PORT_MAP_RE.fullmatch(line, start, end) and maskable):
-            spans.append((start, end))
+            spans.append((start, end, kind) if kind else (start, end))
             pos = end  # the next command starts after the password
     return spans
 
@@ -1938,21 +2028,32 @@ def _url_password_spans(line):
                 url_end -= 1
             if url_end > start and line[url_end - 1] == ",":
                 url_end -= 1
-        at = _url_password_end(line, start, url_end)
+        at, first = _url_password_end(line, start, url_end)
         if at < 0 or _URL_PORT_RE.match(line, start, at):
             continue
         if not _REFERENCE_RE.fullmatch(line[start:at]):
-            spans.append((start, at))
+            if start < first < at:
+                # The password up to the first "@" before a host (1.1.2): a
+                # span of its own, and the longer password a _NEW_SPAN, so it
+                # shows no prefix that the shorter one hides
+                # (u:ab@cd.ef/gh@db.example.com).
+                spans.append((start, at, _NEW_SPAN))
+                if not _REFERENCE_RE.fullmatch(line[start:first]):
+                    spans.append((start, first))
+            else:
+                spans.append((start, at))
         pos = max(pos, at)
 
 
 def _url_password_end(line, start, end):
-    """Position of the "@" that ends a URL password in line[start:end], or -1."""
+    """(position of the "@" that ends a URL password in line[start:end], or
+    -1; position of the earlier "@" followed by a host that ends it when
+    the password does not hold "@host.tld/", else the same position)."""
     last_at = line.rfind("@", start, end)
     while last_at > start and line[last_at - 1] == "/":
         last_at = line.rfind("@", start, last_at)
     if last_at <= start:
-        return -1
+        return -1, -1
     # An earlier "@" followed by a host and then "/", "?" or "#" ends the
     # userinfo: the later "@" sits in the path, query or fragment ...
     at = line.find("@", start, last_at)
@@ -1963,16 +2064,16 @@ def _url_password_end(line, start, end):
                 break
         at = line.find("@", at + 1, last_at)
     else:
-        return last_at
+        return last_at, last_at
     # ... unless no "?" or "#" comes before the last "@" and a host follows
     # it (u:ab@cd.ef/gh@db.example.com:5432/app): then the password holds
     # "@cd.ef/". /pkg@1.0.2, /react@18.2.0/ and /logo@2x.png are no hosts.
     if line.find("?", at, last_at) >= 0 or line.find("#", at, last_at) >= 0:
-        return at
+        return at, at
     h = _URL_LAST_HOST_RE.match(line, last_at + 1, end)
     if h is not None and (h.group(1) is None or h.group(1).lower() not in _URL_FILE_SUFFIXES):
-        return last_at
-    return at
+        return last_at, at
+    return at, at
 
 
 def _query_secret_name(name, ctx):
@@ -1987,7 +2088,11 @@ def _query_secret_name(name, ctx):
 def _query_secret_spans(line, ctx):
     """Value spans of secret query parameters (?token=, &api_key=, &sig= ...)."""
     spans = []
-    last = 0
+    # End of the last value masked, and of the last _QUERY_EXTRA_NAMES /
+    # ;jsessionid value: a parameter inside a value already masked is part
+    # of that value, but the extra names (1.1.3) do not hide the parameters
+    # the other names find inside their values (?sid=?pw=x masks both).
+    last = last_extra = 0
     for m in _QUERY_PARAM_RE.finditer(line):
         if m.start() < last:
             continue  # inside a value already masked
@@ -2005,12 +2110,14 @@ def _query_secret_spans(line, ctx):
             continue
         v = _QUERY_VALUE_RE.match(line, m.end())
         if extra:
+            if m.start() < last_extra:
+                continue
             if (v is not None and _query_extra_value(low, v.group())
                     and not _REFERENCE_RE.fullmatch(v.group())
                     and not _TEMPLATE_REF_RE.fullmatch(v.group())
                     and not _reference_head(v.group())):
-                spans.append(v.span())
-                last = v.end()
+                spans.append((v.start(), v.end(), _NEW_SPAN))
+                last_extra = v.end()
             continue
         if v is None or v.end() - v.start() < _query_value_min(m.group(1)):
             continue
@@ -2091,33 +2198,115 @@ def _mask_spans_uncached(line, ctx):
         # (A "\" continuation line `  -u admin:pw \` holds no hint itself,
         # nor does the "value", line after a "--token", line.)
         return line, []
-    merged = []
-    for start, end in sorted(_secret_spans(line, ctx)):
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
+    plain = []
+    new = []
+    for span in _secret_spans(line, ctx):
+        if len(span) > 2:
+            new.append(span[:2])
         else:
-            merged.append([start, end])
-    pieces = []
-    values = []
-    pos = 0
-    for start, end in merged:
-        value = line[start:end]
-        values.append(value)
-        pieces.append(line[pos:start])
-        pieces.append(_mask_value(value))
-        pos = end
-    pieces.append(line[pos:])
+            plain.append(span)
+    if new:
+        masked, values = _mask_new_spans(line, plain, new)
+    else:
+        merged = _merge_spans(sorted(plain))
+        pieces = []
+        values = []
+        pos = 0
+        for start, end in merged:
+            value = line[start:end]
+            values.append(value)
+            pieces.append(line[pos:start])
+            pieces.append(_mask_value(value))
+            pos = end
+        pieces.append(line[pos:])
+        masked = "".join(pieces)
     # One entry per distinct value (a line with thousands of URLs may repeat
     # one password thousands of times), longest first.
-    values = sorted(dict.fromkeys(values), key=len, reverse=True)
+    values = sorted(_distinct_values(values), key=len, reverse=True)
     # A value found at one position may appear again elsewhere on the line
     # (API_KEY=abc... and later abc... again): mask every occurrence.
-    masked = "".join(pieces)
     if len(values) <= 4 and not any(_may_reappear(masked, v) for v in values):
         # The usual line: one or two values, none of them left in the
         # masked line (building the fragment tables costs more than this).
         return masked, values
     return _mask_fragment(masked, values), values
+
+
+def _merge_spans(spans):
+    """Sorted (start, end) spans -> [start, end] runs; touching spans merge."""
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _hidden_run(start, end):
+    """The part of line[start:end] that _mask_value() hides on its own."""
+    return (start + 4 if end - start >= 8 else start), end
+
+
+def _mask_new_spans(line, plain, new):
+    """(masked line, values) for a line with _NEW_SPAN spans.
+
+    The other ("plain") spans merge as they always have: a merged run shows
+    its first four characters (eight or more) or nothing, and its values
+    are masked again where they reappear on the line. A _NEW_SPAN (a value
+    a newer rule finds, or one a rule now reads longer than it did) may
+    merge with them, but the result never shows a character that the plain
+    runs, their reappearances or a new span on its own hide: every run, and
+    every value (the plain runs' values, the new spans' values, the merged
+    runs' values), shows at most the characters before the first hidden
+    position at its start (_Secret.show), here and wherever the value is
+    masked again (finding messages, the other lines of the file).
+    """
+    plain_runs = _merge_spans(sorted(set(plain)))
+    hidden = [_hidden_run(start, end) for start, end in plain_runs]
+    spans = [tuple(r) for r in plain_runs]
+    plain_values = [line[start:end] for start, end in plain_runs]
+    if plain_values:
+        # Where the plain values reappear on the line (as _mask_fragment
+        # masks them): hidden too.
+        long_values, short_values, matcher = _build_fragment_tables(plain_values)
+        if long_values:
+            for i, size, value in _long_value_hits(line, matcher):
+                spans.append((i, i + size))
+                hidden.append((i + _value_show(value), i + size))
+        if short_values and ":" in line and "@" in line:
+            for start, end in _short_url_password_hits(line, short_values):
+                spans.append((start, end))
+                hidden.append((start, end))
+    new = sorted(set(new))
+    hidden.extend(_hidden_run(start, end) for start, end in new)
+    spans.extend(new)
+    hidden = _merge_spans(sorted(h for h in hidden if h[0] < h[1]))
+    starts = [h[0] for h in hidden]
+
+    def secret(start, end):
+        """line[start:end] as a _Secret showing no hidden position."""
+        show = 0
+        if end - start >= 8:
+            i = bisect.bisect_right(starts, start) - 1
+            if i < 0 or hidden[i][1] <= start:
+                nxt = starts[i + 1] if i + 1 < len(starts) else end
+                show = min(4, nxt - start)
+        return _Secret(line[start:end], show)
+
+    values = [secret(start, end) for start, end in plain_runs]
+    values.extend(secret(start, end) for start, end in new)
+    pieces = []
+    pos = 0
+    for start, end in _merge_spans(sorted(spans)):
+        value = secret(start, end)
+        values.append(value)
+        pieces.append(line[pos:start])
+        pieces.append(_mask_value(value))
+        pos = end
+    pieces.append(line[pos:])
+    return "".join(pieces), values
 
 
 def _may_reappear(text, value):
@@ -2137,16 +2326,22 @@ def _may_reappear(text, value):
 # kept the length. Comparing two tuples costs one pass over identical
 # elements, far less than rebuilding the tables. The file-level tables
 # (file_mask_tables) are built once per file and passed in explicitly.
-_FRAGMENT_TABLES = [None, None]
+# The third entry holds the values' shown-prefix limits (_Secret): equal
+# strings with other limits need other tables.
+_FRAGMENT_TABLES = [None, None, None]
 
 
 def _fragment_tables(values):
+    # A _Secret equals the plain str of the same text: its `show` is part of
+    # the key, so tables built for a value showing four characters are not
+    # reused for the same value showing none.
     key = tuple(values)
+    shows = tuple(_value_show(v) for v in key)
     cached = _FRAGMENT_TABLES
-    if cached[0] == key:
+    if cached[0] == key and cached[2] == shows:
         return cached[1]
     tables = _build_fragment_tables(key)
-    cached[:] = [key, tables]
+    cached[:] = [key, tables, shows]
     return tables
 
 
@@ -2158,13 +2353,13 @@ def _build_fragment_tables(values):
     a cut-short prefix one bisect, whatever the number of values sharing a
     prefix.
     """
-    long_values = [v for v in values if len(v) >= 5]
+    long_values = _distinct_values(v for v in values if len(v) >= 5)
     short_values = frozenset(v for v in values if len(v) < 5)
     matcher = (
         frozenset(v[:5] for v in long_values),
-        frozenset(long_values),
+        dict((v, v) for v in long_values),
         sorted(set(len(v) for v in long_values), reverse=True),
-        sorted(set(long_values)),
+        sorted(long_values),
     )
     return long_values, short_values, matcher
 
@@ -2175,7 +2370,8 @@ def _mask_fragment(text, values, tables=None):
     A full occurrence is masked, and so is a prefix of five or more characters
     cut short by the end of the text or by "..." (_short). A value shorter
     than five characters is masked only in URL-password position (":pw@").
-    `tables` (from file_mask_tables) replaces `values` when given.
+    `tables` (from file_mask_tables) replaces `values` when given. A value
+    shows the prefix its `show` allows (_Secret, _mask_value).
     """
     if not text:
         return text
@@ -2188,6 +2384,22 @@ def _mask_fragment(text, values, tables=None):
         text = _mask_short_url_passwords(text, short_values)
     if not long_values:
         return text
+    pieces = []
+    pos = 0
+    for i, size, value in _long_value_hits(text, matcher):
+        pieces.append(text[pos:i])
+        pieces.append(_mask_value(value))
+        pos = i + size
+    if not pieces:
+        return text
+    pieces.append(text[pos:])
+    return "".join(pieces)
+
+
+def _long_value_hits(text, matcher):
+    """(start, length, value) of every occurrence _mask_fragment masks of a
+    value of five or more characters (matcher from _build_fragment_tables),
+    left to right, not overlapping."""
     prefixes, value_set, lengths, ordered = matcher
     n = len(text)
     if len(prefixes) <= 16:
@@ -2201,7 +2413,6 @@ def _mask_fragment(text, values, tables=None):
         starts = sorted(starts)
     else:
         starts = (i for i in range(n - 4) if text[i:i + 5] in prefixes)
-    pieces = []
     pos = 0
     dots = -1  # position of the first "..." at or after i + 5
     for i in starts:
@@ -2211,7 +2422,7 @@ def _mask_fragment(text, values, tables=None):
         best_value = None
         for size in lengths:
             if i + size <= n and text[i:i + size] in value_set:
-                best, best_value = size, text[i:i + size]
+                best, best_value = size, value_set[text[i:i + size]]
                 break
         # A prefix cut short by "..." or by the end of the text.
         if dots < i + 5:
@@ -2227,11 +2438,23 @@ def _mask_fragment(text, values, tables=None):
                     break
         if best_value is None:
             continue
-        pieces.append(text[pos:i])
-        pieces.append(_mask_value(best_value))
+        yield i, best, best_value
         pos = i + best
-    pieces.append(text[pos:])
-    return "".join(pieces)
+
+
+def _short_url_password_hits(text, short_values):
+    """(start, end) of every ":pw@" password _mask_short_url_passwords masks."""
+    n = len(text)
+    i = text.find(":")
+    while 0 <= i < n:
+        nxt = i + 1
+        for size in (4, 3, 2, 1):
+            at = i + 1 + size
+            if text[at:at + 1] == "@" and text[i + 1:at] in short_values:
+                yield i + 1, at
+                nxt = at
+                break
+        i = text.find(":", nxt)
 
 
 def _mask_short_url_passwords(text, short_values):
@@ -2244,18 +2467,10 @@ def _mask_short_url_passwords(text, short_values):
     """
     pieces = []
     pos = 0
-    n = len(text)
-    i = text.find(":")
-    while 0 <= i < n:
-        nxt = i + 1
-        for size in (4, 3, 2, 1):
-            at = i + 1 + size
-            if text[at:at + 1] == "@" and text[i + 1:at] in short_values:
-                pieces.append(text[pos:i + 1])
-                pieces.append(_MASK)
-                pos = nxt = at
-                break
-        i = text.find(":", nxt)
+    for start, end in _short_url_password_hits(text, short_values):
+        pieces.append(text[pos:start])
+        pieces.append(_MASK)
+        pos = end
     if not pieces:
         return text
     pieces.append(text[pos:])
@@ -2324,7 +2539,7 @@ def file_mask_tables(values):
     hold each distinct value once, longest first.
     """
     keep = sorted(
-        (v for v in dict.fromkeys(values) if _file_mask_value(v)), key=len, reverse=True
+        (v for v in _distinct_values(values) if _file_mask_value(v)), key=len, reverse=True
     )
     return _build_fragment_tables(keep) if keep else None
 
