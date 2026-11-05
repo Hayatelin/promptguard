@@ -1211,9 +1211,20 @@ _FLAG_VALUE_RE = re.compile(
 # <token>) does not start with a token68 character. The value sits in a
 # lookahead, so a value that is no credential (x:Bearer) does not hide the
 # next "Bearer <value>" (a value ends at whitespace: the scans are linear).
+# Since 1.1.4 the credential may also start with one of ! # % * ? @ ^
+# (Bearer !Ab3xYz9Qw7k); such a value is hidden whole (_NEW_WHOLE). A value starting with
+# a parameter name and "=" after a WWW-Authenticate / Proxy-Authenticate
+# header (WWW-Authenticate: Basic charset=UTF-8) is no credential.
 _AUTH_CUT_RE = re.compile(r"[:,;]")
+_TOKEN68_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/-")
+_AUTH_PARAM_RE = re.compile(r"(?:charset|realm|scope|error|error_description|error_uri)=",
+                            re.IGNORECASE)
+# The header names an auth value may belong to: a parameter is left alone
+# only when the nearest one before it is WWW-/Proxy-Authenticate (group 1).
+_AUTH_HEADER_RE = re.compile(
+    r"(?<![\w-])(?:((?:WWW|Proxy)-Authenticate)|(?:Proxy-)?Authorization)[ \t]*:", re.IGNORECASE)
 _AUTH_VALUE_RE = re.compile(
-    r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/-]"
+    r"\b(?:Bearer|Basic)[ \t]+(?=([A-Za-z0-9._~+/!#%*?@^-]"
     r"(?:[A-Za-z0-9._~+/=!#$%*?@^-]|[:,;](?=[A-Za-z0-9][A-Za-z0-9._~+/=!#$%*?@^-]{7}))*))",
     re.IGNORECASE,
 )
@@ -1223,6 +1234,11 @@ _AUTH_VALUE_RE = re.compile(
 # The client name is a word followed by a space, or a JSON argv item ("http", ...).
 _HTTPIE_WORD_RE = re.compile(
     r"(?<![\w./:-])(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
+)
+# Since 1.1.4 also at the end of a /bin/ path (/usr/local/bin/http), as for
+# mysql; a value found only through such a path is hidden whole (_NEW_WHOLE).
+_HTTPIE_ANY_WORD_RE = re.compile(
+    r"(?:(?<![\w./:-])|(?<=/bin/))(?:https?|xhs?)(?=[ \t]|\\{0,3}[\"'][ \t]*,)", re.IGNORECASE
 )
 _HTTPIE_AUTH_RE = re.compile(
     r"(?<![\w-])(?:-[vhbdcfFjSIxq]*a|--auth)"
@@ -1274,6 +1290,11 @@ _AWS_HINT_RE = re.compile(r"aws", re.IGNORECASE)
 # now reads longer than before, is (start, end, _NEW_SPAN): its merge with
 # the other spans shows no character they hide (_mask_new_spans).
 _NEW_SPAN = 1
+# (start, end, _NEW_WHOLE): a _NEW_SPAN hidden whole, its first characters
+# included. A Bearer / Basic value starting with ! # % * ? @ ^ (1.1.4) may
+# start with another value of the line (Bearer %401234/$ after
+# mongosh -p %401234), which its shown prefix would show.
+_NEW_WHOLE = 2
 
 
 class _Secret(str):
@@ -1456,10 +1477,23 @@ def _secret_spans(line, ctx):
         for m in _COOKIE_HEADER_RE.finditer(line):
             spans.extend(_cookie_value_spans(line, m.end()))
     if "Bearer" in line or "Basic" in line or "bearer" in line or "basic" in line:
+        auth_hdr = None  # (starts, is-Authenticate) of the auth headers, found once
         for m in _AUTH_VALUE_RE.finditer(line):
             start = m.start(1)
             end = _value_end(line, start, m.end(1))
             if end - start >= 8 and any(c.isdigit() for c in m.group(1)):
+                if auth_hdr is None and _AUTH_PARAM_RE.match(line, start):
+                    found = [(h.end(), h.group(1) is not None)
+                             for h in _AUTH_HEADER_RE.finditer(line)]
+                    auth_hdr = ([f[0] for f in found], [f[1] for f in found])
+                k = (bisect.bisect_right(auth_hdr[0], start) - 1) if auth_hdr else -1
+                if k >= 0 and auth_hdr[1][k] and _AUTH_PARAM_RE.match(line, start):
+                    continue  # WWW-Authenticate: Basic charset=UTF-8, a parameter
+                if line[start] not in _TOKEN68_FIRST:
+                    # Bearer !Ab3xYz9Qw7k (1.1.4): read whole, as one
+                    # value, and hidden whole (_NEW_WHOLE).
+                    spans.append((start, end, _NEW_WHOLE))
+                    continue
                 # The value as read up to the first ":" "," ";" (1.1.2): a
                 # span of its own when it qualifies, and a longer value a
                 # _NEW_SPAN (Bearer abc123,def456ghi).
@@ -1858,15 +1892,21 @@ def _httpie_auth_spans(line, prev, ctx=None):
         if "http" not in plower and "xh" not in plower:
             return spans
     state = _command_has(prev, _HTTPIE_WORD_RE, False) if prev else False
+    # state_any: the client also counts at the end of a /bin/ path (1.1.4).
+    any_path = "/bin/" in line or (prev is not None and "/bin/" in prev)
+    state_any = (_command_has(prev, _HTTPIE_ANY_WORD_RE, False) if prev else False
+                 ) if any_path else state
     # A value without "user:" is a token only when its command selects
     # bearer auth; otherwise it is a user name (prompts).
     seps = None
     bearer_cache = {}
     pos = 0
     for m in _HTTPIE_AUTH_RE.finditer(line):
-        state = _command_has(line[pos:m.start()], _HTTPIE_WORD_RE, state)
+        segment = line[pos:m.start()]
+        state = _command_has(segment, _HTTPIE_WORD_RE, state)
+        state_any = _command_has(segment, _HTTPIE_ANY_WORD_RE, state_any) if any_path else state
         pos = m.start()
-        if not state:
+        if not state_any:
             continue
         if seps is None:
             seps = [(x.start(), x.end()) for x in _COMMAND_SEP_RE.finditer(line)]
@@ -1885,7 +1925,8 @@ def _httpie_auth_spans(line, prev, ctx=None):
         if not bearer and m.group(2) and m.group(2).isdigit() and line[start:end].isdigit():
             continue
         if _maskable_value(line, start, end):
-            spans.append((start, end))
+            # Found only through a /bin/ path (1.1.4): hidden whole (_NEW_WHOLE).
+            spans.append((start, end) if state else (start, end, _NEW_WHOLE))
     return spans
 
 
@@ -2270,17 +2311,20 @@ def _mask_spans_uncached(line, ctx, extra=None):
     long_line = ctx is not None and len(line) > _SPAN_MEMO_MIN
     entry = ctx.get("_span_memo", {}).get((ctx.get("lineno"), line)) if long_line else None
     if entry is not None:
-        plain, new = entry[0], entry[1]
+        plain, new, whole = entry[0], entry[1], entry[4]
     else:
         plain = []
         new = []
+        whole = []
         for span in _secret_spans(line, ctx):
             if len(span) > 2:
                 new.append(span[:2])
+                if span[2] == _NEW_WHOLE:
+                    whole.append(span[:2])
             else:
                 plain.append(span)
         if new and long_line:
-            entry = [plain, new, None, None]
+            entry = [plain, new, None, None, whole]
             ctx.setdefault("_span_memo", {})[(ctx.get("lineno"), line)] = entry
     extra_hits = ()
     if new and extra:
@@ -2295,7 +2339,7 @@ def _mask_spans_uncached(line, ctx, extra=None):
     hidden_runs = None
     if new:
         hidden_runs = []
-        masked, values = _mask_new_spans(line, plain, new, extra_hits, hidden_runs)
+        masked, values = _mask_new_spans(line, plain, new, extra_hits, hidden_runs, whole)
     else:
         merged = _merge_spans(sorted(plain))
         pieces = []
@@ -2394,7 +2438,7 @@ def _hidden_run(start, end):
     return (start + 4 if end - start >= 8 else start), end
 
 
-def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
+def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None, whole=()):
     """(masked line, values) for a line with _NEW_SPAN spans.
 
     The other ("plain") spans merge as they always have: a merged run shows
@@ -2412,6 +2456,8 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
     other texts (the other lines of the file, the line of a message) where
     they occur on this line (_table_hits): masked and hidden the same way.
     `hidden_runs`, a list, receives the [start, end) runs the result hides.
+    `whole` lists the new spans hidden whole, first characters included
+    (_NEW_WHOLE).
     """
     plain_runs = _merge_spans(sorted(set(plain)))
     hidden = [_hidden_run(start, end) for start, end in plain_runs]
@@ -2434,6 +2480,35 @@ def _mask_new_spans(line, plain, new, extra_hits=(), hidden_runs=None):
         hidden.append((hide, end))
     new = sorted(set(new))
     hidden.extend(_hidden_run(start, end) for start, end in new)
+    if whole:
+        # A whole span hides its first characters, so the masked line no
+        # longer holds a value of this line that reappears across it, and
+        # masking the reappearances afterwards would miss its tail
+        # (redis-cli -a '@pw12345(TAIL)' ... Bearer @pw12345(TAIL)): such
+        # occurrences are hidden whole with it.
+        hidden.extend(whole)
+        runs_w = _merge_spans(sorted(whole))
+        starts_w = [r[0] for r in runs_w]
+
+        def meets_whole(start, end):
+            k = bisect.bisect_right(starts_w, end - 1) - 1
+            return k >= 0 and runs_w[k][1] > start
+
+        # Every value of the line, overlapping occurrences included (one
+        # may start inside a whole span); linear thanks to the long index of
+        # _build_fragment_tables.
+        line_values = [line[s:e] for s, e in plain_runs] + [line[s:e] for s, e in new]
+        long_w, short_w, matcher_w = _build_fragment_tables(line_values)
+        if long_w:
+            for i, size, _value in _long_value_hits(line, matcher_w, True):
+                if meets_whole(i, i + size):
+                    spans.append((i, i + size))
+                    hidden.append((i, i + size))
+        if short_w and ":" in line and "@" in line:
+            for start, end in _short_url_password_hits(line, short_w):
+                if meets_whole(start, end):
+                    spans.append((start, end))
+                    hidden.append((start, end))
     spans.extend(new)
     hidden = _merge_spans(sorted(h for h in hidden if h[0] < h[1]))
     starts = [h[0] for h in hidden]
@@ -2504,17 +2579,26 @@ def _build_fragment_tables(values):
     """(long values, short values, matcher) for _mask_fragment.
 
     matcher = (5-character prefixes, value set, distinct lengths longest
-    first, sorted values): a full occurrence is one set lookup per length,
-    a cut-short prefix one bisect, whatever the number of values sharing a
-    prefix.
+    first, sorted values, long index): a full occurrence is one set lookup
+    per length, a cut-short prefix one bisect, whatever the number of values
+    sharing a prefix. The long index maps the first _LONG_KEY characters of
+    a longer value to {length: {last five characters: [values]}} (1.1.4:
+    walking every value sharing the key at every start was k x k on a line
+    of many such values).
     """
     long_values = _distinct_values(v for v in values if len(v) >= 5)
     short_values = frozenset(v for v in values if len(v) < 5)
+    long_index = {}
+    for v in long_values:
+        if len(v) > _LONG_KEY:
+            long_index.setdefault(v[:_LONG_KEY], {}).setdefault(
+                len(v), {}).setdefault(v[-5:], []).append(v)
     matcher = (
         frozenset(v[:5] for v in long_values),
         dict((v, v) for v in long_values),
         sorted(set(len(v) for v in long_values), reverse=True),
         sorted(long_values),
+        long_index,
     )
     return long_values, short_values, matcher
 
@@ -2569,7 +2653,7 @@ def _long_value_hits(text, matcher, overlapping=False):
     value of five or more characters (matcher from _build_fragment_tables),
     left to right, not overlapping (`overlapping`: also the occurrences that
     start inside an earlier one)."""
-    prefixes, value_set, lengths, ordered = matcher
+    prefixes, value_set, lengths, ordered, long_index = matcher
     n = len(text)
     if len(prefixes) <= 16:
         # Few prefixes: find the candidate positions with str.find.
@@ -2619,16 +2703,25 @@ def _long_value_hits(text, matcher, overlapping=False):
             # (slicing text[i:i + size] for each of them at each start was
             # k x n on a long value whose prefix recurs inside it).
             long_key = text[i:i + _LONG_KEY]
-            j = bisect.bisect_left(ordered, long_key)
-            while j < len(ordered) and ordered[j].startswith(long_key):
-                value = ordered[j]
-                size = len(value)
-                j += 1
-                if (size > _LONG_KEY and i + size <= n and text[i + size - 5:i + size] == value[-5:]
-                        and text.startswith(value, i)):
-                    if size > best:
-                        best, best_value = size, value
-                    show = min(show, _value_show(value))
+            # One lookup per length of the values starting with the key
+            # (the same values as walking them all: key, length, last five
+            # characters, then a compare in place).
+            for size, by_end in long_index.get(long_key, {}).items():
+                if i + size > n:
+                    continue
+                bucket = by_end.get(text[i + size - 5:i + size], ())
+                if len(bucket) > _BUCKET_WALK and len(bucket) * _LONG_KEY > size:
+                    # Many short values share key, length and end: one slice
+                    # and one lookup (the same value, if any, as the walk);
+                    # a few long ones are walked (slicing a long value at
+                    # every start costs its length).
+                    found = value_set.get(text[i:i + size])
+                    bucket = (found,) if found is not None else ()
+                for value in bucket:
+                    if text.startswith(value, i):
+                        if size > best:
+                            best, best_value = size, value
+                        show = min(show, _value_show(value))
         # A prefix cut short by "..." or by the end of the text.
         if dots < i + 5:
             dots = text.find("...", i + 5)
@@ -2661,6 +2754,21 @@ def _long_value_hits(text, matcher, overlapping=False):
 # _long_value_hits: values longer than this are looked up by their first
 # _LONG_KEY characters and compared in place.
 _LONG_KEY = 64
+# Above this many values sharing a key (and length and end), and when they
+# outnumber the piece length / _LONG_KEY, a long-value lookup slices the
+# text once instead of walking them (1.1.4): each start costs at most about
+# min(values x _LONG_KEY, piece length) beyond the walk's early exits.
+_BUCKET_WALK = 16
+
+
+def _prefix_end(ordered, prefix, lo):
+    """Index after the last value of the sorted `ordered` (from `lo`) that
+    starts with `prefix`: bisect at the smallest string above all of them
+    (the prefix without its trailing U+10FFFF, its last character + 1)."""
+    stem = prefix.rstrip("\U0010ffff")
+    if not stem:
+        return len(ordered)
+    return bisect.bisect_left(ordered, stem[:-1] + chr(ord(stem[-1]) + 1), lo)
 
 
 def _prefix_value(text, i, end, ordered, long_key=None):
@@ -2678,6 +2786,16 @@ def _prefix_value(text, i, end, ordered, long_key=None):
     # bisect would give), checked on five characters before a full compare.
     tail = text[end - 5:end]
     j = bisect.bisect_left(ordered, long_key)
+    count = _prefix_end(ordered, long_key, j) - j
+    if count > _BUCKET_WALK and count * _LONG_KEY > size:
+        # Many values share the key (1.1.4: walking them at every start was
+        # k x k): one slice and one bisect give the same first value. Not
+        # for a long piece and few values (the slice costs its length).
+        piece = text[i:end]
+        j = bisect.bisect_left(ordered, piece, j)
+        if j < len(ordered) and ordered[j].startswith(piece):
+            return ordered[j]
+        return None
     while j < len(ordered) and ordered[j].startswith(long_key):
         value = ordered[j]
         j += 1
