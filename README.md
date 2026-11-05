@@ -288,7 +288,11 @@ with `$` is taken for a reference. A password made only of letters in one case (
 `ADMINPASS`) is masked on its own line but not where it is repeated on other
 lines; on other lines a value is also looked for only when it is five or more
 characters long, or in URL-password position (`:pw@`). A URL password that
-starts with `/` is not looked for without that `/`. Masking can also cover text that
+starts with `/` is not looked for without that `/`. On a line that also
+holds a value hidden whole (such as `Bearer !tok12345`), a repeated value of
+letters in one case that starts inside another repeated value may show its last
+characters (`TOKEN=xyabcdef echo xyabcdefgh PASSWORD=abcdefgh Bearer !tok12345`
+shows `echo xyab***gh`). Masking can also cover text that
 is not a secret: a `mysql` or `http` word given as an argument of another
 command (`service mysql restart -pv`, `grep mysql -pv`,
 `find /usr/bin/mysql -perm 600`) is taken for the client (`grep mysql -p***`,
